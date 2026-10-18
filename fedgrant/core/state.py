@@ -13,6 +13,7 @@ from enum import IntEnum
 
 import numpy as np
 
+from fedgrant.encoder.blocks import values as _encoder_values
 from fedgrant.policy.constants import (
     CAP0,
     EWMA_INIT,
@@ -55,10 +56,10 @@ def values_from_energies(energies: np.ndarray, w: float) -> np.ndarray:
     """Eq. (2): v_i(s) = w_i^2 * eps_{i,pi_i(s)}, as float32 [K] (Table 2 `val`).
 
     `energies` are the READY energies in send order (float32 on the wire, Section 8).
-    The product is formed in float64 and rounded once to float32.
+    Same arithmetic as fedgrant.encoder.blocks.values (formed in float64, rounded
+    once to float32), so client and gateway values are bit-identical.
     """
-    e = np.asarray(energies, dtype=np.float64)
-    return (float(w) ** 2 * e).astype(np.float32)
+    return _encoder_values(energies, w)
 
 
 @dataclass(slots=True, eq=False)
