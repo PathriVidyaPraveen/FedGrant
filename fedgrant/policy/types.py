@@ -37,7 +37,7 @@ class CandidateView:
         if not isinstance(und, np.ndarray) or und.dtype != np.int32 or und.shape != (n,):
             raise TypeError(f"undelivered must be an int32 ndarray of shape ({n},)")
         rr = self.rr_pointer
-        if isinstance(rr, bool) or not isinstance(rr, (int, np.integer)):
+        if isinstance(rr, (bool, np.bool_)) or not isinstance(rr, (int, np.integer)):
             raise TypeError("rr_pointer must be an int")
         self.rr_pointer = int(rr)
 
@@ -80,10 +80,12 @@ class PolicyConfig:
         if not isinstance(self.predictor, str) or self.predictor not in PREDICTORS:
             raise ValueError(f"predictor must be one of {sorted(PREDICTORS)}, got {self.predictor!r}")
         for name in ("pred_in_pacing", "pred_in_eligibility", "retransmit"):
-            if not isinstance(getattr(self, name), bool):
-                raise TypeError(f"{name} must be a bool, got {getattr(self, name)!r}")
+            v = getattr(self, name)
+            if not isinstance(v, (bool, np.bool_)):
+                raise TypeError(f"{name} must be a bool, got {v!r}")
+            setattr(self, name, bool(v))
         eps = self.explore_eps
-        if isinstance(eps, bool) or not isinstance(eps, (int, float)):
+        if isinstance(eps, (bool, np.bool_)) or not isinstance(eps, (int, float, np.integer, np.floating)):
             raise TypeError(f"explore_eps must be a number, got {eps!r}")
         eps = float(eps)
         if not math.isfinite(eps) or not 0.0 <= eps <= 1.0:

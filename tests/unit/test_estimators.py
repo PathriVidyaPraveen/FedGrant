@@ -13,7 +13,6 @@ from fedgrant.core.estimators import (
     compute_cap,
     grant_timeout,
     rate_update,
-    rebase_timestamps,
     rtt_update,
     update_outcome_stats,
 )
@@ -321,12 +320,3 @@ def test_update_outcome_stats_hist_ring_and_bad_y() -> None:
     for bad in (2, -1, True, 1.0):
         with pytest.raises(ValueError):
             update_outcome_stats(st, bad, 0)  # type: ignore[arg-type]
-
-
-def test_rebase_timestamps() -> None:
-    st = _st()
-    rebase_timestamps(st, 10)                                  # None stays None
-    assert st.t_last_del_ns is None and st.t_last_loss_ns is None
-    st.t_last_del_ns, st.t_last_loss_ns = 300 * MS, 350 * MS
-    rebase_timestamps(st, 1_400 * MS)                          # next round starts 1.4 s later
-    assert (st.t_last_del_ns, st.t_last_loss_ns) == (-1_100 * MS, -1_050 * MS)

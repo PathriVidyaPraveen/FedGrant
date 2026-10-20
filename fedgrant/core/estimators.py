@@ -9,6 +9,8 @@ from __future__ import annotations
 from fractions import Fraction
 from math import ceil
 
+import numpy as np
+
 from fedgrant.core.state import ClientState
 from fedgrant.policy.constants import (
     CAP_HEADROOM,
@@ -30,9 +32,17 @@ assert RFC6298_ALPHA == 1 / 8 and RFC6298_BETA == 1 / 4
 
 
 def _check_int(x: object, name: str) -> int:
-    if isinstance(x, bool) or not isinstance(x, int):
-        raise TypeError(f"{name} must be an int (ns), got {type(x).__name__}")
-    return x
+    """Accept Python and NumPy integers (not bools); return a Python int."""
+    if isinstance(x, (bool, np.bool_)) or not isinstance(x, (int, np.integer)):
+        raise TypeError(f"{name} must be an int, got {type(x).__name__}")
+    return int(x)
+
+
+def check_y(y: object) -> int:
+    """Validate an outcome label y in {0, 1} (Python or NumPy int, not bool); return int."""
+    if isinstance(y, (bool, np.bool_)) or not isinstance(y, (int, np.integer)) or int(y) not in (0, 1):
+        raise ValueError(f"y must be 0 or 1, got {y!r}")
+    return int(y)
 
 
 def _div_round(num: int, den: int) -> int:
@@ -227,8 +237,7 @@ def update_outcome_stats(state: ClientState, y: int, t_ns: int) -> None:
     pre-event state has been computed. Also clears first_event_in_round (o8).
     evbuf, h/h_stale and the RTT sample are handled by their own callers.
     """
-    if isinstance(y, bool) or not isinstance(y, int) or y not in (0, 1):
-        raise ValueError(f"y must be 0 or 1, got {y!r}")
+    y = check_y(y)
     t = _check_int(t_ns, "t_ns")
     state.hist.append(y)
     state.ewma_fast = (1.0 - EWMA_FAST_W) * state.ewma_fast + EWMA_FAST_W * y
@@ -241,18 +250,3 @@ def update_outcome_stats(state: ClientState, y: int, t_ns: int) -> None:
         state.t_last_loss_ns = t
     state.n_resolved += 1
     state.first_event_in_round = False
-
-
-def rebase_timestamps(state: ClientState, offset_ns: int) -> None:
-    """Shift the persistent timestamps into a new round's clock: t <- t - offset.
-
-    SPEC-NOTE: times are relative to round start (project rule) but t_last_del /
-    t_last_loss persist across rounds (Table 2). At ROUND_START call this with
-    offset = (this round's start) - (previous round's start), both on one clock,
-    so features 45/46 stay correct. Not needed if one absolute clock is used.
-    """
-    off = _check_int(offset_ns, "offset_ns")
-    if state.t_last_del_ns is not None:
-        state.t_last_del_ns -= off
-    if state.t_last_loss_ns is not None:
-        state.t_last_loss_ns -= off

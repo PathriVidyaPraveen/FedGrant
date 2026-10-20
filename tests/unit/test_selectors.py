@@ -45,7 +45,7 @@ def _cv(ids, vals=None, und=None, rr=0) -> CandidateView:
 
 def _ready_state(K: int = 5, cid: int = 0) -> ClientState:
     st = ClientState(client_id=cid, w=0.5, K=K)
-    st.reset_round(K, np.arange(K, 0, -1, dtype=np.float32))     # val = K, K-1, ..., 1
+    st.reset_round(K, np.arange(K, 0, -1, dtype=np.float32), round_start_ns=0)   # val = K, ..., 1
     return st
 
 
