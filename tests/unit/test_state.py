@@ -59,7 +59,7 @@ def test_initial_values_table2() -> None:
     assert st.hist.maxlen == 32 and len(st.hist) == 0
     assert st.rtt_last8.maxlen == 8 and st.evbuf.maxlen == 16
     assert st.h is None and st.h_stale is True
-    assert st.t_last_del_ns is None and st.t_last_loss_ns is None
+    assert st.t_last_del_ns is None and st.t_last_loss_ns is None and st.t_prev_event_ns is None
     assert st.consec_loss == 0 and st.starve == 0 and st.n_resolved == 0
     assert st.cap == 45
     assert isinstance(st.srtt_ns, int) and isinstance(st.rttvar_ns, int)
@@ -122,6 +122,7 @@ def test_reset_round_keeps_persistent_and_clears_per_round() -> None:
     st.hist.append(1); st.rtt_last8.append(9); st.evbuf.append(np.ones(8, np.float32))
     st.h, st.h_stale = np.ones(32, np.float32), False
     st.t_last_del_ns, st.t_last_loss_ns, st.consec_loss = 11, 12, 3
+    st.t_prev_event_ns = 13
     st.starve, st.n_resolved, st.cap = 2, 17, 9
     st.first_event_in_round = False
 
@@ -136,6 +137,7 @@ def test_reset_round_keeps_persistent_and_clears_per_round() -> None:
     assert list(st.hist) == [1] and list(st.rtt_last8) == [9] and len(st.evbuf) == 1
     assert st.h is not None and st.h_stale is False
     assert (st.t_last_del_ns, st.t_last_loss_ns, st.consec_loss) == (11, 12, 3)
+    assert st.t_prev_event_ns == 13                     # persistent (event sequence persists)
     assert (st.starve, st.n_resolved, st.cap) == (2, 17, 9)
     st.check_invariants()
 

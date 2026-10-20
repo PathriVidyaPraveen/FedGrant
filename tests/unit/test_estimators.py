@@ -327,6 +327,7 @@ def test_rebase_timestamps() -> None:
     st = _st()
     rebase_timestamps(st, 10)                                  # None stays None
     assert st.t_last_del_ns is None and st.t_last_loss_ns is None
-    st.t_last_del_ns, st.t_last_loss_ns = 300 * MS, 350 * MS
+    st.t_last_del_ns, st.t_last_loss_ns, st.t_prev_event_ns = 300 * MS, 350 * MS, 360 * MS
     rebase_timestamps(st, 1_400 * MS)                          # next round starts 1.4 s later
     assert (st.t_last_del_ns, st.t_last_loss_ns) == (-1_100 * MS, -1_050 * MS)
+    assert st.t_prev_event_ns == -1_040 * MS

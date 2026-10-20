@@ -65,7 +65,7 @@ def values_from_energies(energies: np.ndarray, w: float) -> np.ndarray:
 @dataclass(slots=True, eq=False)
 class ClientState:
     """All gateway state for one client (Table 2), plus n_resolved, ready, w,
-    first_event_in_round and cap.
+    first_event_in_round, t_prev_event_ns and cap.
 
     Construct with ClientState(client_id, w[, K]); __post_init__ calls reset_round(K).
     """
@@ -99,6 +99,7 @@ class ClientState:
     h_stale: bool = field(init=False, default=True)
     t_last_del_ns: int | None = field(init=False, default=None)    # None = no delivery yet
     t_last_loss_ns: int | None = field(init=False, default=None)   # None = no loss yet
+    t_prev_event_ns: int | None = field(init=False, default=None)  # last resolution time (o3); None = no event yet
     consec_loss: int = field(init=False, default=0)
     starve: int = field(init=False, default=0)
     n_resolved: int = field(init=False, default=0)                 # feature 35

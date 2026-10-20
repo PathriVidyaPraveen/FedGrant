@@ -247,12 +247,15 @@ def rebase_timestamps(state: ClientState, offset_ns: int) -> None:
     """Shift the persistent timestamps into a new round's clock: t <- t - offset.
 
     SPEC-NOTE: times are relative to round start (project rule) but t_last_del /
-    t_last_loss persist across rounds (Table 2). At ROUND_START call this with
-    offset = (this round's start) - (previous round's start), both on one clock,
-    so features 45/46 stay correct. Not needed if one absolute clock is used.
+    t_last_loss / t_prev_event persist across rounds (Table 2; the event sequence
+    persists, Section 4.2). At ROUND_START call this with offset = (this round's
+    start) - (previous round's start), both on one clock, so features 45/46 and
+    observation o3 stay correct. Not needed if one absolute clock is used.
     """
     off = _check_int(offset_ns, "offset_ns")
     if state.t_last_del_ns is not None:
         state.t_last_del_ns -= off
     if state.t_last_loss_ns is not None:
         state.t_last_loss_ns -= off
+    if state.t_prev_event_ns is not None:
+        state.t_prev_event_ns -= off
