@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from fedgrant.core.estimators import rtt_update, update_outcome_stats
+from fedgrant.core.estimators import check_y, rtt_update, update_outcome_stats
 from fedgrant.core.state import ClientState
 from fedgrant.policy.constants import C, CTX_SLICE, HIST_LEN, N_OBS, N_X48, S
 from fedgrant.policy.pacing import InflightTracker
@@ -51,7 +51,7 @@ assert len(FEATURE_NAMES) == N_X48 and len(OBS_NAMES) == N_OBS
 
 
 def _int(x: object, name: str) -> int:
-    if isinstance(x, bool) or not isinstance(x, (int, np.integer)):
+    if isinstance(x, (bool, np.bool_)) or not isinstance(x, (int, np.integer)):
         raise TypeError(f"{name} must be an int (ns), got {type(x).__name__}")
     return int(x)
 
@@ -60,7 +60,12 @@ def _int(x: object, name: str) -> int:
 
 
 class ArrivalLog:
-    """(t_ns, bits) of every DATA frame arriving at the gateway, all clients.
+    """(t_ns, bits) of every FedGrant DATA frame arriving at the gateway, all clients.
+
+    SPEC-NOTE: feature 42 and o7 count FedGrant DATA frames only. Cross traffic
+    (scenario X2) also crosses the bottleneck but the gateway daemon never sees
+    it, so the simulator must not record it here either, or simulator and
+    gateway features differ in X2.
 
     Record times must be non-decreasing. Entries older than 20 ms before the
     latest record are pruned, so queries may start no earlier than
@@ -255,8 +260,7 @@ def observation8(
     o8 1 if e is the client's first resolved event in this round.
     """
     view._check()
-    if isinstance(y, bool) or y not in (0, 1):
-        raise ValueError(f"y must be 0 or 1, got {y!r}")
+    y = check_y(y)
     t_e, D = _int(t_e_ns, "t_e_ns"), int(view.D_ns)
     srtt = _srtt(state)
     o = np.empty(N_OBS, dtype=np.float64)
@@ -299,14 +303,17 @@ def resolve_event(
     rtt_ns: for y = 1, the RTT sample t_e - t_g; if None it is computed from the
     grant's issue time. Must be None for y = 0.
 
+    Persistent timestamps are kept on the round's clock by
+    ClientState.reset_round(K, round_start_ns=...), which the caller runs at
+    every ROUND_START.
+
     Not done here (caller, Algorithm 1): position status changes (mark_delivered
     before resolving on DATA; mark_timeout after resolving on timeout), the
     RateWindow outstanding update, Predictor.observe, recomputing p_hat / P_target.
     """
     gid = _int(grant_id, "grant_id")
     t_e = _int(t_e_ns, "t_e_ns")
-    if isinstance(y, bool) or y not in (0, 1):
-        raise ValueError(f"y must be 0 or 1, got {y!r}")
+    y = check_y(y)
     if gid not in state.outstanding:
         raise KeyError(f"grant {gid} is not outstanding for client {state.client_id}")
     if gid not in view.inflight:

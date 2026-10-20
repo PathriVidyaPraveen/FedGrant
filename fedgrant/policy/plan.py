@@ -22,7 +22,7 @@ def plan_time_ns(D_ns: int) -> int:
 
     SPEC-NOTE: floors if D_ns is not divisible by 10.
     """
-    return D_ns // 10
+    return int(D_ns) // 10
 
 
 def plan_budget(C: int, D_ns: int, t_plan_ns: int, rtt_median_ns: float) -> int:
@@ -53,6 +53,7 @@ def plan_allocate(
     Optimal for the laminar matroid {k_i <= c_i, sum k_i <= M} because each
     client's values are non-increasing (Section 3.4). Returns k_i for every client.
     """
+    M = int(M)
     if M < 0:
         raise ValueError(f"M must be >= 0, got {M}")
     if set(values) != set(caps):
@@ -74,7 +75,7 @@ def plan_allocate(
         limit[cid] = min(c, a.size)
 
     k = {cid: 0 for cid in values}
-    heap = [(-vals[cid][0], cid) for cid in sorted(values) if limit[cid] > 0]
+    heap = [(-float(vals[cid][0]), cid) for cid in sorted(values) if limit[cid] > 0]
     heapq.heapify(heap)
     total = 0
     while heap and total < M:
@@ -82,7 +83,7 @@ def plan_allocate(
         k[cid] += 1
         total += 1
         if k[cid] < limit[cid]:
-            heapq.heappush(heap, (-vals[cid][k[cid]], cid))
+            heapq.heappush(heap, (-float(vals[cid][k[cid]]), cid))
     return k
 
 

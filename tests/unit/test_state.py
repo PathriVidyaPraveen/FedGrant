@@ -13,7 +13,7 @@ from fedgrant.policy import constants as c
 
 def _ready(K: int = 5, w: float = 0.5) -> ClientState:
     st = ClientState(client_id=3, w=w, K=K)
-    st.reset_round(K, np.arange(K, 0, -1, dtype=np.float32))
+    st.reset_round(K, np.arange(K, 0, -1, dtype=np.float32), round_start_ns=0)
     return st
 
 
@@ -60,6 +60,7 @@ def test_initial_values_table2() -> None:
     assert st.rtt_last8.maxlen == 8 and st.evbuf.maxlen == 16
     assert st.h is None and st.h_stale is True
     assert st.t_last_del_ns is None and st.t_last_loss_ns is None and st.t_prev_event_ns is None
+    assert st.round_start_ns is None
     assert st.consec_loss == 0 and st.starve == 0 and st.n_resolved == 0
     assert st.cap == 45
     assert isinstance(st.srtt_ns, int) and isinstance(st.rttvar_ns, int)
@@ -126,7 +127,7 @@ def test_reset_round_keeps_persistent_and_clears_per_round() -> None:
     st.starve, st.n_resolved, st.cap = 2, 17, 9
     st.first_event_in_round = False
 
-    st.reset_round(6)
+    st.reset_round(6, round_start_ns=1_000)       # next round starts 1000 ns later
 
     assert st.K == 6 and st.val.shape == (6,) and st.status.shape == (6,)
     assert np.all(st.status == Status.UNSENT) and st.lost_heap == []
@@ -136,17 +137,51 @@ def test_reset_round_keeps_persistent_and_clears_per_round() -> None:
     assert (st.ewma_fast, st.ewma_slow) == (0.1, 0.2)
     assert list(st.hist) == [1] and list(st.rtt_last8) == [9] and len(st.evbuf) == 1
     assert st.h is not None and st.h_stale is False
-    assert (st.t_last_del_ns, st.t_last_loss_ns, st.consec_loss) == (11, 12, 3)
-    assert st.t_prev_event_ns == 13                     # persistent (event sequence persists)
+    # persistent timestamps are kept and moved onto the new round's clock
+    assert (st.t_last_del_ns, st.t_last_loss_ns, st.consec_loss) == (11 - 1_000, 12 - 1_000, 3)
+    assert st.t_prev_event_ns == 13 - 1_000
+    assert st.round_start_ns == 1_000
     assert (st.starve, st.n_resolved, st.cap) == (2, 17, 9)
     st.check_invariants()
 
 
 def test_reset_round_with_values_marks_ready() -> None:
     st = ClientState(0, 0.5, K=3)
-    st.reset_round(3, np.array([2, 1, 0], np.float32))
+    st.reset_round(3, np.array([2, 1, 0], np.float32), round_start_ns=0)
     assert st.ready is True
     np.testing.assert_array_equal(st.val, [2, 1, 0])
+
+
+def test_reset_round_requires_round_start() -> None:
+    st = ClientState(0, 0.5, K=3)
+    with pytest.raises(TypeError):
+        st.reset_round(3)  # type: ignore[call-arg]
+    with pytest.raises(TypeError):
+        st.reset_round(3, round_start_ns=1.5)  # type: ignore[arg-type]
+
+
+def test_reset_round_shifts_timestamps_across_rounds() -> None:
+    MS = 1_000_000
+    st = ClientState(0, 0.5, K=3)
+    st.reset_round(3, round_start_ns=5_000 * MS)            # round 1: no shift yet
+    assert st.t_last_del_ns is None and st.round_start_ns == 5_000 * MS
+    st.t_last_del_ns, st.t_last_loss_ns, st.t_prev_event_ns = 300 * MS, 350 * MS, 360 * MS
+    st.reset_round(3, round_start_ns=6_400 * MS)            # round 2 starts 1.4 s later
+    assert (st.t_last_del_ns, st.t_last_loss_ns, st.t_prev_event_ns) == (-1_100 * MS, -1_050 * MS, -1_040 * MS)
+    # absolute times are preserved: round_start + relative is unchanged
+    assert st.round_start_ns + st.t_last_del_ns == 5_000 * MS + 300 * MS
+    st.reset_round(3, round_start_ns=np.int64(7_800 * MS))  # NumPy int accepted
+    assert st.t_last_del_ns == -2_500 * MS and isinstance(st.t_last_del_ns, int)
+
+
+@pytest.mark.parametrize("start", [6_400, 6_399])
+def test_reset_round_rejects_non_increasing_start(start: int) -> None:
+    st = ClientState(0, 0.5, K=3)
+    st.reset_round(3, round_start_ns=6_400)
+    st.t_last_del_ns = 7
+    with pytest.raises(ValueError):
+        st.reset_round(3, round_start_ns=start)
+    assert st.t_last_del_ns == 7 and st.round_start_ns == 6_400   # unchanged on error
 
 
 # --------------------------------------------------------------------------- transitions

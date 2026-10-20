@@ -67,7 +67,8 @@ class ClientState:
     """All gateway state for one client (Table 2), plus n_resolved, ready, w,
     first_event_in_round, t_prev_event_ns and cap.
 
-    Construct with ClientState(client_id, w[, K]); __post_init__ calls reset_round(K).
+    Construct with ClientState(client_id, w[, K]); the per-round fields start at
+    their initial values. Call reset_round(K, round_start_ns=...) at every ROUND_START.
     """
 
     client_id: int
@@ -100,6 +101,7 @@ class ClientState:
     t_last_del_ns: int | None = field(init=False, default=None)    # None = no delivery yet
     t_last_loss_ns: int | None = field(init=False, default=None)   # None = no loss yet
     t_prev_event_ns: int | None = field(init=False, default=None)  # last resolution time (o3); None = no event yet
+    round_start_ns: int | None = field(init=False, default=None)   # absolute start of the current round
     consec_loss: int = field(init=False, default=0)
     starve: int = field(init=False, default=0)
     n_resolved: int = field(init=False, default=0)                 # feature 35
@@ -113,20 +115,57 @@ class ClientState:
         if not np.isfinite(w) or not 0.0 <= w <= 1.0:
             raise ValueError(f"w must be in [0, 1], got {self.w!r}")
         self.w = w
-        self.reset_round(self.K)
+        self._reset_per_round(self.K)
 
     # ------------------------------------------------------------------------
     # Round lifecycle
     # ------------------------------------------------------------------------
-    def reset_round(self, K: int, values: np.ndarray | None = None) -> None:
-        """Reset every per-round field of Table 2 (Algorithm 1, RoundStart).
+    def reset_round(
+        self, K: int, values: np.ndarray | None = None, *, round_start_ns: int
+    ) -> None:
+        """ROUND_START (Algorithm 1, RoundStart): reset every per-round field of Table 2
+        and move the persistent timestamps onto the new round's clock.
 
-        Persistent estimator fields are untouched. If `values` (val, float32 [K])
-        is given, the client is also marked ready, as by set_ready().
+        round_start_ns: absolute start time of this round on ONE clock shared by
+        all rounds (simulator time, or CLOCK_MONOTONIC in Mininet). It must
+        strictly increase from round to round.
+
+        All times inside a round are relative to its start. t_last_del,
+        t_last_loss and t_prev_event persist across rounds (Table 2; the event
+        sequence persists, Section 4.2), so they are shifted by
+        -(round_start - previous round_start) here, which keeps features 45/46
+        and observation o3 correct. The argument is required so this cannot be
+        skipped. Persistent estimator values are otherwise untouched.
+
+        If `values` (val, float32 [K]) is given, the client is also marked ready,
+        as by set_ready().
         """
-        if isinstance(K, bool) or not isinstance(K, (int, np.integer)) or int(K) < 1:
+        if isinstance(K, (bool, np.bool_)) or not isinstance(K, (int, np.integer)) or int(K) < 1:
             raise ValueError(f"K must be a positive int, got {K!r}")
-        self.K = int(K)
+        if isinstance(round_start_ns, (bool, np.bool_)) or not isinstance(round_start_ns, (int, np.integer)):
+            raise TypeError("round_start_ns must be an int (ns)")
+        start = int(round_start_ns)
+        prev = self.round_start_ns
+        if prev is not None and start <= prev:
+            raise ValueError(
+                f"round_start_ns must strictly increase across rounds: {start} <= previous {prev}"
+            )
+        if prev is not None:
+            off = start - prev
+            if self.t_last_del_ns is not None:
+                self.t_last_del_ns -= off
+            if self.t_last_loss_ns is not None:
+                self.t_last_loss_ns -= off
+            if self.t_prev_event_ns is not None:
+                self.t_prev_event_ns -= off
+        self.round_start_ns = start
+        self._reset_per_round(int(K))
+        if values is not None:
+            self.set_ready(values)
+
+    def _reset_per_round(self, K: int) -> None:
+        """Per-round fields of Table 2 to their initial values."""
+        self.K = K
         self.val = np.zeros(self.K, dtype=np.float32)
         self.status = np.zeros(self.K, dtype=np.uint8)       # all UNSENT
         self.lost_heap = []
@@ -135,8 +174,6 @@ class ClientState:
         self.m = 0
         self.ready = False
         self.first_event_in_round = True
-        if values is not None:
-            self.set_ready(values)
 
     def set_ready(self, values: np.ndarray) -> None:
         """Algorithm 1, OnReady: val <- w^2 eps (pass values_from_energies(...)); mark ready.

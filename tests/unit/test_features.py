@@ -7,7 +7,6 @@ import copy
 import numpy as np
 import pytest
 
-from fedgrant.core.estimators import rebase_timestamps
 from fedgrant.core.state import ClientState, OutstandingGrant
 from fedgrant.policy.constants import C, K, S
 from fedgrant.policy.features import (
@@ -270,7 +269,7 @@ def test_view_validation() -> None:
 
 def _obs_setup() -> tuple[ClientState, GatewayView]:
     st = ClientState(client_id=2, w=0.3)
-    st.reset_round(K, np.linspace(1, 0, K).astype(np.float32))
+    st.reset_round(K, np.linspace(1, 0, K).astype(np.float32), round_start_ns=0)
     st.srtt_ns, st.rttvar_ns = 80 * MS, 20 * MS
     st.cap = 12
     st.t_prev_event_ns = 30 * MS
@@ -387,7 +386,7 @@ def test_obs_ranges_random() -> None:
     rng = np.random.default_rng(5)
     for trial in range(200):
         st = ClientState(client_id=0, w=0.1)
-        st.reset_round(K, np.linspace(1, 0, K).astype(np.float32))
+        st.reset_round(K, np.linspace(1, 0, K).astype(np.float32), round_start_ns=0)
         st.cap = int(rng.integers(4, 60))
         view = _view(t=0, D=int(rng.integers(100, 1000)) * MS, P=float(rng.uniform(1, 90)))
         t = 0
@@ -411,16 +410,61 @@ def test_obs_ranges_random() -> None:
         assert len(st.evbuf) == min(16, st.n_resolved)             # ring buffer of T = 16
 
 
-def test_first_event_flag_resets_each_round_and_rebase() -> None:
+def test_first_event_flag_resets_each_round_and_timestamps_shift() -> None:
     st, view = _obs_setup()
     resolve_event(st, view, 7, 1, 50 * MS)
     resolve_event(st, view, 8, 0, 60 * MS)
-    rebase_timestamps(st, 1_400 * MS)                    # next round starts 1.4 s later
+    st.reset_round(K, np.linspace(1, 0, K).astype(np.float32), round_start_ns=1_400 * MS)  # 1.4 s later
     assert st.t_prev_event_ns == 60 * MS - 1_400 * MS
-    st.reset_round(K, np.linspace(1, 0, K).astype(np.float32))
     view2 = _view(t=0, D=400 * MS, P=5.0)
     _issue(st, view2, 1, 0, 0.9)
     o = resolve_event(st, view2, 1, 0, 40 * MS)
     assert o[7] == 1.0
     srtt = st.srtt_ns
     assert o[2] == f32(min((40 * MS - (60 * MS - 1_400 * MS)) / srtt, 20) / 20)
+
+
+# --------------------------------------------------------------------------- multi-round integration
+
+
+def test_multi_round_timestamps_match_absolute_clock_reference() -> None:
+    """Several rounds with idle gaps between them (T_c + D): features 45/46 and o3,
+    computed from round-relative times after reset_round(round_start_ns=...), must
+    equal an independent reference computed on one absolute clock."""
+    rng = np.random.default_rng(11)
+    st = ClientState(client_id=1, w=0.2)
+    D = 398 * MS
+    start = 7_000 * MS                                        # absolute clock, arbitrary origin
+    ref_last_del = ref_last_loss = ref_prev = None             # absolute times
+    gid = 0
+    for rnd in range(6):
+        st.reset_round(K, np.linspace(1, 0, K).astype(np.float32), round_start_ns=start)
+        view = _view(t=0, D=D, P=8.0)
+        t = 0
+        for _ in range(int(rng.integers(0 if rnd == 2 else 3, 12))):   # round 2 has no events
+            t += int(rng.integers(1 * MS, 30 * MS))
+            if t >= D:
+                break
+            view.t_ns = t
+            # features at a prediction time t vs. the absolute-clock reference
+            x = features48(st, view)
+            srtt = max(st.srtt_ns, 1)
+            abs_t = start + t
+            exp45 = 1.0 if ref_last_del is None else min((abs_t - ref_last_del) / srtt, 20) / 20
+            exp46 = 1.0 if ref_last_loss is None else min((abs_t - ref_last_loss) / srtt, 20) / 20
+            assert x[44] == np.float32(exp45) and x[45] == np.float32(exp46)
+            # one grant resolved at t
+            gid += 1
+            _issue(st, view, gid, max(t - 5 * MS, 0), 0.5)
+            y = int(rng.integers(0, 2))
+            srtt_before = max(st.srtt_ns, 1)
+            o = resolve_event(st, view, gid, y, t)
+            exp_o3 = 1.0 if ref_prev is None else min((abs_t - ref_prev) / srtt_before, 20) / 20
+            assert o[2] == np.float32(exp_o3)
+            ref_prev = abs_t
+            if y == 1:
+                ref_last_del = abs_t
+            else:
+                ref_last_loss = abs_t
+        start += 1_000 * MS + D + int(rng.integers(0, 50 * MS))    # T_c + D + jitter
+    assert ref_prev is not None and st.n_resolved > 10
