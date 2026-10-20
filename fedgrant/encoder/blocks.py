@@ -57,7 +57,7 @@ def block_energies(blocks: np.ndarray) -> np.ndarray:
     if not isinstance(blocks, np.ndarray) or blocks.dtype != np.float32 or blocks.ndim != 2:
         raise TypeError("blocks must be a 2-D float32 ndarray")
     b = np.ascontiguousarray(blocks)
-    return np.sum(b * b, axis=1, dtype=np.float32)
+    return np.asarray(np.sum(b * b, axis=1, dtype=np.float32), dtype=np.float32)
 
 
 def send_order(energies: np.ndarray) -> np.ndarray:
