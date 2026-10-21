@@ -23,6 +23,10 @@ One split per file or directory, under `data/mldata/`:
 - **Shards:** a directory `data/mldata/<split>/` of `shard_000.npz`, `shard_001.npz`, …
   Each shard is self-contained: it holds whole runs, and its `sample_end` indexes its own
   `events`. `load_split()` concatenates shards in file-name order and offsets `sample_end`.
+- **Memory:** `SplitRecorder` holds about 300 bytes per sample while recording and about
+  twice that while saving. For the 4M-sample train split, use one recorder per shard of
+  at most 100 runs (about 400k samples, about 250 MB peak) and save each as
+  `data/mldata/train/shard_XXX.npz`.
 
 ## 2. Arrays
 

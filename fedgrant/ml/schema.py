@@ -10,8 +10,6 @@ No PyTorch here: this module is imported by the simulator side as well.
 from __future__ import annotations
 
 import json
-from bisect import bisect_left
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -64,24 +62,29 @@ ALL_FIELDS = (*EVENT_FIELDS, *SAMPLE_FIELDS, *RUN_FIELDS, META_FIELD)
 # --------------------------------------------------------------------------- recorder
 
 
-@dataclass(slots=True)
-class _Sample:
-    run: int
-    client: int
-    t_ns: int
-    x48: np.ndarray
-    p_ewma: float
-    p_hmm: float
-    p_oracle: float
-    y: int | None = None
+class _Buf:
+    """Growable NumPy buffer (amortised O(1) append, no per-row Python objects)."""
+
+    __slots__ = ("a", "n")
+
+    def __init__(self, dtype: np.dtype | type, tail: tuple[int, ...] = (), cap: int = 1024) -> None:
+        self.a = np.empty((cap, *tail), dtype=dtype)
+        self.n = 0
+
+    def append(self, row: object) -> int:
+        if self.n == self.a.shape[0]:
+            grown = np.empty((2 * self.n, *self.a.shape[1:]), dtype=self.a.dtype)
+            grown[: self.n] = self.a
+            self.a = grown
+        self.a[self.n] = row
+        self.n += 1
+        return self.n - 1
+
+    def view(self) -> np.ndarray:
+        return self.a[: self.n]
 
 
-@dataclass(slots=True)
-class _Group:
-    """Events of one (run, client), in resolution order."""
-
-    t: list[int] = field(default_factory=list)
-    obs: list[np.ndarray] = field(default_factory=list)
+_UNRESOLVED = 255                      # y sentinel until the grant resolves
 
 
 class SplitRecorder:
@@ -97,19 +100,32 @@ class SplitRecorder:
     Every sample gets exactly one event (its own grant's resolution); the event
     sets the sample's label y. Windows are built at save time from event times,
     so the caller cannot get them wrong.
+
+    Memory: about 260 bytes per sample (x48 dominates), held in NumPy buffers.
+    For the 4M-sample train split, write shards (one recorder per group of runs,
+    saved as <split>/shard_000.npz, ...) to bound peak memory; see the schema doc.
     """
 
-    def __init__(self, split: str, seed_range: range | None = None, generator: str = "") -> None:
+    def __init__(self, split: str, generator: str = "") -> None:
         if split not in SPLITS:
             raise ValueError(f"unknown split {split!r}; expected one of {sorted(SPLITS)}")
         self.split = split
-        self.seed_range = SPLITS[split] if seed_range is None else seed_range
         self.generator = generator
-        self._samples: list[_Sample] = []
-        self._groups: dict[tuple[int, int], _Group] = {}
+        # samples
+        self._s_run = _Buf(np.int32)
+        self._s_client = _Buf(np.int16)
+        self._s_t = _Buf(np.int64)
+        self._s_x48 = _Buf(np.float32, (N_X48,))
+        self._s_p = _Buf(np.float32, (3,))
+        self._s_y = _Buf(np.uint8)
+        # events, in arrival order (regrouped at save time)
+        self._e_obs = _Buf(np.float32, (N_OBS,))
+        self._e_t = _Buf(np.int64)
+        self._e_run = _Buf(np.int32)
+        self._e_client = _Buf(np.int16)
+        self._last_t: dict[tuple[int, int], int] = {}      # last event time per (run, client)
         self._runs: dict[int, dict[str, Any]] = {}
-        self._open: set[int] = set()
-        self._done: set[int] = set()
+        self._unresolved: dict[int, int] = {}              # open run -> unresolved samples
 
     # -- runs
     def begin_run(self, run_id: int, seed: int, *, burst: int, pi: float, beta: float,
@@ -119,117 +135,124 @@ class SplitRecorder:
             raise ValueError(f"run {run_id} already recorded")
         if seed not in SPLITS[self.split]:
             raise ValueError(f"seed {seed} outside the {self.split} range {SPLITS[self.split]}")
+        if not 0 <= run_id <= np.iinfo(np.int32).max:
+            raise ValueError(f"run id {run_id} does not fit int32")
         self._runs[run_id] = dict(run_id=run_id, run_seed=seed, run_burst=int(burst), run_pi=float(pi),
                                   run_beta=float(beta), run_D_ns=int(D_ns), run_capacity=str(capacity))
-        self._open.add(run_id)
+        self._unresolved[run_id] = 0
 
     def end_run(self, run_id: int) -> None:
         """Close a run; every one of its samples must have been resolved."""
         run_id = int(run_id)
-        if run_id not in self._open:
+        if run_id not in self._unresolved:
             raise ValueError(f"run {run_id} is not open")
-        missing = sum(1 for s in self._samples if s.run == run_id and s.y is None)
-        if missing:
-            raise ValueError(f"run {run_id}: {missing} samples were never resolved")
-        self._open.remove(run_id)
-        self._done.add(run_id)
+        if self._unresolved[run_id]:
+            raise ValueError(f"run {run_id}: {self._unresolved[run_id]} samples were never resolved")
+        del self._unresolved[run_id]
 
     # -- samples and events
     def add_sample(self, run_id: int, client: int, t_ns: int, x48: np.ndarray,
                    p_ewma: float, p_hmm: float, p_oracle: float) -> int:
         """Record a grant issued at t_ns (features computed BEFORE the grant changes any state).
         Returns a handle to pass to add_event when the grant resolves."""
-        run_id = int(run_id)
-        if run_id not in self._open:
+        run_id, client = int(run_id), int(client)
+        if run_id not in self._unresolved:
             raise ValueError(f"run {run_id} is not open")
+        if not 0 <= client <= np.iinfo(np.int16).max:
+            raise ValueError(f"client id {client} does not fit int16")
         x = np.asarray(x48, dtype=np.float32)
         if x.shape != (N_X48,) or not np.all(np.isfinite(x)):
             raise ValueError("x48 must be 48 finite values")
         ps = (float(p_ewma), float(p_hmm), float(p_oracle))
         if not all(0.0 <= p <= 1.0 for p in ps):
             raise ValueError(f"predictions must be in [0, 1], got {ps}")
-        self._samples.append(_Sample(run_id, int(client), int(t_ns), x.copy(), *ps))
-        return len(self._samples) - 1
+        self._s_run.append(run_id)
+        self._s_client.append(client)
+        self._s_t.append(int(t_ns))
+        self._s_x48.append(x)
+        self._s_p.append(ps)
+        self._unresolved[run_id] += 1
+        return self._s_y.append(_UNRESOLVED)
 
     def add_event(self, handle: int, y: int, t_ns: int, obs: np.ndarray) -> None:
         """Record the resolution of the grant `handle` (obs from features.resolve_event)."""
-        s = self._samples[handle]
-        if s.y is not None:
-            raise ValueError(f"sample {handle} already resolved; a late DATA never edits an event")
-        if y not in (0, 1):
+        h = int(handle)
+        if not 0 <= h < self._s_y.n:
+            raise ValueError(f"unknown sample handle {handle}")
+        if self._s_y.a[h] != _UNRESOLVED:
+            raise ValueError(f"sample {h} already resolved; a late DATA never edits an event")
+        if isinstance(y, (bool, np.bool_)) or y not in (0, 1):
             raise ValueError(f"y must be 0 or 1, got {y!r}")
+        run, client, t_g = int(self._s_run.a[h]), int(self._s_client.a[h]), int(self._s_t.a[h])
+        if run not in self._unresolved:
+            raise ValueError(f"run {run} is not open")
         t = int(t_ns)
-        if t < s.t_ns:
-            raise ValueError(f"resolution at {t} before issue at {s.t_ns}")
+        if t < t_g:
+            raise ValueError(f"resolution at {t} before issue at {t_g}")
         o = np.asarray(obs, dtype=np.float32)
         if o.shape != (N_OBS,) or not np.all(np.isfinite(o)) or float(o[0]) != float(y):
             raise ValueError("obs must be 8 finite values with obs[0] == y")
-        g = self._groups.setdefault((s.run, s.client), _Group())
-        if g.t and t < g.t[-1]:
-            raise ValueError(f"events of (run {s.run}, client {s.client}) must arrive in resolution order")
-        g.t.append(t)
-        g.obs.append(o.copy())
-        s.y = int(y)
+        last = self._last_t.get((run, client))
+        if last is not None and t < last:
+            raise ValueError(f"events of (run {run}, client {client}) must arrive in resolution order")
+        self._last_t[(run, client)] = t
+        self._e_obs.append(o)
+        self._e_t.append(t)
+        self._e_run.append(run)
+        self._e_client.append(client)
+        self._s_y.a[h] = int(y)
+        self._unresolved[run] -= 1
 
     # -- output
     def arrays(self) -> dict[str, np.ndarray]:
         """Build all schema arrays (see docs/ML_DATASET_SCHEMA.md)."""
-        if self._open:
-            raise ValueError(f"runs still open: {sorted(self._open)}")
-        if any(s.y is None for s in self._samples):
-            raise ValueError("unresolved samples")
-        keys = sorted(self._groups)                       # (run, client) order
-        start: dict[tuple[int, int], int] = {}
-        ev_obs, ev_t, ev_run, ev_cli = [], [], [], []
-        pos = 0
-        for k in keys:
-            g = self._groups[k]
-            start[k] = pos
-            ev_obs.extend(g.obs)
-            ev_t.extend(g.t)
-            ev_run.extend([k[0]] * len(g.t))
-            ev_cli.extend([k[1]] * len(g.t))
-            pos += len(g.t)
-        E = pos
+        if self._unresolved:
+            raise ValueError(f"runs still open: {sorted(self._unresolved)}")
+        e_run, e_cli, e_t = self._e_run.view(), self._e_client.view(), self._e_t.view()
+        # group events by (run, client); stable sort keeps resolution order inside a group
+        order = np.lexsort((e_cli, e_run))
+        e_run, e_cli, e_t = e_run[order], e_cli[order], e_t[order]
+        E = int(order.size)
         out: dict[str, np.ndarray] = {
-            "events": np.array(ev_obs, dtype=np.float32).reshape(E, N_OBS),
-            "event_t_ns": np.array(ev_t, dtype=np.int64),
-            "event_run": np.array(ev_run, dtype=np.int32),
-            "event_client": np.array(ev_cli, dtype=np.int16),
+            "events": self._e_obs.view()[order],
+            "event_t_ns": e_t.copy(),
+            "event_run": e_run.copy(),
+            "event_client": e_cli.copy(),
         }
-        ns = len(self._samples)
+        s_run, s_cli, s_t = self._s_run.view(), self._s_client.view(), self._s_t.view()
+        ns = int(s_t.size)
+        e_key = e_run.astype(np.int64) * 65536 + e_cli.astype(np.int64)    # sorted ascending
+        s_key = s_run.astype(np.int64) * 65536 + s_cli.astype(np.int64)
+        g_lo = np.searchsorted(e_key, s_key, side="left")                 # group start (or insertion point)
+        g_hi = np.searchsorted(e_key, s_key, side="right")
         end = np.empty(ns, np.int64)
-        ln = np.empty(ns, np.int8)
-        for i, s in enumerate(self._samples):
-            k = (s.run, s.client)
-            grp = self._groups.get(k)
-            if grp is None:                                # (run, client) without events: empty window
-                j = bisect_left(keys, k)                   # at the position its group would occupy
-                end[i] = start[keys[j]] if j < len(keys) else E
-                ln[i] = 0
-                continue
-            n_prior = bisect_left(grp.t, s.t_ns)           # events with resolution time < t_g
-            end[i] = start[k] + n_prior
-            ln[i] = min(T_EVBUF, n_prior)
-        x48 = np.array([s.x48 for s in self._samples], dtype=np.float32).reshape(ns, N_X48)
+        s_order = np.argsort(s_key, kind="stable")                        # samples grouped by (run, client)
+        cuts = np.flatnonzero(np.diff(s_key[s_order])) + 1
+        for idx in np.split(s_order, cuts) if ns else []:                  # one slice per (run, client)
+            lo, hi = int(g_lo[idx[0]]), int(g_hi[idx[0]])
+            # number of this group's events with resolution time < t_g
+            end[idx] = lo + np.searchsorted(e_t[lo:hi], s_t[idx], side="left")
+        n_prior = end - g_lo
+        x48 = self._s_x48.view().copy()
+        p = self._s_p.view()
         out.update(
             sample_end=end,
-            sample_len=ln,
-            sample_t_ns=np.array([s.t_ns for s in self._samples], dtype=np.int64),
-            sample_run=np.array([s.run for s in self._samples], dtype=np.int32),
-            sample_client=np.array([s.client for s in self._samples], dtype=np.int16),
+            sample_len=np.minimum(T_EVBUF, n_prior).astype(np.int8),
+            sample_t_ns=s_t.copy(),
+            sample_run=s_run.copy(),
+            sample_client=s_cli.copy(),
             ctx=np.ascontiguousarray(x48[:, CTX_SLICE]),
             x48=x48,
-            y=np.array([s.y for s in self._samples], dtype=np.uint8),
-            p_ewma=np.array([s.p_ewma for s in self._samples], dtype=np.float32),
-            p_hmm=np.array([s.p_hmm for s in self._samples], dtype=np.float32),
-            p_oracle=np.array([s.p_oracle for s in self._samples], dtype=np.float32),
+            y=self._s_y.view().copy(),
+            p_ewma=np.ascontiguousarray(p[:, 0]),
+            p_hmm=np.ascontiguousarray(p[:, 1]),
+            p_oracle=np.ascontiguousarray(p[:, 2]),
         )
         runs = [self._runs[r] for r in sorted(self._runs)]
         for name, (dt, _) in RUN_FIELDS.items():
             out[name] = np.array([r[name] for r in runs], dtype=dt)
-        meta = dict(schema_version=SCHEMA_VERSION, split=self.split,
-                    seed_range=[self.seed_range.start, self.seed_range.stop],
+        rng = SPLITS[self.split]
+        meta = dict(schema_version=SCHEMA_VERSION, split=self.split, seed_range=[rng.start, rng.stop],
                     generator=self.generator, n_runs=len(runs), n_events=E, n_samples=ns)
         out[META_FIELD] = np.array(json.dumps(meta, sort_keys=True))
         return out

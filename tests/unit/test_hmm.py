@@ -179,6 +179,8 @@ def test_phmm_new_client_and_predict_formula() -> None:
     nxt = bg * (1 - P0) + (1 - bg) * R0
     assert h.predict(_inp([4]))[0] == np.float32(nxt * E_G + (1 - nxt) * E_B)
     assert h.predict(_inp([9]))[0] == out[1]                     # clients are independent
+    assert set(h._c) == {4}                                       # reads never create state
+    assert h.params(9) == (P0, R0)
 
 
 def test_phmm_refit_schedule_window_clip_and_refresh() -> None:

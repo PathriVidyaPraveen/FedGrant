@@ -52,6 +52,12 @@ class Fake:
             return np.full(inp.n + 1, self.value, np.float32)
         if self.mode == "range":
             return np.full(inp.n, 1.5, np.float32)
+        if self.mode == "strings":
+            return np.array(["a"] * inp.n)
+        if self.mode == "none":
+            return None  # type: ignore[return-value]
+        if self.mode == "float64":
+            return np.full(inp.n, self.value, np.float64)
         return np.full(inp.n, self.value, np.float32)
 
 
@@ -72,7 +78,8 @@ def test_ok_path_returns_primary() -> None:
 
 @pytest.mark.parametrize(
     "mode,reason", [("raise", "exception"), ("nan", "non_finite"), ("inf", "non_finite"),
-                    ("shape", "bad_output"), ("range", "bad_output")],
+                    ("shape", "bad_output"), ("range", "bad_output"), ("strings", "bad_output"),
+                    ("none", "bad_output")],
 )
 def test_bad_primary_triggers_fallback(mode: str, reason: str) -> None:
     prim = Fake(mode)
@@ -166,3 +173,10 @@ def test_empty_request() -> None:
     fp = FallbackPredictor(Fake("ok"), _warm_ewma())
     fp.reset_round(_ctx(1))
     assert fp.predict(_inp([])).shape == (0,) and not fp.in_fallback
+
+
+def test_float64_output_is_accepted_and_returned_as_float32() -> None:
+    fp = FallbackPredictor(Fake("float64"), _warm_ewma())
+    fp.reset_round(_ctx(1))
+    out = fp.predict(_inp([1, 2]))
+    assert out.dtype == np.float32 and np.all(out == np.float32(0.7)) and not fp.in_fallback

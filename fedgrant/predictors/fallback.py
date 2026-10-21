@@ -109,8 +109,14 @@ class FallbackPredictor:
                 self._trip("exception", inp.t_ns, repr(e))
             else:
                 elapsed = self._clock() - t0
-                arr = np.asarray(out)
-                if arr.shape != (inp.n,):
+                try:
+                    arr = np.asarray(out, dtype=np.float64)
+                except (TypeError, ValueError) as e:     # e.g. strings, None, ragged lists
+                    arr = None
+                    self._trip("bad_output", inp.t_ns, f"not numeric: {e!r}")
+                if arr is None:
+                    pass
+                elif arr.shape != (inp.n,):
                     self._trip("bad_output", inp.t_ns, f"shape {arr.shape}, expected ({inp.n},)")
                 elif not np.all(np.isfinite(arr)):
                     self._trip("non_finite", inp.t_ns, "")
@@ -119,5 +125,5 @@ class FallbackPredictor:
                 elif elapsed > self.time_limit_ns:
                     self._trip("timeout", inp.t_ns, f"{elapsed} ns")
                 else:
-                    return arr.astype(np.float32, copy=False)
+                    return arr.astype(np.float32)
         return self.ewma.predict(inp)

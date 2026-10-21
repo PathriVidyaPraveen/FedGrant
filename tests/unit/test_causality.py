@@ -45,57 +45,78 @@ def splits(split_paths: list[Path]) -> list[dict[str, np.ndarray]]:
     return out
 
 
-def _window_ranges(d: dict[str, np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
-    end = d["sample_end"].astype(np.int64)
-    return end - d["sample_len"].astype(np.int64), end
+def _keys(d: dict[str, np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
+    """(run, client) as one int64 key for events and for samples."""
+    ke = d["event_run"].astype(np.int64) * 65536 + d["event_client"].astype(np.int64)
+    ks = d["sample_run"].astype(np.int64) * 65536 + d["sample_client"].astype(np.int64)
+    return ke, ks
 
 
-def test_window_events_precede_the_grant_and_match_run_client(splits) -> None:
+def _prior_counts(d: dict[str, np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
+    """Independent recount, per sample: (start of its (run, client) block in events,
+    number of that block's events with resolution time < t_g). Fully vectorised:
+    events are ordered by the composite (key, time) after the checks below."""
+    ke, ks = _keys(d)
+    times = np.unique(np.concatenate([d["event_t_ns"], d["sample_t_ns"]]))
+    te = np.searchsorted(times, d["event_t_ns"])           # dense time ranks
+    ts = np.searchsorted(times, d["sample_t_ns"])
+    width = np.int64(times.size + 1)
+    ce = ke * width + te                                   # lexicographic (key, time)
+    cs = ks * width + ts
+    assert np.all(np.diff(ce) >= 0)                        # grouped by key, time order inside
+    lo = np.searchsorted(ke, ks, side="left")
+    return lo, np.searchsorted(ce, cs, side="left") - lo
+
+
+def test_events_grouped_and_in_resolution_order(splits) -> None:
     for d in splits:
-        start, end = _window_ranges(d)
-        n = (end - start).astype(np.int64)
-        assert np.all((n >= 0) & (n <= T))
-        idx = np.repeat(np.arange(len(n)), n)                     # sample of each window slot
-        ev = np.concatenate([np.arange(s, e) for s, e in zip(start, end)]) if n.sum() else np.zeros(0, int)
-        assert np.all(d["event_t_ns"][ev] < d["sample_t_ns"][idx])          # strictly before t_g
-        assert np.array_equal(d["event_run"][ev], d["sample_run"][idx])     # never crosses runs
-        assert np.array_equal(d["event_client"][ev], d["sample_client"][idx])
+        ke, _ = _keys(d)
+        assert np.all(np.diff(ke) >= 0)                    # each (run, client) is one sorted block
+        same = np.diff(ke) == 0
+        assert np.all(np.diff(d["event_t_ns"])[same] >= 0)
 
 
 def test_sample_len_is_min_16_prior_events(splits) -> None:
     for d in splits:
-        key_e = d["event_run"].astype(np.int64) * 65536 + d["event_client"].astype(np.int64)
-        key_s = d["sample_run"].astype(np.int64) * 65536 + d["sample_client"].astype(np.int64)
-        for k in np.unique(key_s):
-            ev = np.flatnonzero(key_e == k)
-            sm = np.flatnonzero(key_s == k)
-            t_ev = d["event_t_ns"][ev]
-            assert np.all(np.diff(t_ev) >= 0)                     # resolution order
-            prior = np.searchsorted(t_ev, d["sample_t_ns"][sm], side="left")   # count of t_e < t_g
-            assert np.array_equal(d["sample_len"][sm].astype(np.int64), np.minimum(T, prior))
-            if ev.size:
-                # the window is the LAST min(16, prior) events before t_g
-                assert np.array_equal(d["sample_end"][sm], ev[0] + prior)
+        lo, prior = _prior_counts(d)
+        assert np.array_equal(d["sample_len"].astype(np.int64), np.minimum(T, prior))
+        # the window is the LAST min(16, prior) events before t_g of the same block
+        assert np.array_equal(d["sample_end"], lo + prior)
 
 
-def test_events_contiguous_per_run_client(splits) -> None:
+def test_window_events_precede_the_grant_and_match_run_client(splits) -> None:
     for d in splits:
-        key = d["event_run"].astype(np.int64) * 65536 + d["event_client"].astype(np.int64)
-        change = np.flatnonzero(np.diff(key)) + 1
-        starts = np.concatenate([[0], change]) if key.size else np.zeros(0, int)
-        assert len(np.unique(key)) == len(starts)                  # each (run, client) is one block
+        ke, ks = _keys(d)
+        end = d["sample_end"].astype(np.int64)
+        n = d["sample_len"].astype(np.int64)
+        start = end - n
+        assert np.all((n >= 0) & (n <= T)) and np.all(start >= 0) and np.all(end <= ke.size)
+        w = n > 0
+        # blocks are contiguous and time-sorted (checked above), so first/last slot suffice
+        assert np.array_equal(ke[start[w]], ks[w]) and np.array_equal(ke[end[w] - 1], ks[w])
+        assert np.all(d["event_t_ns"][end[w] - 1] < d["sample_t_ns"][w])     # strictly before t_g
+        # and a direct slot-by-slot check on a sample of windows
+        rng = np.random.default_rng(0)
+        pick = rng.choice(np.flatnonzero(w), size=min(20_000, int(w.sum())), replace=False)
+        slots = np.repeat(start[pick], n[pick]) + (np.arange(int(n[pick].sum()))
+                                                   - np.repeat(np.cumsum(n[pick]) - n[pick], n[pick]))
+        owner = np.repeat(pick, n[pick])
+        assert np.all(d["event_t_ns"][slots] < d["sample_t_ns"][owner])
+        assert np.array_equal(d["event_run"][slots], d["sample_run"][owner])        # never crosses runs
+        assert np.array_equal(d["event_client"][slots], d["sample_client"][owner])
 
 
 def test_one_event_per_sample_and_labels_agree(splits) -> None:
     """Every grant resolves exactly once, so each (run, client) has as many events as
     samples, and the outcome counts match (a late DATA never adds or edits an event)."""
     for d in splits:
-        for r in np.unique(d["sample_run"]):
-            for c in np.unique(d["sample_client"][d["sample_run"] == r]):
-                sm = (d["sample_run"] == r) & (d["sample_client"] == c)
-                ev = (d["event_run"] == r) & (d["event_client"] == c)
-                assert sm.sum() == ev.sum()
-                assert d["y"][sm].sum() == d["events"][ev, 0].sum()
+        ke, ks = _keys(d)
+        u, inv = np.unique(np.concatenate([ke, ks]), return_inverse=True)
+        ie, is_ = inv[: ke.size], inv[ke.size:]
+        assert np.array_equal(np.bincount(ie, minlength=u.size), np.bincount(is_, minlength=u.size))
+        y_ev = np.bincount(ie, weights=d["events"][:, 0].astype(np.float64), minlength=u.size)
+        y_s = np.bincount(is_, weights=d["y"].astype(np.float64), minlength=u.size)
+        assert np.array_equal(y_ev, y_s)
 
 
 def test_split_isolation(splits) -> None:
@@ -109,11 +130,11 @@ def test_split_isolation(splits) -> None:
 
 
 def test_times_monotone_within_run(splits) -> None:
-    """Run-absolute clock: a later round never has earlier times."""
+    """Run-absolute clock and issue order: within a run, sample times never decrease."""
     for d in splits:
-        for r in np.unique(d["sample_run"]):
-            t = d["sample_t_ns"][d["sample_run"] == r]
-            assert np.all(np.diff(t) >= 0)                          # samples recorded in issue order
+        order = np.argsort(d["sample_run"], kind="stable")
+        same = np.diff(d["sample_run"][order]) == 0
+        assert np.all(np.diff(d["sample_t_ns"][order])[same] >= 0)
 
 
 def test_features_computed_before_the_grant(splits) -> None:
@@ -121,9 +142,8 @@ def test_features_computed_before_the_grant(splits) -> None:
     sees no outstanding grant of its own (feature 40 = 0), and the first grant of a run
     sees Phi = 0 (feature 41) and nothing delivered yet (feature 48)."""
     for d in splits:
-        key = d["sample_run"].astype(np.int64) * 65536 + d["sample_client"].astype(np.int64)
-        _, first = np.unique(key, return_index=True)
+        _, ks = _keys(d)
+        _, first = np.unique(ks, return_index=True)
         assert np.all(d["x48"][first, 39] == 0.0)
-        for r in np.unique(d["sample_run"]):
-            i0 = np.flatnonzero(d["sample_run"] == r)[0]
-            assert d["x48"][i0, 40] == 0.0 and d["x48"][i0, 47] == 0.0
+        _, first_run = np.unique(d["sample_run"], return_index=True)
+        assert np.all(d["x48"][first_run, 40] == 0.0) and np.all(d["x48"][first_run, 47] == 0.0)

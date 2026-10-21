@@ -209,17 +209,22 @@ class PHMM:
         st.belief_g = float(beliefs[-1])
         st.n_fits += 1
 
+    def _prior_next_g(self, client: int) -> float:
+        """Pr[G_next] without creating state for an unseen client (reads are side-effect free)."""
+        st = self._c.get(int(client))
+        return stationary_g(P0, R0) if st is None else st.prior_next_g()
+
     def params(self, client: int) -> tuple[float, float]:
-        """Current (p, r) of a client."""
-        st = self._get(client)
-        return st.p, st.r
+        """Current (p, r) of a client ((0.01, 0.2) if never observed)."""
+        st = self._c.get(int(client))
+        return (P0, R0) if st is None else (st.p, st.r)
 
     def value(self, client: int) -> float:
         """p_hat of one client."""
-        g = self._get(client).prior_next_g()
+        g = self._prior_next_g(client)
         return g * E_G + (1.0 - g) * E_B
 
     def predict(self, inp: PredInput) -> np.ndarray:
         """p_hat = Pr[G_next] 0.98 + Pr[B_next] 0.02 for each requested client, float32 [n]."""
-        g = np.fromiter((self._get(c).prior_next_g() for c in inp.client_ids), dtype=np.float64, count=inp.n)
+        g = np.fromiter((self._prior_next_g(c) for c in inp.client_ids), dtype=np.float64, count=inp.n)
         return (g * E_G + (1.0 - g) * E_B).astype(np.float32)
