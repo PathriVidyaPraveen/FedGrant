@@ -83,6 +83,9 @@ class ClientState:
     m: int = field(init=False)                 # delivered blocks this round
     ready: bool = field(init=False)            # READY received this round, rule (i)
     first_event_in_round: bool = field(init=False)   # for observation o8 (Section 4.2)
+    round_start_ns: int = field(init=False, default=0)
+    delivered_payloads: dict[int, np.ndarray] = field(init=False)
+    delivered_n_coords: dict[int, int] = field(init=False)
 
     # ---- persistent (Table 2 initial values) --------------------------------
     srtt_ns: int = field(init=False, default=SRTT0_NS)
@@ -117,7 +120,13 @@ class ClientState:
     # ------------------------------------------------------------------------
     # Round lifecycle
     # ------------------------------------------------------------------------
-    def reset_round(self, K: int, values: np.ndarray | None = None) -> None:
+    def reset_round(
+        self,
+        K: int,
+        values: np.ndarray | None = None,
+        *,
+        round_start_ns: int = 0,
+    ) -> None:
         """Reset every per-round field of Table 2 (Algorithm 1, RoundStart).
 
         Persistent estimator fields are untouched. If `values` (val, float32 [K])
@@ -125,6 +134,9 @@ class ClientState:
         """
         if isinstance(K, bool) or not isinstance(K, (int, np.integer)) or int(K) < 1:
             raise ValueError(f"K must be a positive int, got {K!r}")
+        if isinstance(round_start_ns, bool) or not isinstance(round_start_ns, (int, np.integer)) or int(round_start_ns) < 0:
+            raise ValueError(f"round_start_ns must be a non-negative int, got {round_start_ns!r}")
+        ready_values = None if values is None else self._validated_ready_values(values, int(K))
         self.K = int(K)
         self.val = np.zeros(self.K, dtype=np.float32)
         self.status = np.zeros(self.K, dtype=np.uint8)       # all UNSENT
@@ -134,8 +146,25 @@ class ClientState:
         self.m = 0
         self.ready = False
         self.first_event_in_round = True
-        if values is not None:
-            self.set_ready(values)
+        self.round_start_ns = int(round_start_ns)
+        self.delivered_payloads = {}
+        self.delivered_n_coords = {}
+        if ready_values is not None:
+            self.val = ready_values
+            self.ready = True
+
+    @staticmethod
+    def _validated_ready_values(values: np.ndarray, K: int) -> np.ndarray:
+        v = np.asarray(values, dtype=np.float32)
+        if v.shape != (K,):
+            raise ValueError(f"values must have shape ({K},), got {v.shape}")
+        if not np.all(np.isfinite(v)):
+            raise ValueError("values must be finite")
+        if np.any(v < 0):
+            raise ValueError("values must be non-negative")
+        if K > 1 and np.any(np.diff(v) > 0):
+            raise ValueError("values must be non-increasing in send order (Table 2)")
+        return v.copy()
 
     def set_ready(self, values: np.ndarray) -> None:
         """Algorithm 1, OnReady: val <- w^2 eps (pass values_from_energies(...)); mark ready.
@@ -145,16 +174,7 @@ class ClientState:
         rejected READY as a malformed message (Section 8: dropped and counted), and
         should ignore a duplicate READY in the same round.
         """
-        v = np.asarray(values, dtype=np.float32)
-        if v.shape != (self.K,):
-            raise ValueError(f"values must have shape ({self.K},), got {v.shape}")
-        if not np.all(np.isfinite(v)):
-            raise ValueError("values must be finite")
-        if np.any(v < 0):
-            raise ValueError("values must be non-negative")
-        if self.K > 1 and np.any(np.diff(v) > 0):
-            raise ValueError("values must be non-increasing in send order (Table 2)")
-        self.val = v.copy()
+        self.val = self._validated_ready_values(values, self.K)
         # Algorithm 1 sets unsent_ptr <- 1 here. reset_round already did so, and
         # unsent_ptr can only have moved if DATA preceded READY (push/plan modes);
         # it is then the smallest UNSENT position and must not be reset.

@@ -116,6 +116,9 @@ def test_reset_round_keeps_persistent_and_clears_per_round() -> None:
     st = _ready(K=4)
     _take_next(st)
     st.mark_delivered(1)
+    st.round_start_ns = 123
+    st.delivered_payloads[0] = np.ones(2, np.float32)
+    st.delivered_n_coords[0] = 1
     st.outstanding[1] = OutstandingGrant(pos=2, t_issue_ns=0, p_issue=0.9, timeout_ns=10)
     st.srtt_ns, st.rttvar_ns, st.bhat_bps = 123, 45, 6e6
     st.ewma_fast, st.ewma_slow = 0.1, 0.2
@@ -131,6 +134,8 @@ def test_reset_round_keeps_persistent_and_clears_per_round() -> None:
     assert np.all(st.status == Status.UNSENT) and st.lost_heap == []
     assert st.unsent_ptr == 1 and st.outstanding == {} and st.m == 0
     assert st.ready is False and st.first_event_in_round is True
+    assert st.round_start_ns == 0
+    assert st.delivered_payloads == {} and st.delivered_n_coords == {}
     assert (st.srtt_ns, st.rttvar_ns, st.bhat_bps) == (123, 45, 6e6)
     assert (st.ewma_fast, st.ewma_slow) == (0.1, 0.2)
     assert list(st.hist) == [1] and list(st.rtt_last8) == [9] and len(st.evbuf) == 1
@@ -145,6 +150,49 @@ def test_reset_round_with_values_marks_ready() -> None:
     st.reset_round(3, np.array([2, 1, 0], np.float32))
     assert st.ready is True
     np.testing.assert_array_equal(st.val, [2, 1, 0])
+
+
+def test_reset_round_rejects_bad_timestamp_without_mutating_state() -> None:
+    st = _ready(K=3)
+    _take_next(st)
+    st.mark_delivered(1)
+    st.round_start_ns = 123
+    before_status = st.status.copy()
+
+    with pytest.raises(ValueError):
+        st.reset_round(5, round_start_ns=-1)
+
+    assert st.K == 3 and st.round_start_ns == 123
+    assert st.m == 1 and st.ready is True
+    np.testing.assert_array_equal(st.status, before_status)
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        np.array([1, 2, 0, 0, 0], np.float32),
+        np.array([5, 4, 3], np.float32),
+    ],
+)
+def test_reset_round_rejects_bad_values_without_mutating_state(values: np.ndarray) -> None:
+    st = _ready(K=3)
+    _take_next(st)
+    st.mark_delivered(1)
+    st.round_start_ns = 123
+    st.delivered_payloads[0] = np.ones(2, np.float32)
+    st.delivered_n_coords[0] = 2
+    before_status = st.status.copy()
+    before_values = st.val.copy()
+
+    with pytest.raises(ValueError):
+        st.reset_round(5, values, round_start_ns=456)
+
+    assert st.K == 3 and st.round_start_ns == 123
+    assert st.m == 1 and st.ready is True
+    np.testing.assert_array_equal(st.status, before_status)
+    np.testing.assert_array_equal(st.val, before_values)
+    np.testing.assert_array_equal(st.delivered_payloads[0], np.ones(2, np.float32))
+    assert st.delivered_n_coords[0] == 2
 
 
 # --------------------------------------------------------------------------- transitions
