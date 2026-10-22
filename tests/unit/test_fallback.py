@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import time
 
 import numpy as np
 import pytest
@@ -46,8 +45,8 @@ class Fake:
             return out
         if self.mode == "inf":
             return np.full(inp.n, np.inf, np.float32)
-        if self.mode == "sleep":
-            time.sleep(0.004)
+        if self.mode == "neg_inf":
+            return np.full(inp.n, -np.inf, np.float32)
         if self.mode == "shape":
             return np.full(inp.n + 1, self.value, np.float32)
         if self.mode == "range":
@@ -78,6 +77,7 @@ def test_ok_path_returns_primary() -> None:
 
 @pytest.mark.parametrize(
     "mode,reason", [("raise", "exception"), ("nan", "non_finite"), ("inf", "non_finite"),
+                    ("neg_inf", "non_finite"),
                     ("shape", "bad_output"), ("range", "bad_output"), ("strings", "bad_output"),
                     ("none", "bad_output")],
 )
@@ -92,8 +92,9 @@ def test_bad_primary_triggers_fallback(mode: str, reason: str) -> None:
     assert (ev.round_id, ev.t_ns, ev.reason) == (3, 5_000_000, reason)
 
 
-def test_real_sleep_over_2ms_triggers_fallback() -> None:
-    fp = FallbackPredictor(Fake("sleep"), _warm_ewma())
+def test_slow_call_over_2ms_triggers_fallback_with_fake_clock() -> None:
+    ticks = iter([10, 2_000_011])
+    fp = FallbackPredictor(Fake("ok"), _warm_ewma(), clock=lambda: next(ticks))
     fp.reset_round(_ctx(1))
     out = fp.predict(_inp([1]))
     assert fp.last_reason == "timeout" and out[0] == np.float32(0.81)
