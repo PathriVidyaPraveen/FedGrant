@@ -13,7 +13,7 @@ from fedgrant.policy import constants as c
 
 def _ready(K: int = 5, w: float = 0.5) -> ClientState:
     st = ClientState(client_id=3, w=w, K=K)
-    st.reset_round(K, np.arange(K, 0, -1, dtype=np.float32))
+    st.reset_round(K, np.arange(K, 0, -1, dtype=np.float32), round_start_ns=0)
     return st
 
 
@@ -59,7 +59,9 @@ def test_initial_values_table2() -> None:
     assert st.hist.maxlen == 32 and len(st.hist) == 0
     assert st.rtt_last8.maxlen == 8 and st.evbuf.maxlen == 16
     assert st.h is None and st.h_stale is True
-    assert st.t_last_del_ns is None and st.t_last_loss_ns is None
+    assert st.t_last_del_ns is None and st.t_last_loss_ns is None and st.t_prev_event_ns is None
+    assert st.round_start_ns is None
+    assert st.delivered_payloads == {} and st.delivered_n_coords == {}
     assert st.consec_loss == 0 and st.starve == 0 and st.n_resolved == 0
     assert st.cap == 45
     assert isinstance(st.srtt_ns, int) and isinstance(st.rttvar_ns, int)
@@ -116,83 +118,111 @@ def test_reset_round_keeps_persistent_and_clears_per_round() -> None:
     st = _ready(K=4)
     _take_next(st)
     st.mark_delivered(1)
-    st.round_start_ns = 123
-    st.delivered_payloads[0] = np.ones(2, np.float32)
-    st.delivered_n_coords[0] = 1
     st.outstanding[1] = OutstandingGrant(pos=2, t_issue_ns=0, p_issue=0.9, timeout_ns=10)
     st.srtt_ns, st.rttvar_ns, st.bhat_bps = 123, 45, 6e6
     st.ewma_fast, st.ewma_slow = 0.1, 0.2
     st.hist.append(1); st.rtt_last8.append(9); st.evbuf.append(np.ones(8, np.float32))
     st.h, st.h_stale = np.ones(32, np.float32), False
     st.t_last_del_ns, st.t_last_loss_ns, st.consec_loss = 11, 12, 3
+    st.t_prev_event_ns = 13
     st.starve, st.n_resolved, st.cap = 2, 17, 9
     st.first_event_in_round = False
+    st.delivered_payloads[0] = np.ones(2, np.float32)
+    st.delivered_n_coords[0] = 1
 
-    st.reset_round(6)
+    st.reset_round(6, round_start_ns=1_000)       # next round starts 1000 ns later
 
     assert st.K == 6 and st.val.shape == (6,) and st.status.shape == (6,)
     assert np.all(st.status == Status.UNSENT) and st.lost_heap == []
     assert st.unsent_ptr == 1 and st.outstanding == {} and st.m == 0
     assert st.ready is False and st.first_event_in_round is True
-    assert st.round_start_ns == 0
     assert st.delivered_payloads == {} and st.delivered_n_coords == {}
     assert (st.srtt_ns, st.rttvar_ns, st.bhat_bps) == (123, 45, 6e6)
     assert (st.ewma_fast, st.ewma_slow) == (0.1, 0.2)
     assert list(st.hist) == [1] and list(st.rtt_last8) == [9] and len(st.evbuf) == 1
     assert st.h is not None and st.h_stale is False
-    assert (st.t_last_del_ns, st.t_last_loss_ns, st.consec_loss) == (11, 12, 3)
+    # persistent timestamps are kept and moved onto the new round's clock
+    assert (st.t_last_del_ns, st.t_last_loss_ns, st.consec_loss) == (11 - 1_000, 12 - 1_000, 3)
+    assert st.t_prev_event_ns == 13 - 1_000
+    assert st.round_start_ns == 1_000
     assert (st.starve, st.n_resolved, st.cap) == (2, 17, 9)
     st.check_invariants()
 
 
 def test_reset_round_with_values_marks_ready() -> None:
     st = ClientState(0, 0.5, K=3)
-    st.reset_round(3, np.array([2, 1, 0], np.float32))
+    st.reset_round(3, np.array([2, 1, 0], np.float32), round_start_ns=0)
     assert st.ready is True
     np.testing.assert_array_equal(st.val, [2, 1, 0])
 
 
-def test_reset_round_rejects_bad_timestamp_without_mutating_state() -> None:
-    st = _ready(K=3)
+def _used_state() -> ClientState:
+    """A ready client mid-round with delivered data and persistent timestamps."""
+    st = _ready(K=3)                               # round_start_ns = 0
     _take_next(st)
     st.mark_delivered(1)
-    st.round_start_ns = 123
-    before_status = st.status.copy()
+    st.delivered_payloads[0] = np.ones(2, np.float32)
+    st.delivered_n_coords[0] = 2
+    st.t_last_del_ns, st.t_prev_event_ns = 40, 45
+    return st
 
-    with pytest.raises(ValueError):
-        st.reset_round(5, round_start_ns=-1)
 
-    assert st.K == 3 and st.round_start_ns == 123
-    assert st.m == 1 and st.ready is True
-    np.testing.assert_array_equal(st.status, before_status)
+def _snapshot(st: ClientState) -> tuple:
+    return (st.K, st.round_start_ns, st.m, st.ready, st.status.tobytes(), st.val.tobytes(),
+            st.t_last_del_ns, st.t_prev_event_ns, st.delivered_n_coords.copy(),
+            {k: v.tobytes() for k, v in st.delivered_payloads.items()})
 
 
 @pytest.mark.parametrize(
-    "values",
+    "kwargs",
     [
-        np.array([1, 2, 0, 0, 0], np.float32),
-        np.array([5, 4, 3], np.float32),
+        dict(K=5, round_start_ns=-1),                                            # negative time
+        dict(K=5, round_start_ns=0),                                             # not increasing
+        dict(K=5, values=np.array([1, 2, 0, 0, 0], np.float32), round_start_ns=456),   # increasing values
+        dict(K=5, values=np.array([5, 4, 3], np.float32), round_start_ns=456),         # wrong length
+        dict(K=0, round_start_ns=456),                                           # bad K
     ],
 )
-def test_reset_round_rejects_bad_values_without_mutating_state(values: np.ndarray) -> None:
-    st = _ready(K=3)
-    _take_next(st)
-    st.mark_delivered(1)
-    st.round_start_ns = 123
-    st.delivered_payloads[0] = np.ones(2, np.float32)
-    st.delivered_n_coords[0] = 2
-    before_status = st.status.copy()
-    before_values = st.val.copy()
-
+def test_rejected_reset_round_leaves_state_untouched(kwargs: dict) -> None:
+    st = _used_state()
+    before = _snapshot(st)
+    K = kwargs.pop("K")
     with pytest.raises(ValueError):
-        st.reset_round(5, values, round_start_ns=456)
+        st.reset_round(K, **kwargs)
+    assert _snapshot(st) == before
+    st.check_invariants()
 
-    assert st.K == 3 and st.round_start_ns == 123
-    assert st.m == 1 and st.ready is True
-    np.testing.assert_array_equal(st.status, before_status)
-    np.testing.assert_array_equal(st.val, before_values)
-    np.testing.assert_array_equal(st.delivered_payloads[0], np.ones(2, np.float32))
-    assert st.delivered_n_coords[0] == 2
+
+def test_reset_round_requires_round_start() -> None:
+    st = ClientState(0, 0.5, K=3)
+    with pytest.raises(TypeError):
+        st.reset_round(3)  # type: ignore[call-arg]
+    with pytest.raises(TypeError):
+        st.reset_round(3, round_start_ns=1.5)  # type: ignore[arg-type]
+
+
+def test_reset_round_shifts_timestamps_across_rounds() -> None:
+    MS = 1_000_000
+    st = ClientState(0, 0.5, K=3)
+    st.reset_round(3, round_start_ns=5_000 * MS)            # round 1: no shift yet
+    assert st.t_last_del_ns is None and st.round_start_ns == 5_000 * MS
+    st.t_last_del_ns, st.t_last_loss_ns, st.t_prev_event_ns = 300 * MS, 350 * MS, 360 * MS
+    st.reset_round(3, round_start_ns=6_400 * MS)            # round 2 starts 1.4 s later
+    assert (st.t_last_del_ns, st.t_last_loss_ns, st.t_prev_event_ns) == (-1_100 * MS, -1_050 * MS, -1_040 * MS)
+    # absolute times are preserved: round_start + relative is unchanged
+    assert st.round_start_ns + st.t_last_del_ns == 5_000 * MS + 300 * MS
+    st.reset_round(3, round_start_ns=np.int64(7_800 * MS))  # NumPy int accepted
+    assert st.t_last_del_ns == -2_500 * MS and isinstance(st.t_last_del_ns, int)
+
+
+@pytest.mark.parametrize("start", [6_400, 6_399])
+def test_reset_round_rejects_non_increasing_start(start: int) -> None:
+    st = ClientState(0, 0.5, K=3)
+    st.reset_round(3, round_start_ns=6_400)
+    st.t_last_del_ns = 7
+    with pytest.raises(ValueError):
+        st.reset_round(3, round_start_ns=start)
+    assert st.t_last_del_ns == 7 and st.round_start_ns == 6_400   # unchanged on error
 
 
 # --------------------------------------------------------------------------- transitions
