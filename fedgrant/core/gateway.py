@@ -81,6 +81,8 @@ class SendRoundEnd:
 @dataclass(frozen=True, slots=True)
 class EmitAggregate:
     aggregate: Any
+    round_id: int = field(default=0, compare=False)
+    client_n_coords: Mapping[int, Mapping[int, int]] = field(default_factory=dict, compare=False)
 
 
 GatewayAction = SendRoundStart | SendGrant | SendRoundEnd | EmitAggregate
@@ -667,7 +669,16 @@ class GatewayCore:
                 self.estimator.resolve(client_id, grant, False, deadline_ns)
             self.estimator.on_deadline(deadline_ns)
         if self.aggregate is not None:
-            actions.append(EmitAggregate(self.aggregate.aggregate(self.clients)))
+            actions.append(
+                EmitAggregate(
+                    self.aggregate.aggregate(self.clients),
+                    round_id=self.round.round_id,
+                    client_n_coords={
+                        client_id: dict(state.delivered_n_coords)
+                        for client_id, state in self.clients.items()
+                    },
+                )
+            )
         return actions
 
     def _resolve_timeout(
