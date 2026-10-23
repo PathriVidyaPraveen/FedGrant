@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fedgrant"
+version = "0.1.0"
+description = "FedGrant: online, receiver-driven allocation of deadline-bounded FL uplinks under bursty loss"
+requires-python = ">=3.11"
+dependencies = ["numpy", "scipy"]
+
+[project.optional-dependencies]
+ml = ["torch", "psutil"]
+test = ["pytest"]
+
+[tool.setuptools.packages.find]
+include = ["fedgrant*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
