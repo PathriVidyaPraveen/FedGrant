@@ -250,7 +250,7 @@ def _write_csv(path: Path, rows: list[dict[str, Any]], fields: list[str]) -> Non
         w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
         for r in rows:
-            w.writerow({k: (repr(v) if isinstance(v, float) else v) for k, v in r.items()})
+            w.writerow({k: (repr(float(v)) if isinstance(v, (float, np.floating)) else v) for k, v in r.items()})
 
 
 FIELDS = {
