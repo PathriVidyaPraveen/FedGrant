@@ -10,7 +10,7 @@ requires-python = ">=3.11"
 dependencies = ["numpy", "scipy"]
 
 [project.optional-dependencies]
-ml = ["torch", "psutil"]
+ml = ["torch", "psutil", "matplotlib"]
 test = ["pytest"]
 
 [tool.setuptools.packages.find]

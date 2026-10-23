@@ -248,3 +248,13 @@ def test_missing_runs_reported_not_dropped(tmp_path) -> None:
              and g["metric"] == "eta" and g["experiment_id"] == "N-main")
     assert g["n_seeds"] == 4 and g["missing_seeds"] == "2"
     assert "missing" in (tmp_path / "t" / "groups_N-main.tex").read_text()
+
+
+def test_csv_numbers_are_plain(analysed) -> None:
+    """Every numeric cell must parse with float() (no 'np.float64(...)' reprs)."""
+    d, _ = analysed
+    for f in ("stats_groups.csv", "stats_paired.csv", "stats_mininet_vs_sim.csv"):
+        text = (d / "out" / f).read_text()
+        assert "np." not in text, f
+    for r in _read(d / "out" / "stats_paired.csv"):
+        float(r["mean_diff"]), float(r["p_holm"])
