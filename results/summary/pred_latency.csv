@@ -1,0 +1,5 @@
+case,n_clients,reps,median_us,p99_us,mean_us,spec_median_us,model_source
+gru_single_recompute,1,1000,271.4495,705.1909999999998,298.397546,180.0,"models/gru_prod.npz seed 3, mlp_prod.npz seed 4"
+gru_tick20_all_stale,20,1000,692.2555,1539.4127099999996,735.006318,360.0,"models/gru_prod.npz seed 3, mlp_prod.npz seed 4"
+gru_head20,20,1000,35.086,192.4569399999998,45.626244,6.0,"models/gru_prod.npz seed 3, mlp_prod.npz seed 4"
+mlp20,20,1000,22.179,47.19331,23.775571,,"models/gru_prod.npz seed 3, mlp_prod.npz seed 4"

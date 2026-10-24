@@ -1,0 +1,330 @@
+nohup: ignoring input
+=== start Fri Oct 23 17:36:01 UTC 2026
+=== 1. tests
+........................................................................ [ 13%]
+........................................................................ [ 26%]
+........................................................................ [ 39%]
+........................................................................ [ 52%]
+........................................................................ [ 65%]
+........................................................................ [ 78%]
+........................................................................ [ 91%]
+..............................................                           [100%]
+550 passed in 46.58s
+=== 2. synthetic data (only if missing)
+[train] run 1/10 seed=1000: 18854 samples (4s)
+[train] run 2/10 seed=1001: 40229 samples (14s)
+[train] run 3/10 seed=1002: 9210 samples (16s)
+[train] run 4/10 seed=1003: 9388 samples (18s)
+[train] run 5/10 seed=1004: 38419 samples (27s)
+[train] run 6/10 seed=1005: 9070 samples (29s)
+[train] run 7/10 seed=1006: 37239 samples (38s)
+[train] run 8/10 seed=1007: 23330 samples (43s)
+[train] run 9/10 seed=1008: 18375 samples (48s)
+[train] run 10/10 seed=1009: 18157 samples (52s)
+[train] wrote data/mldata_synth/train.npz
+[val] run 1/2 seed=2000: 17135 samples (6s)
+[val] run 2/2 seed=2001: 24140 samples (14s)
+[val] wrote data/mldata_synth/val.npz
+[test_id] run 1/2 seed=3000: 8480 samples (2s)
+[test_id] run 2/2 seed=3001: 38343 samples (13s)
+[test_id] wrote data/mldata_synth/test_id.npz
+[test_ood] run 1/2 seed=4000: 38667 samples (11s)
+[test_ood] run 2/2 seed=4001: 8784 samples (14s)
+[test_ood] wrote data/mldata_synth/test_ood.npz
+=== 3. train 5 seeds x {gru, mlp}
+== gru seed 0: /home/vidya/miniconda3/envs/fedgrant/bin/python -m fedgrant.ml.train --model gru --seed 0 --data data/mldata_synth --out models --threads 8 --device auto
+loading data/mldata_synth ...
+[gru seed 0] epoch  1  train 0.38690  val 0.26772     6.6s  *
+[gru seed 0] epoch  2  train 0.28005  val 0.23031     9.8s  *
+[gru seed 0] epoch  3  train 0.26370  val 0.21643     4.9s  *
+[gru seed 0] epoch  4  train 0.25721  val 0.21081     4.5s  *
+[gru seed 0] epoch  5  train 0.25343  val 0.20716     4.6s  *
+[gru seed 0] epoch  6  train 0.25055  val 0.20419     4.6s  *
+[gru seed 0] epoch  7  train 0.24865  val 0.20394     4.4s  *
+[gru seed 0] epoch  8  train 0.24693  val 0.20146     4.5s  *
+[gru seed 0] epoch  9  train 0.24542  val 0.20015     4.3s  *
+[gru seed 0] epoch 10  train 0.24396  val 0.19678     4.4s  *
+[gru seed 0] epoch 11  train 0.24260  val 0.19850     4.3s
+[gru seed 0] epoch 12  train 0.24172  val 0.19588     4.4s  *
+[gru seed 0] epoch 13  train 0.24083  val 0.19485     4.4s  *
+[gru seed 0] epoch 14  train 0.23995  val 0.19814     4.4s
+[gru seed 0] epoch 15  train 0.23930  val 0.19521     4.4s
+[gru seed 0] epoch 16  train 0.23836  val 0.19375     4.3s  *
+[gru seed 0] epoch 17  train 0.23765  val 0.19406     4.4s
+[gru seed 0] epoch 18  train 0.23701  val 0.19425     4.5s
+[gru seed 0] epoch 19  train 0.23639  val 0.19638     4.4s
+[gru seed 0] epoch 20  train 0.23569  val 0.19494     4.6s
+[gru seed 0] epoch 21  train 0.23487  val 0.19249     4.5s  *
+[gru seed 0] epoch 22  train 0.23466  val 0.19409     4.4s
+[gru seed 0] epoch 23  train 0.23397  val 0.19385     4.3s
+[gru seed 0] epoch 24  train 0.23313  val 0.19519     4.4s
+[gru seed 0] epoch 25  train 0.23300  val 0.19415     4.5s
+[gru seed 0] epoch 26  train 0.23210  val 0.19682     4.5s
+[gru seed 0] best epoch 21, val 0.19249; 26 epochs in 123s; peak RSS 1027 MB -> models/gru_seed0.pt
+== gru seed 1: /home/vidya/miniconda3/envs/fedgrant/bin/python -m fedgrant.ml.train --model gru --seed 1 --data data/mldata_synth --out models --threads 8 --device auto
+loading data/mldata_synth ...
+[gru seed 1] epoch  1  train 0.40434  val 0.26303     7.0s  *
+[gru seed 1] epoch  2  train 0.27562  val 0.22385     7.2s  *
+[gru seed 1] epoch  3  train 0.26078  val 0.21185     4.8s  *
+[gru seed 1] epoch  4  train 0.25527  val 0.20742     5.3s  *
+[gru seed 1] epoch  5  train 0.25223  val 0.20627     4.5s  *
+[gru seed 1] epoch  6  train 0.25022  val 0.20550     4.5s  *
+[gru seed 1] epoch  7  train 0.24830  val 0.20242     4.4s  *
+[gru seed 1] epoch  8  train 0.24681  val 0.20275     4.3s
+[gru seed 1] epoch  9  train 0.24554  val 0.20160     4.6s  *
+[gru seed 1] epoch 10  train 0.24429  val 0.20273     4.5s
+[gru seed 1] epoch 11  train 0.24318  val 0.19830     4.5s  *
+[gru seed 1] epoch 12  train 0.24220  val 0.19849     4.4s
+[gru seed 1] epoch 13  train 0.24130  val 0.19963     4.5s
+[gru seed 1] epoch 14  train 0.24073  val 0.19857     4.5s
+[gru seed 1] epoch 15  train 0.23961  val 0.19730     4.4s  *
+[gru seed 1] epoch 16  train 0.23886  val 0.19859     4.5s
+[gru seed 1] epoch 17  train 0.23822  val 0.19721     4.7s  *
+[gru seed 1] epoch 18  train 0.23764  val 0.19666     4.5s  *
+[gru seed 1] epoch 19  train 0.23741  val 0.19698     4.5s
+[gru seed 1] epoch 20  train 0.23657  val 0.19927     4.4s
+[gru seed 1] epoch 21  train 0.23597  val 0.19712     4.4s
+[gru seed 1] epoch 22  train 0.23559  val 0.19764     4.4s
+[gru seed 1] epoch 23  train 0.23513  val 0.19886     4.5s
+[gru seed 1] best epoch 18, val 0.19666; 23 epochs in 109s; peak RSS 1030 MB -> models/gru_seed1.pt
+== gru seed 2: /home/vidya/miniconda3/envs/fedgrant/bin/python -m fedgrant.ml.train --model gru --seed 2 --data data/mldata_synth --out models --threads 8 --device auto
+loading data/mldata_synth ...
+[gru seed 2] epoch  1  train 0.40254  val 0.26832     7.6s  *
+[gru seed 2] epoch  2  train 0.27529  val 0.22363     6.2s  *
+[gru seed 2] epoch  3  train 0.25947  val 0.21191     4.4s  *
+[gru seed 2] epoch  4  train 0.25427  val 0.21072     4.5s  *
+[gru seed 2] epoch  5  train 0.25160  val 0.20588     4.6s  *
+[gru seed 2] epoch  6  train 0.24953  val 0.20370     4.8s  *
+[gru seed 2] epoch  7  train 0.24778  val 0.20287     4.5s  *
+[gru seed 2] epoch  8  train 0.24637  val 0.20364     4.4s
+[gru seed 2] epoch  9  train 0.24503  val 0.20114     4.4s  *
+[gru seed 2] epoch 10  train 0.24396  val 0.19985     4.4s  *
+[gru seed 2] epoch 11  train 0.24327  val 0.19864     4.4s  *
+[gru seed 2] epoch 12  train 0.24215  val 0.19417     4.4s  *
+[gru seed 2] epoch 13  train 0.24112  val 0.19736     4.5s
+[gru seed 2] epoch 14  train 0.24036  val 0.19550     4.5s
+[gru seed 2] epoch 15  train 0.23943  val 0.19485     4.6s
+[gru seed 2] epoch 16  train 0.23877  val 0.19502     5.0s
+[gru seed 2] epoch 17  train 0.23813  val 0.19442     4.7s
+[gru seed 2] best epoch 12, val 0.19417; 17 epochs in 82s; peak RSS 1027 MB -> models/gru_seed2.pt
+== gru seed 3: /home/vidya/miniconda3/envs/fedgrant/bin/python -m fedgrant.ml.train --model gru --seed 3 --data data/mldata_synth --out models --threads 8 --device auto
+loading data/mldata_synth ...
+[gru seed 3] epoch  1  train 0.38877  val 0.26774     7.2s  *
+[gru seed 3] epoch  2  train 0.27937  val 0.22901     8.0s  *
+[gru seed 3] epoch  3  train 0.26319  val 0.21601     5.0s  *
+[gru seed 3] epoch  4  train 0.25702  val 0.20837     4.4s  *
+[gru seed 3] epoch  5  train 0.25344  val 0.20593     4.6s  *
+[gru seed 3] epoch  6  train 0.25057  val 0.20446     4.5s  *
+[gru seed 3] epoch  7  train 0.24805  val 0.20148     4.4s  *
+[gru seed 3] epoch  8  train 0.24619  val 0.19836     4.3s  *
+[gru seed 3] epoch  9  train 0.24472  val 0.19880     4.4s
+[gru seed 3] epoch 10  train 0.24328  val 0.19761     4.4s  *
+[gru seed 3] epoch 11  train 0.24204  val 0.19760     4.5s  *
+[gru seed 3] epoch 12  train 0.24113  val 0.19747     4.5s  *
+[gru seed 3] epoch 13  train 0.24009  val 0.19774     4.7s
+[gru seed 3] epoch 14  train 0.23910  val 0.19456     4.3s  *
+[gru seed 3] epoch 15  train 0.23852  val 0.19381     4.5s  *
+[gru seed 3] epoch 16  train 0.23759  val 0.19091     5.0s  *
+[gru seed 3] epoch 17  train 0.23692  val 0.19580     5.5s
+[gru seed 3] epoch 18  train 0.23630  val 0.19511     6.3s
+[gru seed 3] epoch 19  train 0.23544  val 0.19479     4.3s
+[gru seed 3] epoch 20  train 0.23487  val 0.19273     5.4s
+[gru seed 3] epoch 21  train 0.23421  val 0.19228     7.2s
+[gru seed 3] best epoch 16, val 0.19091; 21 epochs in 107s; peak RSS 1031 MB -> models/gru_seed3.pt
+== gru seed 4: /home/vidya/miniconda3/envs/fedgrant/bin/python -m fedgrant.ml.train --model gru --seed 4 --data data/mldata_synth --out models --threads 8 --device auto
+loading data/mldata_synth ...
+[gru seed 4] epoch  1  train 0.44748  val 0.27595    22.2s  *
+[gru seed 4] epoch  2  train 0.28569  val 0.23492     7.5s  *
+[gru seed 4] epoch  3  train 0.26550  val 0.21686     8.0s  *
+[gru seed 4] epoch  4  train 0.25775  val 0.21113     8.6s  *
+[gru seed 4] epoch  5  train 0.25404  val 0.20928     9.6s  *
+[gru seed 4] epoch  6  train 0.25169  val 0.20548     7.8s  *
+[gru seed 4] epoch  7  train 0.24949  val 0.20460     9.4s  *
+[gru seed 4] epoch  8  train 0.24749  val 0.20214     7.7s  *
+[gru seed 4] epoch  9  train 0.24573  val 0.20064     5.2s  *
+[gru seed 4] epoch 10  train 0.24457  val 0.20156     5.3s
+[gru seed 4] epoch 11  train 0.24320  val 0.19998     4.2s  *
+[gru seed 4] epoch 12  train 0.24232  val 0.19707     4.4s  *
+[gru seed 4] epoch 13  train 0.24185  val 0.19835     4.5s
+[gru seed 4] epoch 14  train 0.24074  val 0.19779     4.5s
+[gru seed 4] epoch 15  train 0.23989  val 0.19508     5.8s  *
+[gru seed 4] epoch 16  train 0.23921  val 0.19628     4.7s
+[gru seed 4] epoch 17  train 0.23870  val 0.19595     5.0s
+[gru seed 4] epoch 18  train 0.23800  val 0.19540     4.9s
+[gru seed 4] epoch 19  train 0.23734  val 0.19423     4.8s  *
+[gru seed 4] epoch 20  train 0.23677  val 0.19514     4.5s
+[gru seed 4] epoch 21  train 0.23627  val 0.19357     4.5s  *
+[gru seed 4] epoch 22  train 0.23594  val 0.19210     4.5s  *
+[gru seed 4] epoch 23  train 0.23518  val 0.19439     4.5s
+[gru seed 4] epoch 24  train 0.23445  val 0.19476     4.5s
+[gru seed 4] epoch 25  train 0.23396  val 0.19560     4.5s
+[gru seed 4] epoch 26  train 0.23355  val 0.19252     4.5s
+[gru seed 4] epoch 27  train 0.23283  val 0.19219     4.4s
+[gru seed 4] best epoch 22, val 0.19210; 27 epochs in 170s; peak RSS 1029 MB -> models/gru_seed4.pt
+== mlp seed 0: /home/vidya/miniconda3/envs/fedgrant/bin/python -m fedgrant.ml.train --model mlp --seed 0 --data data/mldata_synth --out models --threads 8 --device auto
+loading data/mldata_synth ...
+[mlp seed 0] epoch  1  train 0.38663  val 0.26806     0.4s  *
+[mlp seed 0] epoch  2  train 0.28137  val 0.24115     0.4s  *
+[mlp seed 0] epoch  3  train 0.26504  val 0.23158     0.4s  *
+[mlp seed 0] epoch  4  train 0.25566  val 0.22282     0.4s  *
+[mlp seed 0] epoch  5  train 0.24919  val 0.21846     0.5s  *
+[mlp seed 0] epoch  6  train 0.24558  val 0.21314     0.4s  *
+[mlp seed 0] epoch  7  train 0.24304  val 0.21064     0.5s  *
+[mlp seed 0] epoch  8  train 0.24097  val 0.20568     0.5s  *
+[mlp seed 0] epoch  9  train 0.23946  val 0.20687     0.4s
+[mlp seed 0] epoch 10  train 0.23806  val 0.20359     0.3s  *
+[mlp seed 0] epoch 11  train 0.23662  val 0.21100     0.4s
+[mlp seed 0] epoch 12  train 0.23541  val 0.20513     0.5s
+[mlp seed 0] epoch 13  train 0.23471  val 0.20505     0.4s
+[mlp seed 0] epoch 14  train 0.23374  val 0.20449     0.3s
+[mlp seed 0] epoch 15  train 0.23258  val 0.20688     0.4s
+[mlp seed 0] best epoch 10, val 0.20359; 15 epochs in 6s; peak RSS 840 MB -> models/mlp_seed0.pt
+== mlp seed 1: /home/vidya/miniconda3/envs/fedgrant/bin/python -m fedgrant.ml.train --model mlp --seed 1 --data data/mldata_synth --out models --threads 8 --device auto
+loading data/mldata_synth ...
+[mlp seed 1] epoch  1  train 0.37474  val 0.26355     0.4s  *
+[mlp seed 1] epoch  2  train 0.27591  val 0.24195     0.4s  *
+[mlp seed 1] epoch  3  train 0.26510  val 0.23545     0.3s  *
+[mlp seed 1] epoch  4  train 0.25863  val 0.23038     0.4s  *
+[mlp seed 1] epoch  5  train 0.25310  val 0.22316     0.5s  *
+[mlp seed 1] epoch  6  train 0.24836  val 0.21917     0.6s  *
+[mlp seed 1] epoch  7  train 0.24522  val 0.21497     0.5s  *
+[mlp seed 1] epoch  8  train 0.24272  val 0.21050     0.6s  *
+[mlp seed 1] epoch  9  train 0.24075  val 0.21121     0.5s
+[mlp seed 1] epoch 10  train 0.23896  val 0.21078     0.4s
+[mlp seed 1] epoch 11  train 0.23729  val 0.20855     0.5s  *
+[mlp seed 1] epoch 12  train 0.23606  val 0.20526     0.5s  *
+[mlp seed 1] epoch 13  train 0.23479  val 0.21090     0.4s
+[mlp seed 1] epoch 14  train 0.23342  val 0.20971     0.5s
+[mlp seed 1] epoch 15  train 0.23229  val 0.20560     0.5s
+[mlp seed 1] epoch 16  train 0.23119  val 0.20556     0.4s
+[mlp seed 1] epoch 17  train 0.23047  val 0.20690     0.6s
+[mlp seed 1] best epoch 12, val 0.20526; 17 epochs in 8s; peak RSS 839 MB -> models/mlp_seed1.pt
+== mlp seed 2: /home/vidya/miniconda3/envs/fedgrant/bin/python -m fedgrant.ml.train --model mlp --seed 2 --data data/mldata_synth --out models --threads 8 --device auto
+loading data/mldata_synth ...
+[mlp seed 2] epoch  1  train 0.36152  val 0.26463     0.4s  *
+[mlp seed 2] epoch  2  train 0.27517  val 0.23975     0.4s  *
+[mlp seed 2] epoch  3  train 0.26305  val 0.23282     0.4s  *
+[mlp seed 2] epoch  4  train 0.25632  val 0.22660     0.4s  *
+[mlp seed 2] epoch  5  train 0.25122  val 0.21680     0.4s  *
+[mlp seed 2] epoch  6  train 0.24724  val 0.21696     0.4s
+[mlp seed 2] epoch  7  train 0.24451  val 0.21202     0.4s  *
+[mlp seed 2] epoch  8  train 0.24219  val 0.21307     0.4s
+[mlp seed 2] epoch  9  train 0.24030  val 0.20849     0.4s  *
+[mlp seed 2] epoch 10  train 0.23850  val 0.20779     0.4s  *
+[mlp seed 2] epoch 11  train 0.23716  val 0.20661     0.4s  *
+[mlp seed 2] epoch 12  train 0.23602  val 0.20465     0.3s  *
+[mlp seed 2] epoch 13  train 0.23465  val 0.20845     0.4s
+[mlp seed 2] epoch 14  train 0.23348  val 0.20684     0.5s
+[mlp seed 2] epoch 15  train 0.23226  val 0.20302     0.3s  *
+[mlp seed 2] epoch 16  train 0.23136  val 0.20558     0.4s
+[mlp seed 2] epoch 17  train 0.23063  val 0.20212     0.4s  *
+[mlp seed 2] epoch 18  train 0.22968  val 0.20982     0.4s
+[mlp seed 2] epoch 19  train 0.22888  val 0.20287     0.4s
+[mlp seed 2] epoch 20  train 0.22774  val 0.20601     0.3s
+[mlp seed 2] epoch 21  train 0.22759  val 0.20266     0.5s
+[mlp seed 2] epoch 22  train 0.22679  val 0.20312     0.4s
+[mlp seed 2] best epoch 17, val 0.20212; 22 epochs in 9s; peak RSS 838 MB -> models/mlp_seed2.pt
+== mlp seed 3: /home/vidya/miniconda3/envs/fedgrant/bin/python -m fedgrant.ml.train --model mlp --seed 3 --data data/mldata_synth --out models --threads 8 --device auto
+loading data/mldata_synth ...
+[mlp seed 3] epoch  1  train 0.36140  val 0.26133     0.4s  *
+[mlp seed 3] epoch  2  train 0.27410  val 0.23712     0.6s  *
+[mlp seed 3] epoch  3  train 0.26081  val 0.22945     0.5s  *
+[mlp seed 3] epoch  4  train 0.25314  val 0.22193     0.4s  *
+[mlp seed 3] epoch  5  train 0.24849  val 0.21712     0.4s  *
+[mlp seed 3] epoch  6  train 0.24538  val 0.21394     0.5s  *
+[mlp seed 3] epoch  7  train 0.24320  val 0.21462     0.5s
+[mlp seed 3] epoch  8  train 0.24124  val 0.21144     0.4s  *
+[mlp seed 3] epoch  9  train 0.23976  val 0.21193     0.4s
+[mlp seed 3] epoch 10  train 0.23830  val 0.21467     0.4s
+[mlp seed 3] epoch 11  train 0.23722  val 0.20848     0.4s  *
+[mlp seed 3] epoch 12  train 0.23584  val 0.20930     0.5s
+[mlp seed 3] epoch 13  train 0.23478  val 0.20775     0.4s  *
+[mlp seed 3] epoch 14  train 0.23368  val 0.20846     0.4s
+[mlp seed 3] epoch 15  train 0.23291  val 0.21123     0.4s
+[mlp seed 3] epoch 16  train 0.23181  val 0.20678     0.4s  *
+[mlp seed 3] epoch 17  train 0.23108  val 0.20652     0.3s  *
+[mlp seed 3] epoch 18  train 0.23013  val 0.20810     0.5s
+[mlp seed 3] epoch 19  train 0.22944  val 0.21016     0.6s
+[mlp seed 3] epoch 20  train 0.22857  val 0.20648     0.5s  *
+[mlp seed 3] epoch 21  train 0.22765  val 0.20483     0.4s  *
+[mlp seed 3] epoch 22  train 0.22714  val 0.20689     0.4s
+[mlp seed 3] epoch 23  train 0.22640  val 0.20600     0.5s
+[mlp seed 3] epoch 24  train 0.22590  val 0.20407     0.4s  *
+[mlp seed 3] epoch 25  train 0.22515  val 0.20392     0.4s  *
+[mlp seed 3] epoch 26  train 0.22453  val 0.20683     0.5s
+[mlp seed 3] epoch 27  train 0.22441  val 0.20633     0.3s
+[mlp seed 3] epoch 28  train 0.22326  val 0.20440     0.4s
+[mlp seed 3] epoch 29  train 0.22272  val 0.20628     0.5s
+[mlp seed 3] epoch 30  train 0.22243  val 0.20786     0.4s
+[mlp seed 3] best epoch 25, val 0.20392; 30 epochs in 13s; peak RSS 839 MB -> models/mlp_seed3.pt
+== mlp seed 4: /home/vidya/miniconda3/envs/fedgrant/bin/python -m fedgrant.ml.train --model mlp --seed 4 --data data/mldata_synth --out models --threads 8 --device auto
+loading data/mldata_synth ...
+[mlp seed 4] epoch  1  train 0.38056  val 0.26385     0.4s  *
+[mlp seed 4] epoch  2  train 0.27696  val 0.24104     0.5s  *
+[mlp seed 4] epoch  3  train 0.26372  val 0.23313     0.4s  *
+[mlp seed 4] epoch  4  train 0.25589  val 0.22342     0.5s  *
+[mlp seed 4] epoch  5  train 0.25029  val 0.22095     0.4s  *
+[mlp seed 4] epoch  6  train 0.24667  val 0.21409     0.4s  *
+[mlp seed 4] epoch  7  train 0.24440  val 0.21238     0.3s  *
+[mlp seed 4] epoch  8  train 0.24217  val 0.20859     0.3s  *
+[mlp seed 4] epoch  9  train 0.24043  val 0.21057     0.3s
+[mlp seed 4] epoch 10  train 0.23913  val 0.21110     0.3s
+[mlp seed 4] epoch 11  train 0.23772  val 0.20622     0.3s  *
+[mlp seed 4] epoch 12  train 0.23649  val 0.20744     0.3s
+[mlp seed 4] epoch 13  train 0.23574  val 0.20632     0.3s
+[mlp seed 4] epoch 14  train 0.23425  val 0.20694     0.3s
+[mlp seed 4] epoch 15  train 0.23303  val 0.20455     0.3s  *
+[mlp seed 4] epoch 16  train 0.23210  val 0.20381     0.4s  *
+[mlp seed 4] epoch 17  train 0.23137  val 0.20499     0.4s
+[mlp seed 4] epoch 18  train 0.23038  val 0.20302     0.4s  *
+[mlp seed 4] epoch 19  train 0.22951  val 0.20245     0.4s  *
+[mlp seed 4] epoch 20  train 0.22854  val 0.20400     0.3s
+[mlp seed 4] epoch 21  train 0.22789  val 0.20510     0.3s
+[mlp seed 4] epoch 22  train 0.22781  val 0.20117     0.3s  *
+[mlp seed 4] epoch 23  train 0.22669  val 0.20543     0.3s
+[mlp seed 4] epoch 24  train 0.22588  val 0.20403     0.3s
+[mlp seed 4] epoch 25  train 0.22536  val 0.20533     0.3s
+[mlp seed 4] epoch 26  train 0.22489  val 0.20356     0.3s
+[mlp seed 4] epoch 27  train 0.22410  val 0.20273     0.3s
+[mlp seed 4] best epoch 22, val 0.20117; 27 epochs in 9s; peak RSS 838 MB -> models/mlp_seed4.pt
+done in 682s; production seeds: gru=3, mlp=4
+=== 4. export production models
+gru: seed 3 (val loss 0.19091) -> models/gru_prod.npz
+mlp: seed 4 (val loss 0.20117) -> models/mlp_prod.npz
+=== 5. evaluate all predictors
+evaluating test_id ...
+evaluating test_ood ...
+  test_id  ewma   Brier 0.11325 (n_seeds=1)
+  test_id  hmm    Brier 0.11444 (n_seeds=1)
+  test_id  oracle Brier 0.01119 (n_seeds=1)
+  test_id  mlp    Brier 0.06484 (n_seeds=5)
+  test_id  gru    Brier 0.06202 (n_seeds=5)
+  test_ood ewma   Brier 0.18613 (n_seeds=1)
+  test_ood hmm    Brier 0.20285 (n_seeds=1)
+  test_ood oracle Brier 0.02732 (n_seeds=1)
+  test_ood mlp    Brier 0.14186 (n_seeds=5)
+  test_ood gru    Brier 0.13823 (n_seeds=5)
+wrote results/summary/ml_metrics.csv, ml_metrics_summary.csv, ml_paired.csv, ml_reliability.csv
+=== 6. latency benchmark
+NumPy 2.4.6, single thread, 1000 reps, models: models/gru_prod.npz seed 3, mlp_prod.npz seed 4
+case                       n  median_us     p99_us  spec_us
+gru_single_recompute       1      271.4      705.2      180
+gru_tick20_all_stale      20      692.3     1539.4      360
+gru_head20                20       35.1      192.5        6
+mlp20                     20       22.2       47.2        -
+wrote results/summary/pred_latency.csv
+=== 7. figures
+wrote results/figures/ml_reliability.pdf
+wrote results/figures/ml_metrics.pdf
+wrote results/figures/ml_latency.pdf
+=== 8. tests again (now with real models present)
+........................................................................ [ 13%]
+........................................................................ [ 26%]
+........................................................................ [ 39%]
+........................................................................ [ 52%]
+........................................................................ [ 65%]
+........................................................................ [ 78%]
+........................................................................ [ 91%]
+..............................................                           [100%]
+550 passed in 40.62s
+=== DONE Fri Oct 23 17:50:48 UTC 2026

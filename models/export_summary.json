@@ -1,0 +1,30 @@
+{
+ "gru": {
+  "model": "gru",
+  "production_seed": 3,
+  "best_val_loss": 0.1909147924080103,
+  "seed_val_losses": {
+   "0": 0.19248905729482133,
+   "1": 0.19666053480844942,
+   "2": 0.19416933037742276,
+   "3": 0.1909147924080103,
+   "4": 0.19210393322228952
+  },
+  "file": "models/gru_prod.npz",
+  "source_checkpoint": "gru_seed3.pt"
+ },
+ "mlp": {
+  "model": "mlp",
+  "production_seed": 4,
+  "best_val_loss": 0.20116640364741065,
+  "seed_val_losses": {
+   "0": 0.20358540988416113,
+   "1": 0.20526474248561477,
+   "2": 0.20212470070222593,
+   "3": 0.20391905592254694,
+   "4": 0.20116640364741065
+  },
+  "file": "models/mlp_prod.npz",
+  "source_checkpoint": "mlp_seed4.pt"
+ }
+}

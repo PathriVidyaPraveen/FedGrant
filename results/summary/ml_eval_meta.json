@@ -1,0 +1,83 @@
+{
+ "seeds_requested": [
+  0,
+  1,
+  2,
+  3,
+  4
+ ],
+ "splits": {
+  "test_id": {
+   "n_samples": 46823,
+   "positive_rate": 0.8824082181833715,
+   "data_meta": {
+    "generator": "fedgrant.ml.synthetic",
+    "n_events": 46823,
+    "n_runs": 2,
+    "n_samples": 46823,
+    "schema_version": 1,
+    "seed_range": [
+     3000,
+     3100
+    ],
+    "split": "test_id"
+   },
+   "seeds_found": {
+    "mlp": [
+     0,
+     1,
+     2,
+     3,
+     4
+    ],
+    "gru": [
+     0,
+     1,
+     2,
+     3,
+     4
+    ]
+   },
+   "seeds_missing": {
+    "mlp": [],
+    "gru": []
+   }
+  },
+  "test_ood": {
+   "n_samples": 47451,
+   "positive_rate": 0.7906682683188974,
+   "data_meta": {
+    "generator": "fedgrant.ml.synthetic",
+    "n_events": 47451,
+    "n_runs": 2,
+    "n_samples": 47451,
+    "schema_version": 1,
+    "seed_range": [
+     4000,
+     4100
+    ],
+    "split": "test_ood"
+   },
+   "seeds_found": {
+    "mlp": [
+     0,
+     1,
+     2,
+     3,
+     4
+    ],
+    "gru": [
+     0,
+     1,
+     2,
+     3,
+     4
+    ]
+   },
+   "seeds_missing": {
+    "mlp": [],
+    "gru": []
+   }
+  }
+ }
+}
