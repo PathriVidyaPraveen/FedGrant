@@ -23,7 +23,12 @@ def test_fl_simulated_smoke() -> None:
     delivered bitmap -> error feedback update -> server model aggregation -> evaluation.
     """
     seed = 42
-    dataset = load_femnist("data/femnist/leaf/data", "data/femnist/clients", 200, 10)
+    dataset = load_femnist(
+        "data/femnist/reproduced/leaf/data",
+        "data/femnist/reproduced/clients",
+        200,
+        10,
+    )
     train_clients = [client.load_train() for client in dataset.clients]
     weights = dataset.client_weights
     loaders = make_client_loaders(train_clients, master_seed=seed, batch_size=32)
