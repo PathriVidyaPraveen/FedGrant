@@ -12,10 +12,16 @@ from fedgrant.baselines.b2_udp import (
     encode_data_packet,
 )
 from fedgrant.baselines.b3_plan import (
+    B3ClientPlan,
     B3GatewayCore,
     B3PlanError,
     B3UdpClient,
     B3UdpGateway,
+)
+from fedgrant.baselines.b3_pacing import (
+    data_frame_size_bytes,
+    paced_blocks_sent,
+    pacing_send_time_ns,
 )
 from fedgrant.common.constants import MessageType
 from fedgrant.common.wire import decode_message, encode_message
@@ -460,7 +466,7 @@ def test_missing_reordered_and_duplicate_data_do_not_forge_delivery_or_backlog()
         1, 1, 2, 2, np.asarray([3.0, 0.0], dtype=np.float16),
         send_pos=3, t_send_ns=core.deadline_ns + 1,
     )
-    with pytest.raises(B3PlanError, match="invalid B3 DATA"):
+    with pytest.raises(B3PlanError, match="closed"):
         core.accept_data(missing_packet, core.deadline_ns + 1)
     assert result.round_result.client_results[1].delivered_indices == (0, 1)
 
@@ -494,3 +500,343 @@ def test_delayed_final_data_at_deadline_counts_once_and_completes_delivery_ratio
     result = core.finish(core.deadline_ns)
     assert result.round_result.client_results[1].packets_received == blocks
     assert core.delivery_ewma.get(1) == pytest.approx(0.19)
+
+
+def test_shared_pacing_helper_boundaries_and_validation() -> None:
+    start_ns = 1_000_000_000
+    rate_bps = 800
+    size_bytes = 10
+    interval_ns = 100_000_000
+    assert paced_blocks_sent(
+        start_ns - 1,
+        t_start_ns=start_ns,
+        k=3,
+        rate_bps=rate_bps,
+        block_size_bytes=size_bytes,
+    ) == 0
+    assert paced_blocks_sent(
+        start_ns,
+        t_start_ns=start_ns,
+        k=3,
+        rate_bps=rate_bps,
+        block_size_bytes=size_bytes,
+    ) == 1
+    assert paced_blocks_sent(
+        start_ns + interval_ns - 1,
+        t_start_ns=start_ns,
+        k=3,
+        rate_bps=rate_bps,
+        block_size_bytes=size_bytes,
+    ) == 1
+    assert paced_blocks_sent(
+        start_ns + interval_ns,
+        t_start_ns=start_ns,
+        k=3,
+        rate_bps=rate_bps,
+        block_size_bytes=size_bytes,
+    ) == 2
+    assert paced_blocks_sent(
+        start_ns + 3 * interval_ns,
+        t_start_ns=start_ns,
+        k=3,
+        rate_bps=rate_bps,
+        block_size_bytes=size_bytes,
+    ) == 3
+    assert paced_blocks_sent(
+        start_ns,
+        t_start_ns=start_ns,
+        k=0,
+        rate_bps=0,
+        block_size_bytes=size_bytes,
+    ) == 0
+    assert pacing_send_time_ns(
+        3,
+        t_start_ns=start_ns,
+        k=3,
+        rate_bps=rate_bps,
+        block_size_bytes=size_bytes,
+    ) == start_ns + 2 * interval_ns
+    with pytest.raises(ValueError, match="positive"):
+        paced_blocks_sent(
+            start_ns,
+            t_start_ns=start_ns,
+            k=1,
+            rate_bps=0,
+            block_size_bytes=size_bytes,
+        )
+    with pytest.raises(ValueError, match="block_size_bytes"):
+        paced_blocks_sent(
+            start_ns,
+            t_start_ns=start_ns,
+            k=1,
+            rate_bps=rate_bps,
+            block_size_bytes=0,
+        )
+    with pytest.raises(ValueError, match="u64"):
+        paced_blocks_sent(
+            1 << 64,
+            t_start_ns=0,
+            k=1,
+            rate_bps=rate_bps,
+            block_size_bytes=size_bytes,
+        )
+    with pytest.raises(ValueError, match="u64 range"):
+        pacing_send_time_ns(
+            2,
+            t_start_ns=(1 << 64) - 1,
+            k=2,
+            rate_bps=1,
+            block_size_bytes=size_bytes,
+        )
+
+
+def test_first_data_position_one_refines_start_from_plan_and_rtt() -> None:
+    core, blocks = _planned_single_client()
+    plan = core.plans[1]
+    srtt_at_plan = core.plan_srtt_ns[1]
+    frame_size = data_frame_size_bytes(core.L)
+    candidate = plan.sent_ns + 5_000_000
+    arrival_ns = candidate + srtt_at_plan // 2
+    packet = encode_data_packet(
+        1, 1, 0, 2, np.asarray([1.0, 0.0], dtype=np.float16),
+        send_pos=1, t_send_ns=plan.sent_ns,
+    )
+    core.accept_data(packet, arrival_ns)
+    assert blocks == 3
+    assert core.transmission_start_ns[1] == candidate
+    assert frame_size == 78
+
+
+def test_first_data_position_after_one_accounts_for_pacing_offset() -> None:
+    core, blocks = _planned_single_client()
+    plan = core.plans[1]
+    offset = pacing_send_time_ns(
+        2,
+        t_start_ns=0,
+        k=blocks,
+        rate_bps=plan.rate_bps,
+        block_size_bytes=data_frame_size_bytes(core.L),
+    )
+    candidate = plan.sent_ns + 7_000_000
+    packet = encode_data_packet(
+        1, 1, 1, 2, np.asarray([2.0, 0.0], dtype=np.float16),
+        send_pos=2, t_send_ns=plan.sent_ns,
+    )
+    core.accept_data(packet, candidate + core.plan_srtt_ns[1] // 2 + offset)
+    assert core.transmission_start_ns[1] == candidate
+
+
+def test_multiple_data_refines_start_to_minimum_and_never_before_plan() -> None:
+    core, blocks = _planned_single_client()
+    plan = core.plans[1]
+    frame_size = data_frame_size_bytes(core.L)
+    half_rtt = core.plan_srtt_ns[1] // 2
+    offset_1 = pacing_send_time_ns(
+        1, t_start_ns=0, k=blocks, rate_bps=plan.rate_bps, block_size_bytes=frame_size
+    )
+    offset_2 = pacing_send_time_ns(
+        2, t_start_ns=0, k=blocks, rate_bps=plan.rate_bps, block_size_bytes=frame_size
+    )
+    first_candidate = plan.sent_ns + 10_000_000
+    first = encode_data_packet(
+        1, 1, 0, 2, np.asarray([1.0, 0.0], dtype=np.float16),
+        send_pos=1, t_send_ns=plan.sent_ns,
+    )
+    core.accept_data(first, first_candidate + half_rtt + offset_1)
+    second_candidate = plan.sent_ns + 9_900_000
+    second = encode_data_packet(
+        1, 1, 1, 2, np.asarray([2.0, 0.0], dtype=np.float16),
+        send_pos=2, t_send_ns=plan.sent_ns,
+    )
+    core.accept_data(second, second_candidate + half_rtt + offset_2)
+    assert core.transmission_start_ns[1] == second_candidate
+
+    earlier_candidate = plan.sent_ns + 9_800_000
+    third = encode_data_packet(
+        1, 1, 2, 2, np.asarray([3.0, 0.0], dtype=np.float16),
+        send_pos=3, t_send_ns=plan.sent_ns,
+    )
+    core.accept_data(third, earlier_candidate + half_rtt + pacing_send_time_ns(
+        3, t_start_ns=0, k=blocks, rate_bps=plan.rate_bps, block_size_bytes=frame_size
+    ))
+    assert core.transmission_start_ns[1] == earlier_candidate
+
+    clamped, clamped_blocks = _planned_single_client()
+    clamped_plan = clamped.plans[1]
+    before_plan = encode_data_packet(
+        1, 1, 0, 2, np.asarray([1.0, 0.0], dtype=np.float16),
+        send_pos=1, t_send_ns=clamped_plan.sent_ns,
+    )
+    clamped.accept_data(
+        before_plan,
+        clamped_plan.sent_ns - 10_000_000 + clamped.plan_srtt_ns[1] // 2,
+    )
+    assert clamped.transmission_start_ns[1] == clamped_plan.sent_ns
+    assert clamped_blocks == 3
+
+
+def test_no_data_uses_plan_plus_half_rtt_fallback_for_windows_and_loss_rate() -> None:
+    core = B3GatewayCore(
+        round_id=1,
+        start_ns=0,
+        deadline_ns=1_000_000_000,
+        d=200,
+        L=2,
+        client_weights={1: 1.0},
+    )
+    core.states[1].bhat_bps = 100_000.0
+    core.compute_plans(core.plan_ns)
+    core.plans[1] = B3ClientPlan(1, 100, 100_000, core.plan_ns)
+    core._plan_sent.add(1)
+    core.plan_srtt_ns[1] = 100_000_000
+    core.transmission_start_ns[1] = core.plan_ns + 50_000_000
+    assert core.transmission_start_ns[1] == 150_000_000
+
+    result = core.finish(core.deadline_ns)
+    assert result.round_result.delivered_blocks == 0
+    # Windows [200, 300) through [600, 700) began after t_start and still
+    # had paced blocks due after their end. Each empty backlogged window applies
+    # the existing 0.7 old-rate multiplier.
+    assert core.states[1].bhat_bps == pytest.approx(100_000.0 * 0.7**5)
+    assert core.delivery_ewma.get(1) == pytest.approx(0.09)
+
+
+@pytest.mark.parametrize(
+    ("window_start", "t_start", "k", "rate", "expected_backlogged"),
+    [
+        (1_000_000_000, 1_200_000_000, 100, 100_000, False),
+        (1_000_000_000, 1_050_000_000, 100, 100_000, False),
+        (1_100_000_000, 1_100_000_000, 100, 100_000, True),
+        (1_100_000_000, 1_100_000_000, 3, 1_000_000, False),
+    ],
+)
+def test_rate_window_backlog_uses_shared_pacing_progress(
+    window_start: int,
+    t_start: int,
+    k: int,
+    rate: int,
+    expected_backlogged: bool,
+) -> None:
+    core = _core(client_ids=(1,))
+    core.compute_plans(core.plan_ns)
+    core.plans[1] = B3ClientPlan(1, k, rate, core.plan_ns)
+    core._plan_sent.add(1)
+    core.plan_srtt_ns[1] = 0
+    core.transmission_start_ns[1] = t_start
+    core.windows[1].start(window_start)
+    old_rate = core.states[1].bhat_bps
+    core._advance_rate_window(1, window_start + 100_000_000, backlogged=None)
+    expected = old_rate * 0.7 if expected_backlogged else old_rate
+    assert core.states[1].bhat_bps == pytest.approx(expected)
+
+
+def test_client_and_gateway_use_same_pacing_schedule_and_send_positions() -> None:
+    async def scenario() -> None:
+        gateway_core = _core(client_ids=(1,), bottleneck_bps=1_000_000)
+        gateway_core.accept_ready(_ready(1), gateway_core.plan_ns)
+        gateway_core.states[1].bhat_bps = 1_500_000.0
+        gateway_plan = gateway_core.compute_plans(gateway_core.plan_ns)[1]
+        assert gateway_plan.blocks == 3
+        start_ns = gateway_core.plan_ns + 1
+        gateway_core.mark_plan_sent(1, start_ns)
+        clock = _FakeClock(start_ns)
+        client_core = B2ClientCore(1, d=6, L=2)
+        client = B3UdpClient(
+            client_core,
+            gateway_addr=("127.0.0.1", 9102),
+            update_provider=lambda _round: np.asarray(
+                [1.0, 2.0, 3.0, 4.0, 5.0, 6.0], dtype=np.float32
+            ),
+            clock_ns=clock,
+            sleep=clock.sleep,
+        )
+        transport = _FakeTransport()
+        client.connection_made(transport)  # type: ignore[arg-type]
+        deadline_ns = gateway_core.deadline_ns
+        round_start = encode_message(
+            MessageType.ROUND_START,
+            round_id=1,
+            client_id=1,
+            t_send_ns=start_ns,
+            body={
+                "deadline_ns": deadline_ns,
+                "K": 3,
+                "L": 2,
+                "rho_us": 0,
+                "mode": 2,
+            },
+        )
+        client.datagram_received(round_start, ("127.0.0.1", 9102))
+        rate = gateway_plan.rate_bps
+        plan = encode_message(
+            MessageType.PLAN,
+            round_id=1,
+            client_id=1,
+            t_send_ns=start_ns,
+            body={"k": gateway_plan.blocks, "rate_bps": rate},
+        )
+        client.datagram_received(plan, ("127.0.0.1", 9102))
+        transfer = await client.wait_for_plan()
+
+        for (packet, _endpoint), send_time in zip(
+            transport.packets[1:],
+            transfer.send_times_ns,
+            strict=True,
+        ):
+            message = decode_message(packet, block_length=2)
+            assert message.body["send_pos"] == len(
+                [t for t in transfer.send_times_ns if t <= send_time]
+            )
+            gateway_core.accept_data(
+                packet,
+                send_time + gateway_core.plan_srtt_ns[1] // 2,
+            )
+        assert transfer.send_times_ns == tuple(
+            pacing_send_time_ns(
+                pos,
+                t_start_ns=start_ns,
+                k=gateway_plan.blocks,
+                rate_bps=rate,
+                block_size_bytes=data_frame_size_bytes(2),
+            )
+            for pos in range(1, 4)
+        )
+        assert gateway_core.transmission_start_ns[1] == start_ns
+        await client.close()
+
+    asyncio.run(scenario())
+
+
+def test_duplicate_data_does_not_change_start_estimate_or_delivery_ratio() -> None:
+    core, blocks = _planned_single_client()
+    plan = core.plans[1]
+    candidate = plan.sent_ns + 5_000_000
+    offset = pacing_send_time_ns(
+        1, t_start_ns=0, k=blocks, rate_bps=plan.rate_bps,
+        block_size_bytes=data_frame_size_bytes(core.L),
+    )
+    packet = encode_data_packet(
+        1, 1, 0, 2, np.asarray([1.0, 0.0], dtype=np.float16),
+        send_pos=1, t_send_ns=plan.sent_ns,
+    )
+    arrival = candidate + core.plan_srtt_ns[1] // 2 + offset
+    core.accept_data(packet, arrival)
+    estimated = core.transmission_start_ns[1]
+    delivered = len(core.accumulator.clients[1].delivered)
+    with pytest.raises(B3PlanError, match="duplicate"):
+        core.accept_data(packet, arrival + 1)
+    assert core.transmission_start_ns[1] == estimated
+    assert len(core.accumulator.clients[1].delivered) == delivered == 1
+    core.finish(core.deadline_ns)
+    assert core.delivery_ewma.get(1) == pytest.approx(0.1 + 0.1 * (1 / blocks - 0.1))
+
+
+def test_zero_plan_does_not_update_delivery_ratio_and_finish_is_once() -> None:
+    core = _core(client_ids=(1,), delivery_ratio_init=0.25)
+    core.compute_plans(core.plan_ns)
+    assert core.plans[1].blocks == 0
+    core.mark_plan_sent(1, core.plan_ns)
+    core.finish(core.deadline_ns)
+    assert core.delivery_ewma.get(1) == 0.25
+    with pytest.raises(B3PlanError, match="already finished"):
+        core.finish(core.deadline_ns)
