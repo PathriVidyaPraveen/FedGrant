@@ -1,0 +1,10 @@
+[
+  {
+    "round_id": 1,
+    "start_mono_ns": 33081776532264,
+    "deadline_mono_ns": 33082174532264,
+    "accepted_data": 14,
+    "rejected_data": 0,
+    "invalid_events": 0
+  }
+]

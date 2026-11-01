@@ -1,0 +1,9 @@
+# Python dependencies for analysis, unit tests, and testbed utilities.
+# Mininet/Open vSwitch/netem/tbf remain host OS/kernel dependencies; see docs/TEJASWI_5_PARTS.md.
+numpy==2.4.6
+scipy==1.18.1
+PyYAML==6.0.3
+pyroute2==0.9.7
+psutil==7.2.2
+pytest==9.2.0
+matplotlib==3.10.8

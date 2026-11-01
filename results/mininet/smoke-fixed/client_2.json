@@ -1,0 +1,10 @@
+{
+  "client_id": 2,
+  "completed_rounds": [
+    1
+  ],
+  "sent": 4,
+  "received": 5,
+  "malformed": 0,
+  "timeouts": 0
+}

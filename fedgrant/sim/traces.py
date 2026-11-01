@@ -8,17 +8,10 @@ from typing import Sequence
 import numpy as np
 
 from fedgrant.sim.links import mean_access_rate_bps
+from fedgrant.traces.client_trace import POOL_ID, POOL_OOD
 
-ID_TRACE_NAMES = (
-    "Verizon-LTE-driving",
-    "Verizon-LTE-short",
-    "ATT-LTE-driving",
-)
-
-OOD_TRACE_NAMES = (
-    "TMobile-UMTS-driving",
-    "Verizon-EVDO-driving",
-)
+ID_TRACE_NAMES = POOL_ID
+OOD_TRACE_NAMES = POOL_OOD
 
 
 class TraceSegment:
@@ -32,7 +25,11 @@ class TraceSegment:
             raise ValueError("t_ms and rate_bps must be non-empty and of equal length")
         self.t_ms = np.ascontiguousarray(t_ms, dtype=np.int64)
         self.rate_bps = np.ascontiguousarray(rate_bps, dtype=np.float64)
+        if not np.isfinite(self.rate_bps).all() or np.any(self.rate_bps < 0):
+            raise ValueError("rate_bps values must be finite and non-negative")
         self.bin_ms = int(self.t_ms[1] - self.t_ms[0]) if len(self.t_ms) > 1 else 100
+        if self.bin_ms <= 0 or (len(self.t_ms) > 1 and np.any(np.diff(self.t_ms) != self.bin_ms)):
+            raise ValueError("t_ms must be strictly increasing with a constant bin width")
         self.duration_ms = int(len(self.t_ms) * self.bin_ms)
         self.mean_rate_bps = float(np.mean(self.rate_bps))
         if self.mean_rate_bps <= 0:
@@ -41,10 +38,12 @@ class TraceSegment:
     @classmethod
     def load_csv(cls, path: str | Path) -> TraceSegment:
         """Load a CSV with columns (t_ms, rate_bps)."""
-        data = np.genfromtxt(path, delimiter=",", names=True)
-        t_col = "t_ms" if "t_ms" in data.dtype.names else data.dtype.names[0]
-        r_col = "rate_bps" if "rate_bps" in data.dtype.names else data.dtype.names[1]
-        return cls(data[t_col], data[r_col])
+        data = np.genfromtxt(path, delimiter=",", names=True, dtype=None, encoding="utf-8")
+        if data.dtype.names is None or not {"t_ms", "rate_bps"}.issubset(data.dtype.names):
+            raise ValueError(f"{path}: expected t_ms,rate_bps columns")
+        if data.ndim == 0:
+            data = np.asarray([data])
+        return cls(data["t_ms"], data["rate_bps"])
 
     def rate_at(self, offset_ms: int) -> float:
         """Get rate for an offset wrapped inside the segment duration."""
@@ -133,7 +132,8 @@ class TraceManager:
         # trace in the selected pool is required so no client silently gets a
         # constant-rate fallback.
         pool_names = OOD_TRACE_NAMES if self.scenario == "L5" else ID_TRACE_NAMES
-        paths = [self.trace_dir / f"{name}_{self.split}.csv" for name in pool_names]
+        trace_split = "ood" if self.scenario == "L5" else self.split
+        paths = [self.trace_dir / f"{name}_{trace_split}.csv" for name in pool_names]
         missing = [path for path in paths if not path.is_file()]
         if missing:
             missing_list = ", ".join(str(path) for path in missing)
@@ -146,10 +146,15 @@ class TraceManager:
         for path in paths:
             segments.append(TraceSegment.load_csv(path))
 
+        # Draw a fixed-size offset vector once. The first N offsets therefore
+        # remain identical when an experiment changes its client count.
+        if self.num_clients > 50:
+            raise ValueError("trace assignment supports at most 50 clients")
+        fractions = self.rng.random(50)
         n_pool = len(pool_names)
         for i in range(self.num_clients):
             seg = segments[i % n_pool]
-            offset = int(self.rng.integers(0, seg.duration_ms))
+            offset = int(fractions[i] * len(seg.rate_bps)) * seg.bin_ms
             self.client_traces.append(
                 ClientTrace(client_id=i, segment=seg, offset_ms=offset)
             )

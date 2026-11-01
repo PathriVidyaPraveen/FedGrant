@@ -1,0 +1,21 @@
+{
+  "bootstrap_block_size": 256,
+  "bootstrap_replicates": 400,
+  "burst_interval_method": "complete_bad_run_resampling",
+  "complete_bursts": 4699,
+  "complete_bursts_bootstrapped": 4699,
+  "confidence": 0.95,
+  "loss_interval_method": "circular_moving_block",
+  "loss_rate": 0.04949,
+  "loss_rate_ci_high": 0.05079025,
+  "loss_rate_ci_low": 0.0482385,
+  "lost": 4949,
+  "mean_burst": 1.053202809108321,
+  "mean_burst_ci_high": 1.0604383911470525,
+  "mean_burst_ci_low": 1.0468131517344115,
+  "n": 100000,
+  "n_bursts": 4699,
+  "scenario": "L1",
+  "target_loss_rate": 0.05,
+  "target_mean_burst": 1.0526315789473684
+}

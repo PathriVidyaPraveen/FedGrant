@@ -1,0 +1,90 @@
+{
+  "N": 3,
+  "beta": 0.1,
+  "compute_window_s": 1.0,
+  "cpu_affinity": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11
+  ],
+  "cpu_roles": {
+    "clients": [
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11
+    ],
+    "gateway": 0,
+    "pinning_enabled": true,
+    "telemetry": 1
+  },
+  "cross_mbps": 0.0,
+  "cross_traffic": null,
+  "ended_mono_ns": 32465265393352,
+  "experiment_id": "smoke-stub",
+  "gateway_factory": "fedgrant.mininet.stub_policy:create_gateway",
+  "platform": "mininet",
+  "queue_interfaces": [
+    [
+      "s1",
+      "s1-gw"
+    ],
+    [
+      "s1",
+      "s1-c0"
+    ],
+    [
+      "s1",
+      "s1-c1"
+    ],
+    [
+      "s1",
+      "s1-c2"
+    ]
+  ],
+  "rounds": 1,
+  "scenario": "L2",
+  "seed": 0,
+  "started_mono_ns": 32462889201682,
+  "trace_dir": "data/traces",
+  "trace_files": [
+    "ATT-LTE-driving_test.csv",
+    "ATT-LTE-driving_train.csv",
+    "ATT-LTE-driving_val.csv",
+    "TMobile-UMTS-driving_ood.csv",
+    "Verizon-EVDO-driving_ood.csv",
+    "Verizon-LTE-driving_test.csv",
+    "Verizon-LTE-driving_train.csv",
+    "Verizon-LTE-driving_val.csv",
+    "Verizon-LTE-short_test.csv",
+    "Verizon-LTE-short_train.csv",
+    "Verizon-LTE-short_val.csv"
+  ],
+  "trace_sha256": {
+    "ATT-LTE-driving_test.csv": "85554d1070bbf45e066451f448b5f0a901df30fa56ab709a277f6fa894f99e1b",
+    "ATT-LTE-driving_train.csv": "d05789591153811c81629f9801da3c969bd8dda9cf8d80df8bff92287a3c4928",
+    "ATT-LTE-driving_val.csv": "4de9649e13def2ec75027c78ab5a27d5f4bd4a922a66705b0944a0a6d20c3967",
+    "TMobile-UMTS-driving_ood.csv": "0981b4cd4cb37d47febc618b4461d3766cf8e814cd83ab618ca83ec27f3a5ad6",
+    "Verizon-EVDO-driving_ood.csv": "80fd81ac5d461f6f32ba56a57d2abde81ea43cc2d5fcd927a815bdde0492acfe",
+    "Verizon-LTE-driving_test.csv": "6210ff582bd3c9e2a14fc5432d69fe759ad6cfcd83c811cb4a5511af2e6159ec",
+    "Verizon-LTE-driving_train.csv": "e13507f719ba93f906f8fc6f1787af86dade8036d7f8764dbc187e2591aaee9e",
+    "Verizon-LTE-driving_val.csv": "05150d18480a63d1e3dc41a00f21426808947209d385ced799ebeab13aeec1df",
+    "Verizon-LTE-short_test.csv": "d835556fdd5dc07ac2a89a65d631863d160f168eef77744118941ef45dd9cbd9",
+    "Verizon-LTE-short_train.csv": "cc50ee050de71d58bccbf94b7b0fb64dee1441bb99f7daf4ba7275566f303ab5",
+    "Verizon-LTE-short_val.csv": "053ea18e40560dafb59c24582e30c0913fbb35052018167586fa879799a7af75"
+  },
+  "trace_source": "source=upstream Mahimahi repository at f1346c38c415abfc98626dd82450f49a57033603\nretrieved_utc=2026-11-01T02:21:48Z\n669840f626966d7490a27629d4227eb2a866d40f104a6217c53b3f4b5a207d1f  data/traces/raw/Verizon-LTE-driving.up\nf6cd9049f58d70f12545772a3482ded085b6d50f06a2f4ff4afcfb6fe7976dcc  data/traces/raw/Verizon-LTE-short.up\nd58a640b9bccd131a421bff6eaf727aba324d9258b35009655bbf68e087b9b29  data/traces/raw/ATT-LTE-driving.up\nf2dc7c8e57f4cf525fefaff2d68c18a9118fd1382ce9c240b1d324a2a60f8a65  data/traces/raw/TMobile-UMTS-driving.up\n6055d60d234030035f59475dc1d39d99e7c2817b9fa5d485f1f0710b1aae2075  data/traces/raw/Verizon-EVDO-driving.up\n"
+}
