@@ -63,7 +63,7 @@ def test_real_udp_b3_round_start_ready_plan_and_energy_order_data() -> None:
                         transfer.send_times_ns,
                         transfer.send_times_ns[1:],
                     )
-                )
+                ), transfer.send_times_ns
                 assert len(set(transfer.sent_indices)) == transfer.packets_sent
                 apply_delivery_result(client_cores[cid], result.round_result)
                 assert client_cores[cid].round is None

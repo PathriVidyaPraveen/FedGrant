@@ -22,7 +22,14 @@ from fedgrant.baselines.b2_udp import (
     B2TransferError,
     B2UdpClient,
     apply_delivery_result,
+    block_payload_f16,
     decode_data_packet,
+    encode_data_packet,
+)
+from fedgrant.baselines.b3_pacing import (
+    data_frame_size_bytes,
+    paced_blocks_sent,
+    pacing_send_time_ns,
 )
 from fedgrant.common.constants import MessageType, TransferMode
 from fedgrant.common.wire import WireProtocolError, decode_message, encode_message
@@ -149,6 +156,8 @@ class B3GatewayCore:
             if delivery_ewma is not None
             else DeliveryRatioEWMA(init=delivery_ratio_init)
         )
+        for cid in self.client_ids:
+            _validate_delivery_ratio_init(self.delivery_ewma.get(cid))
         self.ready_times_ns: dict[int, int] = {}
         self.plans: dict[int, B3ClientPlan] = {}
         self._plan_sent: set[int] = set()
@@ -156,7 +165,8 @@ class B3GatewayCore:
         self.budget: int | None = None
         self.median_rtt_ns: float | None = None
         self.rtt_samples_ns: dict[int, int] = {}
-        self._plan_completed_ns: dict[int, int] = {}
+        self.plan_srtt_ns: dict[int, int] = {}
+        self.transmission_start_ns: dict[int, int] = {}
         self._plan_computed = False
         self._finished = False
         self.rejected_events = 0
@@ -250,12 +260,24 @@ class B3GatewayCore:
         if client_id in self._plan_sent:
             raise B3PlanError("PLAN was already sent for this client")
         current = self.plans[client_id]
+        srtt_ns = self.states[client_id].srtt_ns
+        fallback_start_ns = sent_ns + srtt_ns // 2
+        if fallback_start_ns > 0xFFFFFFFFFFFFFFFF:
+            raise B3PlanError("PLAN fallback transmission start exceeds u64 range")
         plan = B3ClientPlan(client_id, current.blocks, current.rate_bps, sent_ns)
         self.plans[client_id] = plan
+        self.plan_srtt_ns[client_id] = srtt_ns
+        self.transmission_start_ns[client_id] = fallback_start_ns
         self._plan_sent.add(client_id)
         return plan
 
     def accept_data(self, packet: bytes, received_ns: int) -> None:
+        if self._finished or not self.accumulator._active:
+            self.rejected_events += 1
+            raise B3PlanError("B3 round is already closed")
+        if not isinstance(received_ns, int) or isinstance(received_ns, bool):
+            self.rejected_events += 1
+            raise B3PlanError("DATA arrival time must be an integer nanosecond timestamp")
         if not self._plan_computed:
             self.rejected_events += 1
             raise B3PlanError("DATA arrived before PLAN")
@@ -274,24 +296,40 @@ class B3GatewayCore:
         if message.body["send_pos"] > self.plans[cid].blocks:
             self.rejected_events += 1
             raise B3PlanError("DATA send_pos exceeds the client's PLAN")
-        if received_ns < self.plans[cid].sent_ns:
+        if received_ns < self.plans[cid].sent_ns or received_ns > self.deadline_ns:
             self.rejected_events += 1
-            raise B3PlanError("DATA arrived before PLAN was sent")
+            raise B3PlanError("DATA arrived outside the PLAN-to-deadline window")
         try:
-            _round, _client, _send_pos, _block, _count, _payload = decode_data_packet(packet, self.L)
+            _round, _client, send_pos, _block, _count, _payload = decode_data_packet(packet, self.L)
+            candidate_start_ns = (
+                received_ns
+                - self.plan_srtt_ns[cid] // 2
+                - pacing_send_time_ns(
+                    send_pos,
+                    t_start_ns=0,
+                    k=self.plans[cid].blocks,
+                    rate_bps=self.plans[cid].rate_bps,
+                    block_size_bytes=data_frame_size_bytes(self.L),
+                )
+            )
             self.accumulator.accept_packet(packet, received_ns)
         except (B2ProtocolError, ValueError) as exc:
             self.rejected_events += 1
             raise B3PlanError(f"invalid B3 DATA: {exc}") from exc
 
-        if len(self.accumulator.clients[cid].delivered) == self.plans[cid].blocks:
-            self._plan_completed_ns.setdefault(cid, received_ns)
+        self.transmission_start_ns[cid] = max(
+            self.plans[cid].sent_ns,
+            min(self.transmission_start_ns[cid], candidate_start_ns),
+        )
         if cid not in self.rtt_samples_ns:
             sample = received_ns - self.plans[cid].sent_ns
             rtt_update(self.states[cid], sample)
             self.rtt_samples_ns[cid] = sample
         self._advance_rate_window(cid, received_ns, backlogged=None)
-        self.windows[cid].add_delivery(received_ns)
+        self.windows[cid].add_delivery(
+            received_ns,
+            bits=8 * data_frame_size_bytes(self.L),
+        )
 
     def finish(self, completed_ns: int) -> B3RoundResult:
         if self._finished:
@@ -331,26 +369,26 @@ class B3GatewayCore:
         window = self.windows[client_id]
         state = self.states[client_id]
         closed = 0
+        explicit_backlogged = backlogged
         while window.t_end <= time_ns:
-            if backlogged is not None:
-                window.close(state, backlogged=backlogged)
-            else:
+            window_backlogged = explicit_backlogged
+            if window_backlogged is None:
                 plan = self.plans.get(client_id)
-                completed_ns = self._plan_completed_ns.get(client_id)
-                known_not_backlogged = (
-                    plan is None
-                    or client_id not in self._plan_sent
-                    or plan.blocks == 0
-                    or plan.sent_ns >= window.t_end
-                    or (completed_ns is not None and completed_ns <= window.t_start)
+                start_ns = self.transmission_start_ns.get(client_id)
+                window_backlogged = bool(
+                    plan is not None
+                    and start_ns is not None
+                    and start_ns <= window.t_start
+                    and paced_blocks_sent(
+                        window.t_end,
+                        t_start_ns=start_ns,
+                        k=plan.blocks,
+                        rate_bps=plan.rate_bps,
+                        block_size_bytes=data_frame_size_bytes(self.L),
+                    )
+                    < plan.blocks
                 )
-                if known_not_backlogged:
-                    window.close(state, backlogged=False)
-                else:
-                    # A missing DATA packet cannot distinguish loss from an
-                    # unsent position. Discard this ambiguous window rather
-                    # than changing bhat from an unsupported backlog guess.
-                    window.start(window.t_end, outstanding=0)
+            window.close(state, backlogged=window_backlogged)
             closed += 1
         return closed
 
@@ -619,6 +657,7 @@ class B3UdpClient(asyncio.DatagramProtocol):
         self._round_id: int | None = None
         self._plan_received = False
         self.last_transfer: B2ClientTransfer | None = None
+        self.plan_start_ns: int | None = None
         self.rejected_datagrams = 0
 
     @classmethod
@@ -744,6 +783,7 @@ class B3UdpClient(asyncio.DatagramProtocol):
         self._round_start_event.set()
         self._plan_event.clear()
         self.last_transfer = None
+        self.plan_start_ns = None
         self._send(
             encode_message(
                 MessageType.READY,
@@ -773,16 +813,123 @@ class B3UdpClient(asyncio.DatagramProtocol):
         if self._deadline_ns is None or self.clock_ns() >= self._deadline_ns:
             raise B3PlanError("PLAN arrived at or after the deadline")
         self._plan_received = True
+        self.plan_start_ns = None
         self._plan_event.set()
         self._plan_task = asyncio.create_task(
-            self.sender.send_prepared(
-                round_id=message.round_id,
-                deadline_ns=self._deadline_ns,
-                block_count=blocks,
-                rate_bps=rate or 1.0,
-            ),
+            self._send_plan_blocks(message.round_id, blocks, rate),
             name=f"b3-client-{self.core.client_id}-send",
         )
+
+    async def _send_plan_blocks(
+        self,
+        round_id: int,
+        block_count: int,
+        rate_bps: int,
+    ) -> B2ClientTransfer:
+        deadline_ns = self._deadline_ns
+        current = self.core.round
+        if deadline_ns is None or current is None:
+            raise B3PlanError("PLAN send has no active prepared round")
+        t_start_ns = self.clock_ns()
+        self.plan_start_ns = t_start_ns
+        if block_count == 0:
+            return B2ClientTransfer(
+                client_id=self.core.client_id,
+                round_id=round_id,
+                sent_indices=(),
+                send_times_ns=(),
+                application_bytes_sent=0,
+                completed_ns=self.clock_ns(),
+                stop_reason="all_blocks_sent",
+            )
+        if rate_bps <= 0:
+            raise B3PlanError("positive PLAN k requires a positive rate")
+        transport = self.sender.transport
+        if transport is None:
+            raise B2TransferError("B3 UDP client is not bound")
+        if self.sender._sending:
+            raise B2TransferError("B3 UDP client is already sending a round")
+
+        self.sender._sending = True
+        sent_indices: list[int] = []
+        send_times: list[int] = []
+        bytes_sent = 0
+        size = data_frame_size_bytes(self.core.error_feedback.L)
+        stop_reason = "all_blocks_sent"
+        try:
+            while len(sent_indices) < block_count:
+                self.sender._raise_transport_error()
+                now_ns = self.clock_ns()
+                if now_ns >= deadline_ns:
+                    stop_reason = "deadline"
+                    break
+                if not send_times:
+                    t_start_ns = now_ns
+                    self.plan_start_ns = t_start_ns
+                send_pos = len(sent_indices) + 1
+                sent_by_now = paced_blocks_sent(
+                    now_ns,
+                    t_start_ns=t_start_ns,
+                    k=block_count,
+                    rate_bps=rate_bps,
+                    block_size_bytes=size,
+                )
+                target_ns = pacing_send_time_ns(
+                    send_pos,
+                    t_start_ns=t_start_ns,
+                    k=block_count,
+                    rate_bps=rate_bps,
+                    block_size_bytes=size,
+                )
+                if send_times:
+                    target_ns = max(
+                        target_ns,
+                        pacing_send_time_ns(
+                            2,
+                            t_start_ns=send_times[-1],
+                            k=max(block_count, 2),
+                            rate_bps=rate_bps,
+                            block_size_bytes=size,
+                        ),
+                    )
+                if sent_by_now < send_pos or now_ns < target_ns:
+                    wait_ns = min(target_ns, deadline_ns) - now_ns
+                    if wait_ns <= 0:
+                        continue
+                    await self.sender._sleep(wait_ns / _NANOSECONDS_PER_SECOND)
+                    continue
+
+                block_idx = int(current.encoded.order[send_pos - 1])
+                payload, n_coords = block_payload_f16(current.encoded, block_idx)
+                packet = encode_data_packet(
+                    round_id,
+                    self.core.client_id,
+                    block_idx,
+                    n_coords,
+                    payload,
+                    send_pos=send_pos,
+                    t_send_ns=now_ns,
+                )
+                try:
+                    transport.sendto(packet, self.gateway_addr)
+                except OSError as exc:
+                    raise B2TransferError(f"B3 UDP send failed: {exc}") from exc
+                sent_indices.append(block_idx)
+                send_times.append(now_ns)
+                bytes_sent += len(packet)
+
+            self.sender._raise_transport_error()
+            return B2ClientTransfer(
+                client_id=self.core.client_id,
+                round_id=round_id,
+                sent_indices=tuple(sent_indices),
+                send_times_ns=tuple(send_times),
+                application_bytes_sent=bytes_sent,
+                completed_ns=self.clock_ns(),
+                stop_reason=stop_reason,
+            )
+        finally:
+            self.sender._sending = False
 
     def _send(self, packet: bytes) -> None:
         if self.transport is None:
