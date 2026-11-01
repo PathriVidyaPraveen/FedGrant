@@ -1,0 +1,6 @@
+scenario: L4
+loss_probability: 0.05
+mean_loss_burst_packets: 8
+access_rate_profile: cellular_id
+trace_split: test
+cross_traffic_mbps: 0

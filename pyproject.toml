@@ -12,6 +12,7 @@ dependencies = ["numpy", "scipy"]
 [project.optional-dependencies]
 ml = ["torch", "psutil", "matplotlib"]
 test = ["pytest"]
+testbed = ["pyyaml", "pyroute2", "psutil"]
 
 [tool.setuptools.packages.find]
 include = ["fedgrant*"]

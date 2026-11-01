@@ -45,7 +45,7 @@ from fedgrant.policy.selectors import (
 )
 from fedgrant.policy.types import CandidateView, PolicyConfig, Selector
 from fedgrant.predictors.base import PredInput, Predictor, RoundCtx
-from fedgrant.predictors.ewma import PEWMA, EWMAPredictor
+from fedgrant.predictors.ewma import PEWMA
 from fedgrant.predictors.factory import make_predictor
 from fedgrant.predictors.hmm import PHMM
 from fedgrant.predictors.oracle import OraclePredictor

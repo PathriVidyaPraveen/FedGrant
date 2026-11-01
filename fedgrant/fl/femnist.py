@@ -92,14 +92,17 @@ def _selected_users(train_paths: list[Path], count: int) -> list[str]:
     return selected
 
 
-def _collect_group(paths: list[Path], group: tuple[str, ...]) -> dict[str, tuple[list, list]]:
-    selected = set(group)
+def _collect_groups(
+    paths: list[Path], groups: tuple[tuple[str, ...], ...]
+) -> dict[str, tuple[list, list]]:
+    """Collect all selected writers in one pass over the large LEAF shards."""
+    selected = {writer for group in groups for writer in group}
     result: dict[str, tuple[list, list]] = {}
     for path in paths:
         with path.open(encoding="utf-8") as f:
             data = json.load(f)
         user_data = data.get("user_data", {})
-        for writer in group:
+        for writer in selected:
             record = user_data.get(writer)
             if record is None:
                 continue
@@ -174,10 +177,15 @@ def prepare_femnist(
     shards: list[ClientShard] = []
     shard_files: list[dict[str, str]] = []
 
-    for client_id, start in enumerate(range(0, len(writers), writers_per_client)):
-        group = tuple(writers[start : start + writers_per_client])
-        train = _arrays_for_group(_collect_group(train_paths, group), group)
-        test = _arrays_for_group(_collect_group(test_paths, group), group)
+    groups = tuple(
+        tuple(writers[start : start + writers_per_client])
+        for start in range(0, len(writers), writers_per_client)
+    )
+    train_records = _collect_groups(train_paths, groups)
+    test_records = _collect_groups(test_paths, groups)
+    for client_id, group in enumerate(groups):
+        train = _arrays_for_group(train_records, group)
+        test = _arrays_for_group(test_records, group)
         prefix = output_dir / f"client_{client_id:02d}"
         paths = [
             prefix.with_name(prefix.name + "_train_images.npy"),
