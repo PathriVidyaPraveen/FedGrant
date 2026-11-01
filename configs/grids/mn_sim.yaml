@@ -1,0 +1,9 @@
+experiment_id: M-sim
+platform: sim
+scenario: [L2, L4]
+beta: [0.10]
+clients: 20
+cross_traffic_mbps: 0
+policies: [B2, B3, B4, B6, FG-GRU]
+seeds: [0, 1, 2]
+rounds: 100
