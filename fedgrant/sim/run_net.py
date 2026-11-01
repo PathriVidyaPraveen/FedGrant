@@ -122,6 +122,7 @@ class GatewaySim:
         sample_hook: Callable[[dict[str, Any]], None] | None = None,
         shadow_oracle: Predictor | None = None,
         shadow_hmm: Predictor | None = None,
+        decision_hook: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         self.N = int(num_clients)
         self.weights = np.ascontiguousarray(client_weights, dtype=np.float32)
@@ -153,6 +154,7 @@ class GatewaySim:
         self.d_model = int(d_model)
         self.rng = rng or np.random.default_rng()
         self.sample_hook = sample_hook
+        self.decision_hook = decision_hook
         self.shadow_oracle = shadow_oracle
         self.shadow_hmm = shadow_hmm
 
@@ -284,10 +286,12 @@ class GatewaySim:
                 break
 
             # 2. Select client (exploration or configured selector)
+            candidate_ids: tuple[int, ...] | None = None
             if self.cfg.explore_eps > 0.0 and self.rng.random() < self.cfg.explore_eps:
                 eligible_cids = self._get_eligible_clients(t_ns)
                 if not eligible_cids:
                     break
+                candidate_ids = tuple(int(cid) for cid in eligible_cids)
                 sel_cid = int(self.rng.choice(eligible_cids))
             elif isinstance(self.selector, ValueSelector):
                 sel_cid = top_client
@@ -295,6 +299,7 @@ class GatewaySim:
                 cand_view = self._build_candidate_view(t_ns)
                 if len(cand_view) == 0:
                     break
+                candidate_ids = tuple(int(cid) for cid in cand_view.client_id)
                 sel_cid = self.selector.select(cand_view)
 
             st_sel = self.client_states[sel_cid]
@@ -307,11 +312,23 @@ class GatewaySim:
 
             # 3. Pacing check: Phi + p_pacing <= P_target
             if not self.inflight.can_issue(p_pacing, P_targ):
+                if self.decision_hook is not None:
+                    self.decision_hook({
+                        "event": "grant_decision",
+                        "round_id": self.round_id,
+                        "t_ns": t_ns,
+                        "abs_t_ns": self.round_start_abs_ns + t_ns,
+                        "selection_method": self.cfg.selector,
+                        "candidate_client_ids": candidate_ids,
+                        "selected_client_id": sel_cid,
+                        "send_pos": st_sel.next_pos(self.cfg.retransmit),
+                        "grant_id": None,
+                        "p_hat": p_hat_sel,
+                        "p_pacing": p_pacing,
+                        "p_target": P_targ,
+                        "outcome": "pacing_blocked",
+                    })
                 break
-
-            # 4. Pop from heap if top_client was chosen
-            if top_client == sel_cid and self.heap:
-                heapq.heappop(self.heap)
 
             # Shadow predictions for ML logging
             p_ewma_val = float(self.pewma.predict(inp_sel)[0])
@@ -328,13 +345,35 @@ class GatewaySim:
 
             # 5. Take send position s
             s_next = st_sel.next_pos(self.cfg.retransmit)
-            st_sel.take_position(s_next, self.cfg.retransmit)
 
             # 6. Issue grant g
             g_id = self.next_gid
-            self.next_gid += 1
-
             tau_g = grant_timeout(t_ns, st_sel, self.D_ns)
+
+            if self.decision_hook is not None:
+                self.decision_hook({
+                    "event": "grant_decision",
+                    "round_id": self.round_id,
+                    "t_ns": t_ns,
+                    "abs_t_ns": self.round_start_abs_ns + t_ns,
+                    "selection_method": self.cfg.selector,
+                    "candidate_client_ids": candidate_ids,
+                    "selected_client_id": sel_cid,
+                    "send_pos": s_next,
+                    "grant_id": g_id,
+                    "p_hat": p_hat_sel,
+                    "p_pacing": p_pacing,
+                    "p_target": P_targ,
+                    "timeout_ns": tau_g,
+                    "outcome": "grant_issued",
+                })
+
+            # Commit the decision only after the observer has seen its
+            # pre-mutation candidate and client state.
+            if top_client == sel_cid and self.heap:
+                heapq.heappop(self.heap)
+            st_sel.take_position(s_next, self.cfg.retransmit)
+            self.next_gid += 1
 
             st_sel.outstanding[g_id] = OutstandingGrant(
                 pos=s_next,
@@ -590,12 +629,28 @@ def run_network_round(
     sample_hook: Callable[[dict[str, Any]], None] | None = None,
     gateway: GatewaySim | None = None,
     round_start_abs_ns: int = 0,
+    decision_hook: Callable[[dict[str, Any]], None] | None = None,
+    event_hook: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
-    """Execute a single simulated round of FedGrant frame transmission (Section 6)."""
+    """Execute one simulated round (Section 6).
+
+    ``decision_hook`` receives pre-mutation grant decisions. ``event_hook``
+    reports round start, received READY/DATA, scheduler ticks and deadline;
+    DATA is reported only at gateway arrival, never at link enqueue/drop.
+    These diagnostic hooks do not feed back into simulation decisions.
+    """
     cfg = policy_config or PolicyConfig(selector="value", predictor="ewma")
     K = K_DEFAULT
     L = L_DEFAULT
     D_ns = compute_deadline_ns(beta, num_clients, K)
+
+    def _record_decision(record: dict[str, Any]) -> None:
+        if decision_hook is not None:
+            decision_hook(record)
+        # A single ordered observation stream lets test/replay tooling
+        # interleave scheduler decisions with READY/DATA/tick inputs.
+        if event_hook is not None:
+            event_hook(record)
 
     if round_start_abs_ns == 0 and round_id > 1:
         round_start_abs_ns = int((round_id - 1) * (1_000_000_000 + D_ns))
@@ -675,12 +730,14 @@ def run_network_round(
             sample_hook=sample_hook,
             shadow_oracle=shadow_oracle,
             shadow_hmm=shadow_hmm,
+            decision_hook=_record_decision if (decision_hook is not None or event_hook is not None) else None,
         )
         shadow_oracle.client_states = gateway.client_states
     else:
         gateway.D_ns = D_ns
         gateway.cfg = cfg
         gateway.sample_hook = sample_hook
+        gateway.decision_hook = _record_decision if (decision_hook is not None or event_hook is not None) else None
         if predictor is not None:
             gateway.predictor = predictor
         gateway.shadow_oracle = shadow_oracle
@@ -773,6 +830,23 @@ def run_network_round(
             b_idx = frame.payload.get("block_idx", 0)
             pld = frame.payload.get("payload", np.zeros(L, dtype=np.float16))
 
+            # This hook is emitted only after the frame traverses both simulated
+            # links and reaches the gateway; link-internal GE/drop state is not
+            # part of the gateway's observable event stream.
+            if event_hook is not None:
+                event_hook({
+                    "event": "data_received",
+                    "round_id": round_id,
+                    "client_id": cid,
+                    "grant_id": gid,
+                    "send_pos": pos,
+                    "block_idx": b_idx,
+                    "n_coords": max(0, min(L, D_MODEL - b_idx * L)),
+                    "payload": tuple(float(value) for value in pld),
+                    "t_ns": engine.now_ns,
+                    "abs_t_ns": round_start_abs_ns + engine.now_ns,
+                })
+
             if gid in gateway.client_states[cid].outstanding:
                 og = gateway.client_states[cid].outstanding[gid]
                 rtt_samples.append(engine.now_ns - og.t_issue_ns)
@@ -790,6 +864,9 @@ def run_network_round(
     bottleneck.dest_cb = _on_gw_arrive
 
     # 6. Schedule Round Start and Client Readiness
+    if event_hook is not None:
+        event_hook({"event": "round_start", "round_id": round_id,
+                    "t_ns": 0, "abs_t_ns": round_start_abs_ns, "deadline_ns": D_ns})
     gateway.on_round_start(round_id=round_id, t_ns=0, round_start_abs_ns=round_start_abs_ns)
 
     for cid in range(num_clients):
@@ -806,6 +883,11 @@ def run_network_round(
 
     def _on_ready_arrive(cid: int) -> None:
         energies = client_energies[cid]
+        if event_hook is not None:
+            event_hook({"event": "ready_received", "round_id": round_id,
+                        "client_id": cid, "t_ns": engine.now_ns,
+                        "abs_t_ns": round_start_abs_ns + engine.now_ns,
+                        "energies": tuple(float(v) for v in energies)})
         new_grants = gateway.on_ready(client_id=cid, energies=energies, t_ns=engine.now_ns)
         _dispatch_grants(new_grants)
 
@@ -818,6 +900,9 @@ def run_network_round(
         )
 
     def _on_tick(t_ns: int) -> None:
+        if event_hook is not None:
+            event_hook({"event": "tick", "round_id": round_id, "t_ns": t_ns,
+                        "abs_t_ns": round_start_abs_ns + t_ns})
         new_grants = gateway.on_tick(t_ns=t_ns)
         _dispatch_grants(new_grants)
 
@@ -850,6 +935,9 @@ def run_network_round(
         crosstraffic.stop()
 
     # 10. Deadline finish & aggregation
+    if event_hook is not None:
+        event_hook({"event": "deadline", "round_id": round_id,
+                    "t_ns": D_ns, "abs_t_ns": round_start_abs_ns + D_ns})
     round_ends, emit_agg = gateway.on_deadline(t_ns=D_ns)
 
     delivered_mask = [[False] * K for _ in range(num_clients)]

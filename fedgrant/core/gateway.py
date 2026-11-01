@@ -205,6 +205,11 @@ class GatewayCore:
     The caller is responsible for decoding datagrams and sending returned
     actions. No socket, scheduler policy, estimator, or aggregation algorithm
     is implemented here.
+
+    Optional ``decision_hook`` records are observational callbacks invoked
+    before grant-state mutation. Records use ``event=grant_decision`` and
+    include round/time, candidate IDs and score metadata, selected client,
+    prediction, pacing result, and (when issued) grant/position/timeout IDs.
     """
 
     def __init__(
@@ -221,6 +226,7 @@ class GatewayCore:
         aggregate: AggregateProvider | None = None,
         value_integrity: ValueIntegrityChecker | None = None,
         view: Any | None = None,
+        decision_hook: Callable[[dict[str, Any]], None] | None = None,
         retransmit: bool = True,
     ) -> None:
         self.phase = GatewayPhase.IDLE
@@ -241,6 +247,7 @@ class GatewayCore:
         self.aggregate = aggregate
         self.value_integrity = value_integrity
         self.view = view
+        self.decision_hook = decision_hook
         if not isinstance(retransmit, bool):
             raise TypeError("retransmit must be a bool")
         self.retransmit = retransmit
@@ -728,7 +735,22 @@ class GatewayCore:
                 p_hat = self._predict_probability(client_id, t_ns)
             if not np.isfinite(p_hat) or not 0.0 <= p_hat <= 1.0:
                 raise GatewayError("prediction probability must be finite and in [0, 1]")
-            if not self.pacing.allow(client_id, p_hat, t_ns, self.round.deadline_ns):
+            pacing_allowed = self.pacing.allow(client_id, p_hat, t_ns, self.round.deadline_ns)
+            if not pacing_allowed:
+                if self.decision_hook is not None:
+                    self.decision_hook({
+                        "event": "grant_decision",
+                        "round_id": self.round.round_id,
+                        "t_ns": t_ns,
+                        "client_id": client_id,
+                        "candidate_client_ids": tuple(int(cid) for cid in candidates.client_id),
+                        "candidate_next_values": tuple(float(v) for v in candidates.next_value),
+                        "candidate_undelivered": tuple(int(n) for n in candidates.undelivered),
+                        "rr_pointer": candidates.rr_pointer,
+                        "p_hat": p_hat,
+                        "pacing_allowed": False,
+                        "outcome": "pacing_blocked",
+                    })
                 break
             state = self.clients[client_id]
             send_pos = state.next_pos(self.retransmit)
@@ -740,6 +762,24 @@ class GatewayCore:
                 raise GatewayError("timeout_ns must be after grant issue time")
             timeout_ns = min(timeout_ns, self.round.deadline_ns)
             grant_id = self.next_grant_id
+            if self.decision_hook is not None:
+                # Emit the decision with its final identity before state mutation.
+                self.decision_hook({
+                    "event": "grant_decision",
+                    "round_id": self.round.round_id,
+                    "t_ns": t_ns,
+                    "client_id": client_id,
+                    "candidate_client_ids": tuple(int(cid) for cid in candidates.client_id),
+                    "candidate_next_values": tuple(float(v) for v in candidates.next_value),
+                    "candidate_undelivered": tuple(int(n) for n in candidates.undelivered),
+                    "rr_pointer": candidates.rr_pointer,
+                    "p_hat": p_hat,
+                    "pacing_allowed": True,
+                    "outcome": "grant_issued",
+                    "grant_id": grant_id,
+                    "send_pos": send_pos,
+                    "timeout_ns": timeout_ns,
+                })
             self.next_grant_id += 1
             state.take_position(send_pos, self.retransmit)
             state.outstanding[grant_id] = OutstandingGrant(send_pos, t_ns, p_hat, timeout_ns)

@@ -53,8 +53,15 @@ def run_row(run_dir: str | Path) -> dict[str, Any]:
     if not meta_path.is_file():
         raise FileNotFoundError(f"{root}: expected run.json or meta.json")
     meta = json.loads(meta_path.read_text(encoding="utf-8"))
-    required = ("experiment_id", "scenario", "beta", "N", "policy", "seed")
+    # Summary-schema JSON uses `N`; the older logschema RUN_COLUMNS CSV uses
+    # `n_clients`. Prefer the canonical `N` spelling, but read legacy metadata.
+    client_count = meta.get("N", meta.get("n_clients"))
+    if "N" in meta and "n_clients" in meta and int(meta["N"]) != int(meta["n_clients"]):
+        raise ValueError(f"{meta_path}: N and n_clients disagree")
+    required = ("experiment_id", "scenario", "beta", "policy", "seed")
     missing = [key for key in required if key not in meta]
+    if client_count is None:
+        missing.append("N (or legacy n_clients)")
     if missing:
         raise ValueError(f"{meta_path}: missing run identity fields {missing}")
     round_rows = _records(root / "round_metrics.csv")
@@ -92,7 +99,7 @@ def run_row(run_dir: str | Path) -> dict[str, Any]:
     if status != "missing" and not rounds:
         raise ValueError(f"{root}: no round metrics remain after warm-up round 20")
     return make_row(
-        str(meta["experiment_id"]), str(meta["scenario"]), float(meta["beta"]), int(meta["N"]),
+        str(meta["experiment_id"]), str(meta["scenario"]), float(meta["beta"]), int(client_count),
         str(meta["policy"]), int(meta["seed"]), n_rounds,
         cross_mbps=float(meta.get("cross_mbps", 0.0)), status=status, **metrics,
     )
