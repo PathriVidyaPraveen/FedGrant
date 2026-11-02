@@ -1,13 +1,14 @@
 """Deterministic experiment-grid expansion, execution, resume, and summary.
-
 The schema's ``expected_runs`` remains the canonical experiment matrix. This
-runner executes only the grant-based discrete-event simulator configurations
-that have an implementation path today. Mininet, baseline transfer modes, and
-FL jobs are recorded as blocked until their production adapters exist.
+runner executes grant-based simulator configurations through the Task 16
+run-directory pipeline and FEMNIST/FedAvg FL jobs through the existing FL
+entry point. FL runs receive per-run metadata, run.csv, fl_history.csv, and
+fl_result.json; network-only packet/queue logs are deliberately not fabricated.
+F-ref publishes the frozen reference files consumed by F-main/F-abl. Mininet
+and B2/B3 transfer modes remain explicitly blocked until their adapters are
+integrated into the corresponding execution paths.
 """
-
 from __future__ import annotations
-
 import argparse
 import csv
 import fcntl
@@ -23,13 +24,10 @@ from contextlib import contextmanager
 from numbers import Real
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping
-
 import numpy as np
-
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
-
 from fedgrant.analysis import raw_metrics
 from fedgrant.analysis.runs_schema import (
     EXPERIMENTS,
@@ -45,11 +43,10 @@ from fedgrant.analysis.runs_schema import (
     write_runs_csv,
 )
 from fedgrant.common.logschema import SCHEMAS, csv_writer, write_rows
+from fedgrant.analysis.metrics import compute_final_accuracy, compute_time_to_target
 from fedgrant.policy.types import PolicyConfig
-from fedgrant.sim.run_net import run_network_round
+from fedgrant.sim.run_net import compute_deadline_ns, run_network_round
 from fedgrant.traces.client_trace import POOL_ID, POOL_OOD
-
-
 GRID_DIR = Path(__file__).resolve().parents[1] / "configs" / "grids"
 SCENARIO_DIR = Path(__file__).resolve().parents[1] / "configs" / "scenarios"
 _CONFIG_ID_RE = re.compile(
@@ -89,12 +86,8 @@ _LOG_FILES = {
     "processes.csv": "processes",
     "run.csv": "run",
 }
-
-
 class GridError(ValueError):
     """Invalid matrix configuration or unsafe resume state."""
-
-
 def _parse_config_id(config_id: str) -> tuple[str, float, int, float]:
     match = _CONFIG_ID_RE.fullmatch(config_id)
     if match is None:
@@ -104,12 +97,8 @@ def _parse_config_id(config_id: str) -> tuple[str, float, int, float]:
     if make_config_id(scenario, beta, n_clients, cross) != config_id:
         raise GridError(f"config_id {config_id!r} is not canonical")
     return scenario, beta, n_clients, cross
-
-
 def _matrix_keys() -> set[tuple[str, str, str, int]]:
     return set(expected_runs())
-
-
 def _read_yaml(path: Path) -> Mapping[str, Any]:
     try:
         import yaml
@@ -122,8 +111,6 @@ def _read_yaml(path: Path) -> Mapping[str, Any]:
     if not isinstance(value, Mapping):
         raise GridError(f"configuration {path} must contain a YAML mapping")
     return value
-
-
 def validate_repository_configs(
     grid_dir: str | Path = GRID_DIR,
     scenario_dir: str | Path = SCENARIO_DIR,
@@ -167,7 +154,6 @@ def validate_repository_configs(
         if declared != canonical:
             missing, extra = sorted(canonical - declared), sorted(declared - canonical)
             raise GridError(f"{path}: declared run matrix differs from runs_schema; missing={missing[:3]}, extra={extra[:3]}")
-
     scenarios_root = Path(scenario_dir)
     for scenario in { _parse_config_id(key[1])[0] for key in expected } - {"none"}:
         path = scenarios_root / f"{scenario}.yaml"
@@ -176,14 +162,10 @@ def validate_repository_configs(
         config = _read_yaml(path)
         if config.get("scenario") != scenario:
             raise GridError(f"{path}: scenario field must be {scenario!r}")
-
-
 def _run_id(experiment_id: str, config_id: str, policy: str, seed: int) -> str:
     key = (experiment_id, config_id, policy, int(seed))
     digest = hashlib.sha256(json.dumps(key, separators=(",", ":")).encode("utf-8")).hexdigest()[:16]
     return f"{experiment_id}__{config_id}__{policy}__s{seed}__{digest}"
-
-
 def expand_grid(
     experiments: list[str] | None = None,
     *,
@@ -232,8 +214,6 @@ def expand_grid(
         validate_job(job)
         selected.append(job)
     return selected
-
-
 def validate_job(job: Mapping[str, Any]) -> None:
     """Reject malformed or out-of-matrix jobs before allocating output paths."""
     required = (
@@ -272,8 +252,6 @@ def validate_job(job: Mapping[str, Any]) -> None:
         raise GridError(f"unsupported policy {key[2]!r}")
     if job["run_id"] != _run_id(*key):
         raise GridError("run_id is not the stable identifier for this matrix key")
-
-
 def partition_jobs(
     jobs: list[dict[str, Any]],
     machine_id: int,
@@ -294,8 +272,6 @@ def partition_jobs(
     slot = machine_id * num_workers + worker_id
     slots = num_machines * num_workers
     return [job for index, job in enumerate(jobs) if index % slots == slot]
-
-
 def network_round_seed(master_seed: int, round_id: int) -> int:
     """Match ``fedgrant.fl.server._network_round_seed`` exactly, without importing FL/Torch."""
     if isinstance(master_seed, bool) or not isinstance(master_seed, int) or master_seed < 0:
@@ -303,8 +279,6 @@ def network_round_seed(master_seed: int, round_id: int) -> int:
     if isinstance(round_id, bool) or not isinstance(round_id, int) or round_id < 1:
         raise ValueError("round_id must be a positive integer")
     return int(np.random.SeedSequence([master_seed, round_id - 1]).generate_state(1)[0])
-
-
 def _adapter_block_reasons(job: Mapping[str, Any], trace_dir: Path) -> list[str]:
     experiment, policy = str(job["experiment_id"]), str(job["policy"])
     reasons: list[str] = []
@@ -315,9 +289,12 @@ def _adapter_block_reasons(job: Mapping[str, Any], trace_dir: Path) -> list[str]
             "the Mininet launcher has no production client/baseline adapter and its client process uses synthetic updates",
             "the FL server/model-update/bitmap-aggregation lifecycle is not integrated with the Mininet run directory",
         ))
-    elif experiment in FL_EXPERIMENTS:
-        reasons.append("the FL entry point is not integrated with grid run directories, schema metrics, and supported per-policy adapters")
-    elif policy not in _SIMULATOR_POLICY_CONFIGS:
+    elif experiment in FL_EXPERIMENTS and policy in {"B2", "B3"}:
+        reasons.append(f"{policy} FL transport adapter is not integrated with the FEMNIST/FedAvg entry point")
+    elif experiment not in FL_EXPERIMENTS and policy not in _SIMULATOR_POLICY_CONFIGS:
+        # Do not route B2/B3 through the grant-based simulator. Their separate
+        # baseline implementations remain untouched; a simulator adapter must
+        # be integrated before these matrix rows can execute here.
         reasons.append(f"simulator transfer-mode adapter for policy {policy!r} is unavailable (the simulator path is grant-based)")
     if job["scenario"] in {"L4", "L5"}:
         names = POOL_OOD if job["scenario"] == "L5" else POOL_ID
@@ -330,8 +307,6 @@ def _adapter_block_reasons(job: Mapping[str, Any], trace_dir: Path) -> list[str]
     if policy == "FG-MLP" and not Path("models/mlp_prod.npz").is_file():
         reasons.append("production MLP checkpoint models/mlp_prod.npz is unavailable")
     return reasons
-
-
 def _input_hashes(job: Mapping[str, Any], trace_dir: Path) -> dict[str, str]:
     """Hash configuration, trace, and model assets that affect reproducibility."""
     candidates: dict[str, Path] = {}
@@ -356,14 +331,10 @@ def _input_hashes(job: Mapping[str, Any], trace_dir: Path) -> dict[str, str]:
         for name, path in sorted(candidates.items())
         if path.is_file()
     }
-
-
 def _config_fingerprint(job: Mapping[str, Any], input_hashes: Mapping[str, str]) -> str:
     fields = {key: job[key] for key in ("experiment_id", "platform", "config_id", "scenario", "beta", "N", "n_clients", "cross_mbps", "policy", "seed", "n_rounds")}
     fields["input_sha256"] = dict(sorted(input_hashes.items()))
     return hashlib.sha256(json.dumps(fields, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
-
-
 def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
@@ -380,8 +351,6 @@ def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
         except FileNotFoundError:
             pass
         raise
-
-
 @contextmanager
 def _exclusive_lock(path: Path) -> Iterator[None]:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -391,12 +360,8 @@ def _exclusive_lock(path: Path) -> Iterator[None]:
             yield
         finally:
             fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
-
-
 def _identity(job: Mapping[str, Any]) -> dict[str, Any]:
     return {key: job[key] for key in ("experiment_id", "config_id", "policy", "seed")}
-
-
 def _metadata_base(job: Mapping[str, Any], trace_dir: Path) -> dict[str, Any]:
     input_hashes = _input_hashes(job, trace_dir)
     trace_hashes = {name.removeprefix("trace:"): digest for name, digest in input_hashes.items() if name.startswith("trace:")}
@@ -422,20 +387,14 @@ def _metadata_base(job: Mapping[str, Any], trace_dir: Path) -> dict[str, Any]:
         "cpu_roles": None,
         "effective_qdisc_settings": None,
     }
-
-
 def _row_for_missing(job: Mapping[str, Any]) -> dict[str, Any]:
     return make_row(
         str(job["experiment_id"]), str(job["scenario"]), float(job["beta"]), int(job["N"]),
         str(job["policy"]), int(job["seed"]), int(job["n_rounds"]),
         cross_mbps=float(job["cross_mbps"]), status="missing",
     )
-
-
 def _log_row(schema: str, **values: Any) -> dict[str, Any]:
     return {column: values.get(column, "") for column in SCHEMAS[schema]}
-
-
 def _initialize_logs(directory: Path, job: Mapping[str, Any], *, status: str = "running") -> None:
     directory.mkdir(parents=True, exist_ok=True)
     for filename, schema in _LOG_FILES.items():
@@ -459,8 +418,6 @@ def _initialize_logs(directory: Path, job: Mapping[str, Any], *, status: str = "
         else:
             with path.open("w", newline="", encoding="utf-8") as stream:
                 csv_writer(stream, schema)
-
-
 def _ensure_log_headers(directory: Path, job: Mapping[str, Any]) -> None:
     """Make the documented log set discoverable without overwriting prior data."""
     directory.mkdir(parents=True, exist_ok=True)
@@ -487,8 +444,6 @@ def _ensure_log_headers(directory: Path, job: Mapping[str, Any]) -> None:
         else:
             with path.open("w", newline="", encoding="utf-8") as stream:
                 csv_writer(stream, schema)
-
-
 def _write_simulator_run(
     job: Mapping[str, Any],
     stage: Path,
@@ -502,7 +457,6 @@ def _write_simulator_run(
     gateway = None
     policy = _SIMULATOR_POLICY_CONFIGS[str(job["policy"])]
     simulation_scenario = "X2" if float(job["cross_mbps"]) > 0 else str(job["scenario"])
-
     for round_id in range(1, int(job["n_rounds"]) + 1):
         def sample_hook(record: Mapping[str, Any]) -> None:
             if record.get("event") == "grant_resolved" and record.get("y") == 1 and record.get("rtt_ns") is not None:
@@ -513,7 +467,6 @@ def _write_simulator_run(
                     round_id=round_id,
                     rtt_ms=rtt_ns / 1_000_000.0,
                 ))
-
         result = simulation_runner(
             round_id=round_id,
             num_clients=int(job["N"]),
@@ -545,7 +498,6 @@ def _write_simulator_run(
             # The simulator does not expose enough frame-byte accounting to
             # calculate the schema's protocol_overhead metric faithfully.
         ))
-
     write_rows(stage / "round_metrics.csv", "round_metrics", round_rows)
     write_rows(stage / "rtt_samples.csv", "rtt_samples", rtt_rows)
     run_csv_path = stage / "run.csv"
@@ -555,8 +507,6 @@ def _write_simulator_run(
     records[0]["status"] = "ok"
     write_rows(run_csv_path, "run", records)
     return round_rows
-
-
 def _complete_artifacts_exist(run_dir: Path) -> bool:
     if not all((run_dir / filename).is_file() for filename in _LOG_FILES):
         return False
@@ -565,8 +515,6 @@ def _complete_artifacts_exist(run_dir: Path) -> bool:
     except (OSError, ValueError, KeyError, TypeError, RunsSchemaError, json.JSONDecodeError):
         return False
     return True
-
-
 def _load_metadata(path: Path, job: Mapping[str, Any], trace_dir: Path) -> dict[str, Any] | None:
     if not path.exists():
         return None
@@ -581,8 +529,6 @@ def _load_metadata(path: Path, job: Mapping[str, Any], trace_dir: Path) -> dict[
     if metadata.get("config_sha256") != _config_fingerprint(job, _input_hashes(job, trace_dir)):
         raise GridError(f"existing run configuration differs from requested job at {path.parent}")
     return metadata
-
-
 def _blocked_metadata(base: dict[str, Any], reasons: list[str]) -> dict[str, Any]:
     now = time.monotonic_ns()
     return {
@@ -597,8 +543,6 @@ def _blocked_metadata(base: dict[str, Any], reasons: list[str]) -> dict[str, Any
         "attempts": [],
         "summary_row": _row_for_missing(base),
     }
-
-
 def execute_job(
     job: dict[str, Any],
     raw_dir: str | Path,
@@ -609,10 +553,16 @@ def execute_job(
     """Run/resume one schema job under a per-run lock; return its summary row."""
     validate_job(job)
     raw_root, traces = Path(raw_dir), Path(trace_dir)
+    if str(job["experiment_id"]) in FL_EXPERIMENTS:
+        # FL writes its established raw JSON format and summary metrics. Keep
+        # it out of the simulator CSV-log pipeline; use the same per-run lock
+        # to prevent two grid workers from launching the same FL job together.
+        fl_lock = raw_root / ".locks" / f"{job['run_id']}.lock"
+        with _exclusive_lock(fl_lock):
+            return _execute_fl_job(job, raw_root, trace_dir=traces)
     run_dir = raw_root / str(job["experiment_id"]) / str(job["run_id"])
     metadata_path = run_dir / "meta.json"
     lock_path = raw_root / ".locks" / f"{job['run_id']}.lock"
-
     with _exclusive_lock(lock_path):
         if run_dir.exists() and not metadata_path.exists() and any(run_dir.iterdir()):
             raise GridError(f"refusing to reuse non-empty run directory without metadata: {run_dir}")
@@ -629,9 +579,7 @@ def execute_job(
                 "error": "completed metadata exists but raw artifacts are incomplete or invalid",
             })
             _atomic_json(metadata_path, existing)
-
         _ensure_log_headers(run_dir, job)
-
         reasons = _adapter_block_reasons(job, traces)
         if reasons:
             if existing is None or existing.get("execution_state") != "blocked":
@@ -640,7 +588,6 @@ def execute_job(
             else:
                 blocked = existing
             return dict(blocked["summary_row"])
-
         base = _metadata_base(job, traces)
         attempts = list(existing.get("attempts", [])) if existing else []
         attempt_count = int(existing.get("attempt_count", 0)) if existing else 0
@@ -650,7 +597,6 @@ def execute_job(
         if state == "running":
             attempts.append({"attempt": attempt_count, "state": "interrupted", "error": "previous process ended while running"})
         max_attempt_count = 2
-
         while attempt_count < max_attempt_count:
             attempt_count += 1
             started_ns = time.monotonic_ns()
@@ -724,7 +670,6 @@ def execute_job(
                 current.update({"execution_state": "failed", "ended_mono_ns": ended_ns, "attempts": attempts})
                 _atomic_json(metadata_path, current)
                 existing = current
-
         missing = {
             **base,
             "status": "missing",
@@ -739,8 +684,6 @@ def execute_job(
         }
         _atomic_json(metadata_path, missing)
         return dict(missing["summary_row"])
-
-
 def _archive_existing_logs(run_dir: Path, attempt: int) -> None:
     existing = [run_dir / name for name in (*_LOG_FILES,)]
     present = [path for path in existing if path.exists()]
@@ -750,8 +693,6 @@ def _archive_existing_logs(run_dir: Path, attempt: int) -> None:
     archive.mkdir(parents=True, exist_ok=False)
     for path in present:
         os.replace(path, archive / path.name)
-
-
 def upsert_summary_row(row: Mapping[str, Any], output_csv: str | Path) -> None:
     """Atomically upsert one run row, serialized across machines/workers."""
     path = Path(output_csv)
@@ -781,8 +722,6 @@ def upsert_summary_row(row: Mapping[str, Any], output_csv: str | Path) -> None:
         except BaseException:
             temp_path.unlink(missing_ok=True)
             raise
-
-
 def merge_summary_files(inputs: list[str | Path], output_csv: str | Path) -> Path:
     """Merge per-machine summary shards; duplicate schema keys are rejected."""
     rows: list[dict[str, Any]] = []
@@ -809,8 +748,6 @@ def merge_summary_files(inputs: list[str | Path], output_csv: str | Path) -> Pat
             temp_path.unlink(missing_ok=True)
             raise
     return path
-
-
 def _print_plan(jobs: list[dict[str, Any]], trace_dir: Path) -> None:
     available = 0
     blocked = 0
@@ -820,13 +757,186 @@ def _print_plan(jobs: list[dict[str, Any]], trace_dir: Path) -> None:
             blocked += 1
         else:
             available += 1
-    print(f"Expanded jobs: {len(jobs)} ({available} simulator-executable; {blocked} blocked/unavailable)")
+    print(f"Expanded jobs: {len(jobs)} ({available} executable by an available adapter; {blocked} blocked/unavailable)")
     for job in jobs[:8]:
         reasons = _adapter_block_reasons(job, trace_dir)
         label = "available" if not reasons else "blocked: " + "; ".join(reasons)
         print(f"  {job['run_id']} | {job['n_rounds']} rounds | {label}")
+def _load_full_reference_final_accuracies() -> list[float]:
+    """Load the three frozen FULL reference runs required to define a*."""
+    values = []
+    for seed in range(3):
+        path = Path("data/runs") / f"femnist_full_s{seed}.json"
+        if not path.is_file():
+            raise FileNotFoundError(f"run F-ref seeds 0..2 before FL comparisons; missing {path}")
+        data = json.loads(path.read_text(encoding="utf-8"))
+        history = data.get("history", [])
+        evals = [row for row in history if "test_accuracy" in row]
+        values.append(compute_final_accuracy([float(row["test_accuracy"]) for row in evals]))
+    return values
+def _write_fl_artifacts(
+    job: Mapping[str, Any],
+    raw_root: Path,
+    result: Mapping[str, Any],
+    *,
+    trace_dir: Path,
+) -> None:
+    """Persist FL-native artifacts without fabricating network telemetry.
+
+    FL runs have model/evaluation history, not gateway packet/queue samples.
+    Keep those artifacts in the same per-run directory/metadata convention as
+    simulator runs, but use fl_history.csv rather than empty network CSVs.
+    The legacy flat JSON is retained separately for compatibility with the
+    existing FEMNIST reference loader.
+    """
+    run_dir = raw_root / str(job["experiment_id"]) / str(job["run_id"])
+    run_dir.mkdir(parents=True, exist_ok=True)
+    now = time.monotonic_ns()
+    metadata = {
+        **_metadata_base(job, trace_dir),
+        "status": str(result.get("status", "ok")),
+        "execution_state": "complete" if result.get("status") == "ok" else "missing",
+        "availability": "available",
+        "artifact_type": "federated_learning",
+        "artifacts": ["meta.json", "run.csv", "fl_history.csv", "fl_result.json"],
+        "started_mono_ns": result.get("started_mono_ns", now),
+        "ended_mono_ns": result.get("ended_mono_ns", now),
+        "n_rounds_completed": len(result.get("history", [])),
+        "block_reasons": [],
+    }
+    _atomic_json(run_dir / "meta.json", metadata)
+    run_record = {
+        "run_id": job["run_id"],
+        "experiment_id": job["experiment_id"],
+        "config_id": job["config_id"],
+        "policy": job["policy"],
+        "seed": job["seed"],
+        "scenario": job["scenario"],
+        "beta": job["beta"],
+        "n_clients": job["N"],
+        "cross_mbps": job["cross_mbps"],
+        "status": result.get("status", "ok"),
+        "started_mono_ns": metadata["started_mono_ns"],
+        "ended_mono_ns": metadata["ended_mono_ns"],
+    }
+    write_rows(run_dir / "run.csv", "run", [run_record])
+    history = list(result.get("history", []))
+    columns = list(dict.fromkeys(key for row in history for key in row))
+    history_path = run_dir / "fl_history.csv"
+    with history_path.open("w", newline="", encoding="utf-8") as stream:
+        if columns:
+            writer = csv.DictWriter(stream, fieldnames=columns, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(history)
+        else:
+            stream.write("\n")
+    _atomic_json(run_dir / "fl_result.json", result)
 
 
+def _write_full_reference(job: Mapping[str, Any], result: Mapping[str, Any]) -> None:
+    """Publish F-ref in the exact location consumed by F-main/F-abl."""
+    if job["experiment_id"] != "F-ref":
+        return
+    seed = int(job["seed"])
+    target = Path("data/runs") / f"femnist_full_s{seed}.json"
+    _atomic_json(target, {"history": list(result.get("history", [])), "seed": seed,
+                          "experiment_id": "F-ref", "run_id": job["run_id"]})
+
+
+def _execute_fl_job(
+    job: dict[str, Any], raw_dir: Path, *, trace_dir: Path
+) -> dict[str, Any]:
+    """Run FL experiments through the FEMNIST/FedAvg path, never network-only."""
+    exp, pol, seed = job["experiment_id"], job["policy"], int(job["seed"])
+    scen, beta, n_clients = job["scenario"], float(job["beta"]), int(job["N"])
+    rounds, cross = int(job["n_rounds"]), float(job["cross_mbps"])
+    raw_file = raw_dir / f"{exp}_{job['config_id']}_{pol}_s{seed}.json"
+    # B2 push and B3 plan-then-send require Prajin's client/gateway adapters.
+    # Ignore any old raw record produced by the former incorrect dispatch.
+    if pol in {"B2", "B3"}:
+        reason = f"{pol} FL transport adapter is not integrated with the FEMNIST/FedAvg entry point"
+        blocked = {"job": job, "status": "missing", "reason": reason,
+                   "history": [], "started_mono_ns": time.monotonic_ns(),
+                   "ended_mono_ns": time.monotonic_ns()}
+        raw_file.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_json(raw_file, blocked)
+        _write_fl_artifacts(job, raw_dir, blocked, trace_dir=trace_dir)
+        run_dir = raw_dir / exp / str(job["run_id"])
+        metadata_path = run_dir / "meta.json"
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        metadata.update({"execution_state": "blocked", "availability": "blocked",
+                         "block_reasons": [reason]})
+        _atomic_json(metadata_path, metadata)
+        return make_row(exp, scen, beta, n_clients, pol, seed, rounds, cross_mbps=cross, status="missing")
+    if raw_file.is_file():
+        try:
+            data = json.loads(raw_file.read_text(encoding="utf-8"))
+            run_dir = raw_dir / exp / str(job["run_id"])
+            metadata_path = run_dir / "meta.json"
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            expected_config = _metadata_base(job, trace_dir)
+            required_artifacts = ("run.csv", "fl_history.csv", "fl_result.json")
+            cache_is_current = (
+                data.get("status") == "ok"
+                and data.get("job") == job
+                and isinstance(data.get("summary_metrics"), Mapping)
+                and "final_acc" in data["summary_metrics"]
+                and metadata.get("identity") == _identity(job)
+                and metadata.get("config_sha256") == expected_config["config_sha256"]
+                and metadata.get("status") == "ok"
+                and metadata.get("execution_state") == "complete"
+                and metadata.get("artifact_type") == "federated_learning"
+                and all((run_dir / name).is_file() for name in required_artifacts)
+            )
+            if cache_is_current:
+                _write_full_reference(job, data)
+                return make_row(exp, scen, beta, n_clients, pol, seed, rounds, cross_mbps=cross,
+                                status="ok", tta_censored=data.get("tta_censored"),
+                                **data["summary_metrics"])
+        except Exception:
+            pass
+    started_ns = time.monotonic_ns()
+    try:
+        full_final = None if exp == "F-ref" else _load_full_reference_final_accuracies()
+        # Lazy import keeps the non-ML simulator/test commands independent of torch.
+        from fedgrant.fl.run_fl import run_experiment
+        bank_path = "data/bank/femnist_full_s0.npz" if exp == "F-ref" and seed == 0 else None
+        no_ef = exp == "F-abl" and pol == "FG-GRU-A1"
+        history = run_experiment(seed=seed, rounds=rounds, policy="FULL" if exp == "F-ref" else pol,
+                                 beta=beta, scenario=scen, no_ef=no_ef, bank_path=bank_path,
+                                 trace_dir=str(trace_dir))
+        evaluations = [row for row in history if "test_accuracy" in row]
+        accuracies = [float(row["test_accuracy"]) for row in evaluations]
+        final_acc = compute_final_accuracy(accuracies)
+        summary: dict[str, Any] = {"final_acc": final_acc}
+        censored = None
+        if exp != "F-ref":
+            assert full_final is not None
+            target = 0.9 * float(np.mean(full_final))
+            tta_rounds, tta_seconds = compute_time_to_target(
+                evaluations, target, max_round=rounds, t_c_s=1.0,
+                d_s=compute_deadline_ns(beta, n_clients) / 1e9,
+            )
+            censored = tta_rounds is None
+            summary.update(tta_rounds=(float(tta_rounds) if tta_rounds is not None else None),
+                           tta_seconds=(float(tta_seconds) if tta_seconds is not None else None))
+        result_record = {"job": job, "status": "ok", "tta_censored": censored,
+                         "summary_metrics": summary, "history": history,
+                         "started_mono_ns": started_ns, "ended_mono_ns": time.monotonic_ns()}
+        raw_file.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_json(raw_file, result_record)
+        _write_full_reference(job, result_record)
+        _write_fl_artifacts(job, raw_dir, result_record, trace_dir=trace_dir)
+        return make_row(exp, scen, beta, n_clients, pol, seed, rounds, cross_mbps=cross,
+                        status="ok", tta_censored=censored, **summary)
+    except Exception as exc:
+        failure = {"job": job, "status": "missing", "error": repr(exc),
+                   "started_mono_ns": started_ns, "ended_mono_ns": time.monotonic_ns(),
+                   "history": []}
+        raw_file.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_json(raw_file, failure)
+        _write_fl_artifacts(job, raw_dir, failure, trace_dir=trace_dir)
+        return make_row(exp, scen, beta, n_clients, pol, seed, rounds, cross_mbps=cross, status="missing")
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--exp", nargs="+", choices=EXPERIMENTS, default=None, help="Filter experiment IDs")
@@ -845,7 +955,6 @@ def main() -> None:
     parser.add_argument("--output-csv", type=Path, default=Path("results/summary/runs.csv"))
     parser.add_argument("--raw-dir", type=Path, default=Path("results/raw"))
     args = parser.parse_args()
-
     if args.merge_csv:
         try:
             merge_summary_files(args.merge_csv, args.output_csv)
@@ -853,7 +962,6 @@ def main() -> None:
             parser.error(str(exc))
         print(f"Merged {len(args.merge_csv)} summary shard(s) into {args.output_csv}")
         return
-
     if args.run and args.dry_run:
         parser.error("--run and --dry-run are mutually exclusive")
     if args.max_runs is not None and args.max_runs < 1:
@@ -870,9 +978,8 @@ def main() -> None:
     print(f"Summary: {args.output_csv}; run directories: {args.raw_dir}")
     _print_plan(assigned, args.trace_dir)
     if not args.run:
-        print("Pass --run to execute available simulator modes. Blocked jobs will be recorded as missing with reasons.")
+        print("Pass --run to execute available simulator and FL adapters. Blocked jobs will be recorded as missing with reasons.")
         return
-
     started = time.monotonic_ns()
     for index, job in enumerate(assigned, 1):
         print(f"[{index}/{len(assigned)}] {job['run_id']}", flush=True)
@@ -880,7 +987,5 @@ def main() -> None:
         upsert_summary_row(row, args.output_csv)
     elapsed_s = (time.monotonic_ns() - started) / 1e9
     print(f"Finished {len(assigned)} assigned jobs in {elapsed_s:.2f}s; summary: {args.output_csv}")
-
-
 if __name__ == "__main__":
     main()

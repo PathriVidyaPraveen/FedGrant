@@ -5,3 +5,10 @@ data/
 *.egg-info/
 fedgrant.egg-info/
 results/mininet/
+results/raw/
+results/summary/runs.csv
+results/summary/M-sim_runs.csv
+results/summary/M-sim_candidate_runs.csv
+results/summary/M-sim_runs_superseded_20261102.csv
+results/summary/M-sim_validation.json
+Tejaswi_5_part.md

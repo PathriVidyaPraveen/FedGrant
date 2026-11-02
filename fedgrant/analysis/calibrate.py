@@ -1,4 +1,4 @@
-"""Paired Mininet-vs-simulator analysis with paired t tests and Holm correction."""
+"""Per-configuration paired Mininet-vs-simulator confidence intervals."""
 
 from __future__ import annotations
 
@@ -11,12 +11,11 @@ from pathlib import Path
 import numpy as np
 from scipy.stats import t as student_t
 
-from fedgrant.analysis.runs_schema import Run, read_runs_csv
+from fedgrant.analysis.runs_schema import Run, expected_runs, read_runs_csv
 
 CALIBRATION_METRICS = (
-    "eta", "delivered_blocks", "clients_represented", "deadline_completion", "goodput_bps",
-    "utilization", "queue_drops_fg", "queue_drops_cross", "wasted_grants", "late_after_timeout",
-    "late_after_deadline", "rtt_p50_ms", "rtt_p99_ms", "protocol_overhead",
+    # Section 14 explicitly defines these three M1-vs-simulator metrics.
+    "eta", "utilization", "wasted_grants",
 )
 
 
@@ -46,59 +45,54 @@ def _paired_rows(runs: list[Run], metric: str):
     return mininet, simulator, differences
 
 
-def compare(runs: list[Run], metrics: tuple[str, ...] = CALIBRATION_METRICS) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
-    """Return per-policy paired summaries and the list of unmatched identities."""
+def compare(runs: list[Run], metrics: tuple[str, ...] = CALIBRATION_METRICS,
+            *, include_expected: bool = True) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    """Return configuration/policy paired summaries and unmatched identities."""
     mininet_all = {(r.config_id, r.policy, r.seed): r for r in runs if r.experiment_id == "M1"}
     simulator_all = {(r.config_id, r.policy, r.seed): r for r in runs if r.experiment_id == "M-sim"}
     mininet = {key: row for key, row in mininet_all.items() if row.status != "missing"}
     simulator = {key: row for key, row in simulator_all.items() if row.status != "missing"}
+    expected_m1 = {(cid, policy, seed) for exp, cid, policy, seed in expected_runs() if exp == "M1"}
+    expected_sim = {(cid, policy, seed) for exp, cid, policy, seed in expected_runs() if exp == "M-sim"}
     all_keys = mininet_all.keys() | simulator_all.keys()
+    if include_expected:
+        all_keys |= expected_m1 | expected_sim
     missing = []
     for cid, policy, seed in sorted(all_keys):
         m1_row, sim_row = mininet_all.get((cid, policy, seed)), simulator_all.get((cid, policy, seed))
         if m1_row is None or m1_row.status == "missing":
             missing.append({"config_id": cid, "policy": policy, "seed": seed, "missing_from": "M1 metrics"})
-        if sim_row is None or sim_row.status == "missing":
+        # B1 is a TCP Mininet baseline and has no M-sim twin in the frozen matrix.
+        if policy != "B1" and (sim_row is None or sim_row.status == "missing"):
             missing.append({"config_id": cid, "policy": policy, "seed": seed, "missing_from": "M-sim metrics"})
-    grouped: dict[tuple[str, str], list[float]] = defaultdict(list)
+    grouped: dict[tuple[str, str, str], list[float]] = defaultdict(list)
     for metric in metrics:
         _, _, pairs = _paired_rows(runs, metric)
         for (config_id, policy, seed), diff in pairs:
-            grouped[(policy, metric)].append(diff)
+            grouped[(config_id, policy, metric)].append(diff)
     rows: list[dict[str, object]] = []
-    p_slots: list[int] = []
-    p_values: list[float] = []
-    for (policy, metric), diffs in sorted(grouped.items()):
+    for (config_id, policy, metric), diffs in sorted(grouped.items()):
         values = np.asarray(diffs, dtype=np.float64)
         n = int(values.size)
         mean = float(values.mean())
         sd = float(values.std(ddof=1)) if n > 1 else math.nan
-        if n > 1 and sd > 0:
+        if n > 1:
             se = sd / math.sqrt(n)
-            t_stat = mean / se
-            p_value = float(2 * student_t.sf(abs(t_stat), n - 1))
             margin = float(student_t.ppf(0.975, n - 1) * se)
             ci_low, ci_high = mean - margin, mean + margin
-        elif n > 1:
-            t_stat, p_value = (0.0, 1.0) if mean == 0 else (math.copysign(math.inf, mean), 0.0)
-            ci_low = ci_high = mean
+        elif n == 1:
+            ci_low = ci_high = math.nan
         else:
-            t_stat = p_value = ci_low = ci_high = math.nan
-        rows.append({"policy": policy, "metric": metric, "n_pairs": n, "mean_mininet_minus_sim": mean,
-                     "sd_difference": sd, "t_statistic": t_stat, "p_value": p_value,
-                     "ci95_low": ci_low, "ci95_high": ci_high, "p_holm": math.nan})
-        if math.isfinite(p_value):
-            p_slots.append(len(rows) - 1)
-            p_values.append(p_value)
-    for idx, adjusted in zip(p_slots, holm_adjust(p_values), strict=True):
-        rows[idx]["p_holm"] = adjusted
+            ci_low = ci_high = math.nan
+        rows.append({"config_id": config_id, "policy": policy, "metric": metric, "n_pairs": n, "mean_mininet_minus_sim": mean,
+                     "sd_difference": sd, "ci95_low": ci_low, "ci95_high": ci_high})
     return rows, missing
 
 
 def write_csv(rows: list[dict[str, object]], path: str | Path, fieldnames: list[str] | None = None) -> None:
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
-    columns = fieldnames or (list(rows[0]) if rows else ["policy", "metric", "n_pairs", "mean_mininet_minus_sim", "sd_difference", "t_statistic", "p_value", "ci95_low", "ci95_high", "p_holm"])
+    columns = fieldnames or (list(rows[0]) if rows else ["config_id", "policy", "metric", "n_pairs", "mean_mininet_minus_sim", "sd_difference", "ci95_low", "ci95_high"])
     with p.open("w", newline="", encoding="utf-8") as stream:
         writer = csv.DictWriter(stream, fieldnames=columns)
         writer.writeheader()
@@ -112,7 +106,7 @@ def main() -> None:
     parser.add_argument("--missing-output", default="results/summary/mininet_sim_missing_pairs.csv")
     args = parser.parse_args()
     runs = read_runs_csv(args.runs)
-    summaries, missing = compare(runs)
+    summaries, missing = compare(runs, include_expected=True)
     write_csv(summaries, args.output)
     write_csv(missing, args.missing_output, ["config_id", "policy", "seed", "missing_from"])
     print(f"wrote {len(summaries)} metric comparisons and {len(missing)} unmatched run keys")

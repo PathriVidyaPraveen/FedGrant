@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
-SCHEMA_VERSION: int = 1
+SCHEMA_VERSION: int = 2
 
 EXPERIMENTS: tuple[str, ...] = ("N-main", "N-X1", "N-X2", "N-abl", "F-main", "F-ref", "F-abl", "M1", "M2", "M-sim")
 PLATFORM_OF: dict[str, str] = {e: ("mininet" if e in ("M1", "M2") else "sim") for e in EXPERIMENTS}
@@ -33,7 +33,7 @@ NET_METRICS: tuple[str, ...] = (
     "eta", "delivered_blocks", "clients_represented", "deadline_completion", "goodput_bps", "utilization",
     "queue_drops_fg", "queue_drops_cross", "wasted_grants", "late_after_timeout", "late_after_deadline",
     "rtt_p50_ms", "rtt_p99_ms", "gw_cpu_pct", "gw_rss_mb", "sched_lat_p50_us", "sched_lat_p99_us",
-    "protocol_overhead",
+    "queueing_delay_mean_ms", "queueing_delay_p99_ms", "protocol_overhead",
 )
 FL_METRICS: tuple[str, ...] = ("final_acc", "tta_rounds", "tta_censored", "tta_seconds")
 COLUMNS: tuple[str, ...] = (*ID_COLUMNS, *NET_METRICS, *FL_METRICS, "status")
@@ -148,9 +148,9 @@ def parse_row(row: Mapping[str, Any], where: str = "") -> Run:
         if exp in FL_EXPERIMENTS:
             if math.isnan(metrics["final_acc"]):
                 raise RunsSchemaError(f"{at}FL run needs final_acc")
-            if cens is None:
+            if exp != "F-ref" and cens is None:
                 raise RunsSchemaError(f"{at}FL run needs tta_censored")
-            if not cens and math.isnan(metrics["tta_rounds"]):
+            if exp != "F-ref" and not cens and math.isnan(metrics["tta_rounds"]):
                 raise RunsSchemaError(f"{at}uncensored FL run needs tta_rounds")
         elif pol != "FULL" and math.isnan(metrics["eta"]):
             raise RunsSchemaError(f"{at}network run needs eta")
@@ -163,11 +163,16 @@ def read_runs_csv(path: str | Path) -> list[Run]:
     seen: set[tuple[str, str, str, int]] = set()
     with Path(path).open(newline="") as f:
         r = csv.DictReader(f)
-        missing = [c for c in COLUMNS if c not in (r.fieldnames or [])]
+        # Schema v1 did not include explicit queueing-delay scalar columns.
+        # Accept that historical header and normalize absent values to blanks;
+        # all newly written files use the full v2 schema.
+        legacy_optional = {"queueing_delay_mean_ms", "queueing_delay_p99_ms"}
+        missing = [c for c in COLUMNS if c not in (r.fieldnames or []) and c not in legacy_optional]
         if missing:
             raise RunsSchemaError(f"{path}: missing columns {missing}")
         for i, row in enumerate(r, start=2):
-            run = parse_row(row, f"{path}:{i}")
+            normalized = {**row, **{c: "" for c in legacy_optional if c not in row}}
+            run = parse_row(normalized, f"{path}:{i}")
             if run.key in seen:
                 raise RunsSchemaError(f"{path}:{i}: duplicate run {run.key}")
             seen.add(run.key)

@@ -19,29 +19,22 @@ copyright_file=""
 if [[ -n "$manual_dir" ]]; then
   source_dir="$manual_dir"
   source_description="manual source: $manual_dir"
+elif [[ -d "$out_dir/raw" && -f "$out_dir/raw/Verizon-LTE-driving.up" ]]; then
+  source_dir="$out_dir/raw"
+  source_description="existing repository-local raw traces"
 elif [[ -d /usr/share/mahimahi/traces ]]; then
   source_dir=/usr/share/mahimahi/traces
   source_description="system Mahimahi traces"
 else
-  tmp_dir="$(mktemp -d)"
-  trap 'rm -rf "$tmp_dir"' EXIT
-  repo="$tmp_dir/mahimahi"
-  GIT_TERMINAL_PROMPT=0 git clone --quiet --depth 1 --filter=blob:none --sparse https://github.com/ravinet/mahimahi.git "$repo"
-  git -C "$repo" sparse-checkout set traces
-  if [[ -n "${MAHIMAHI_COMMIT:-}" ]]; then
-    git -C "$repo" fetch --quiet --depth 1 origin "$MAHIMAHI_COMMIT"
-    git -C "$repo" checkout --quiet FETCH_HEAD
-  fi
-  source_dir="$repo/traces"
-  source_description="upstream Mahimahi repository at $(git -C "$repo" rev-parse HEAD)"
-  copyright_file="$tmp_dir/COPYING"
-  if git -C "$repo" cat-file -e HEAD:COPYING 2>/dev/null; then
-    git -C "$repo" show HEAD:COPYING > "$copyright_file"
-  elif git -C "$repo" cat-file -e HEAD:LICENSE 2>/dev/null; then
-    copyright_file="$tmp_dir/LICENSE"
-    git -C "$repo" show HEAD:LICENSE > "$copyright_file"
+  # Prefer already downloaded, repository-local trace files. This step is
+  # intentionally offline: fetch raw traces separately with a licensed source
+  # and pass it via --from, or install the Mahimahi trace package.
+  if [[ -d "$out_dir/raw" ]]; then
+    source_dir="$out_dir/raw"
+    source_description="existing repository-local raw traces"
   else
-    copyright_file=""
+    echo "No local trace source found. Install Mahimahi traces or run: $0 --from /path/to/traces" >&2
+    exit 2
   fi
 fi
 
@@ -57,21 +50,26 @@ if ((${#missing[@]})); then
   exit 1
 fi
 
-mkdir -p "$out_dir/raw"
-for name in "${names[@]}"; do cp "$source_dir/$name.up" "$out_dir/raw/$name.up"; done
+# Resolve the license before copying anything, so a failed provenance check
+# cannot leave a partial raw-trace directory behind. Repositories commonly
+# keep COPYRIGHT beside the raw/ subdirectory.
 if [[ -z "$copyright_file" ]]; then
   for candidate in "$source_dir/COPYRIGHT" "$source_dir/COPYING" "$source_dir/LICENSE" \
-                   "$source_dir/../COPYING" "$source_dir/../LICENSE" \
+                   "$source_dir/../COPYRIGHT" "$source_dir/../COPYING" "$source_dir/../LICENSE" \
                    /usr/share/doc/mahimahi-traces/copyright /usr/share/doc/mahimahi/copyright; do
     if [[ -f "$candidate" ]]; then copyright_file="$candidate"; break; fi
   done
 fi
-if [[ -n "$copyright_file" && -f "$copyright_file" ]]; then
-  cp "$copyright_file" "$out_dir/COPYRIGHT"
-else
+if [[ -z "$copyright_file" || ! -f "$copyright_file" ]]; then
   echo "Could not locate the Mahimahi trace license; refusing to copy unlicensed data." >&2
   exit 1
 fi
+
+mkdir -p "$out_dir/raw"
+for name in "${names[@]}"; do
+  [[ "$source_dir/$name.up" -ef "$out_dir/raw/$name.up" ]] || cp "$source_dir/$name.up" "$out_dir/raw/$name.up"
+done
+cp "$copyright_file" "$out_dir/COPYRIGHT"
 
 {
   printf 'source=%s\n' "$source_description"

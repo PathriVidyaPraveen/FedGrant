@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import asyncio
 import json
 from pathlib import Path
@@ -11,6 +12,9 @@ import numpy as np
 
 from fedgrant.core.client_core import ClientCore
 from fedgrant.mininet.profile_update import profile_bank, synthetic_update
+from fedgrant.common.constants import MessageType
+from fedgrant.common.logschema import PACKET_COLUMNS
+from fedgrant.common.wire import decode_message, WireProtocolError
 from fedgrant.net.udp_client import UdpClient
 
 
@@ -22,7 +26,31 @@ async def run(args: argparse.Namespace) -> None:
         profile = profiles[(round_id - 1) % len(profiles)]
         return synthetic_update(profile, seed=args.seed + args.client_id * 1009 + round_id)
 
-    client = await UdpClient.bind(core, gateway_addr=("10.0.0.254", args.port), update_provider=update_provider)
+    packet_path = Path(args.log_file).with_name(f"client_{args.client_id}_packets.csv")
+    packet_stream = packet_path.open("w", newline="", encoding="utf-8")
+    packet_writer = csv.DictWriter(packet_stream, fieldnames=PACKET_COLUMNS, extrasaction="raise")
+    packet_writer.writeheader()
+
+    def observe_packet(data: bytes, timestamp_ns: int) -> None:
+        try:
+            current_l = core.round.L if core.round is not None else None
+            msg = decode_message(data, block_length=current_l)
+            packet_type = MessageType(msg.message_type).name
+            body = msg.body
+            packet_writer.writerow({
+                "t_mono_ns": timestamp_ns, "round_id": msg.round_id, "direction": "sent",
+                "client_id": args.client_id, "packet_seq": "", "grant_id": body.get("grant_id", ""),
+                "send_pos": body.get("send_pos", ""), "block_idx": body.get("block_idx", ""),
+                "packet_type": packet_type, "bytes": len(data),
+                "payload_bytes": (2 * current_l if packet_type == "DATA" and current_l is not None else 0),
+                "result": "sent",
+            })
+            packet_stream.flush()
+        except (WireProtocolError, ValueError, TypeError):
+            return
+
+    client = await UdpClient.bind(core, gateway_addr=("10.0.0.254", args.port),
+                                  update_provider=update_provider, packet_observer=observe_packet)
     completed = []
     try:
         last_seen = 0
@@ -44,7 +72,10 @@ async def run(args: argparse.Namespace) -> None:
             "timeouts": stats.round_end_timeouts,
         }, indent=2) + "\n")
     finally:
-        await client.close()
+        try:
+            await client.close()
+        finally:
+            packet_stream.close()
 
 
 def main() -> None:

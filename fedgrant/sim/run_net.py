@@ -965,7 +965,10 @@ def run_network_round(
     eta_r = (delivered_energy_vr / total_round_energy) if total_round_energy > 0 else 0.0
 
     d_seconds = D_ns / 1_000_000_000.0
-    goodput_bps = (total_delivered_blocks * 8 * 1400) / d_seconds if d_seconds > 0 else 0.0
+    # DATA always carries a fixed L-coordinate fp16 block. The final block is
+    # zero-padded on wire; n_coords is decoder metadata, not a shorter packet.
+    delivered_payload_bytes = total_delivered_blocks * (2 * L_DEFAULT)
+    goodput_bps = (delivered_payload_bytes * 8) / d_seconds if d_seconds > 0 else 0.0
     frames_sent_at_deadline = bottleneck.frames_sent
     utilization = (frames_sent_at_deadline * S * 8) / (C * d_seconds) if d_seconds > 0 else 0.0
 
@@ -1021,6 +1024,9 @@ def run_network_round(
         "gateway": gateway,
         "metrics": metrics,
         "late_metrics": late_metrics,
+        # Keep sample-level values so callers can pool RTTs across warm rounds;
+        # averaging round percentiles is not statistically equivalent.
+        "rtt_samples_ns": tuple(int(value) for value in rtt_samples),
     }
 
 

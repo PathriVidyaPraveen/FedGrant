@@ -21,47 +21,45 @@ pytestmark = pytest.mark.skipif(
 
 
 def _udp_goodput(server, client, *, offered_mbps: int, duration_s: int = 3, port: int = 39173) -> float:
-    """Measure received UDP payload without iperf's in-band TCP control flow."""
+    """Measure delivered payload for datagrams sent inside the offered interval."""
     receiver_code = """import json, socket, sys, time
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 s.bind((sys.argv[1], int(sys.argv[2])))
 s.settimeout(.1)
 duration = float(sys.argv[3])
 deadline = None
-total = 0
-first = None
-last = None
+events = []
 while True:
     try:
         data, _ = s.recvfrom(65535)
-        now = time.monotonic()
-        total += len(data)
-        first = now if first is None else first
-        last = now
+        events.append((time.monotonic_ns(), len(data)))
         if deadline is None:
-            deadline = now + duration + .25
+            deadline = time.monotonic() + duration + .5
     except socket.timeout:
         if deadline is not None and time.monotonic() >= deadline:
             break
-print(json.dumps({'bytes': total, 'first': first, 'last': last}))
+print(json.dumps({'events': events}))
 """
-    sender_code = """import socket, sys, time
+    sender_code = """import json, socket, sys, time
 dst = (sys.argv[1], int(sys.argv[2]))
 rate = float(sys.argv[3]) * 1e6
 duration = float(sys.argv[4])
-payload = b'x' * 1432
+payload_bytes = 1432
+payload = b'x' * payload_bytes
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-start = time.monotonic()
-deadline = start + duration
-next_send = start
-interval = len(payload) * 8 / rate
-while time.monotonic() < deadline:
+start_ns = time.monotonic_ns()
+deadline_ns = start_ns + int(duration * 1e9)
+next_send = time.monotonic()
+interval = payload_bytes * 8 / rate
+while time.monotonic_ns() < deadline_ns:
     now = time.monotonic()
     if now < next_send:
         time.sleep(min(next_send - now, .001))
         continue
     s.sendto(payload, dst)
     next_send = max(next_send + interval, now)
+end_ns = time.monotonic_ns()
+print(json.dumps({'start_ns': start_ns, 'end_ns': end_ns}))
 """
     receiver = server.popen(
         [sys.executable, "-c", receiver_code, "10.0.0.254", str(port), str(duration_s)],
@@ -70,17 +68,26 @@ while time.monotonic() < deadline:
     try:
         time.sleep(0.2)
         sender = client.popen(
-            [sys.executable, "-c", sender_code, "10.0.0.254", str(port), str(offered_mbps), str(duration_s)],
-            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            [sys.executable, "-c", sender_code, "10.0.0.254", str(port),
+             str(offered_mbps), str(duration_s)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
-        _, stderr = sender.communicate(timeout=duration_s + 5)
+        sender_stdout, stderr = sender.communicate(timeout=duration_s + 5)
         assert sender.returncode == 0, stderr.decode(errors="replace")
         stdout, stderr = receiver.communicate(timeout=duration_s + 5)
         assert receiver.returncode == 0, stderr.decode(errors="replace")
-        result = json.loads(stdout)
-        measured_s = result["last"] - result["first"]
-        assert measured_s > 0, f"receiver measured no UDP interval: {result}"
-        return result["bytes"] * 8 / measured_s
+        received = json.loads(stdout)
+        sent = json.loads(sender_stdout)
+        start_ns, end_ns = int(sent["start_ns"]), int(sent["end_ns"])
+        # Use arrival time, so packets that drain after the offered flow stops
+        # do not inflate the measured receiver goodput.
+        delivered_bytes = sum(
+            int(size) for arrived_ns, size in received["events"]
+            if start_ns <= int(arrived_ns) <= end_ns
+        )
+        measured_s = (end_ns - start_ns) / 1e9
+        assert delivered_bytes > 0, f"receiver measured no UDP packets: {received}"
+        return delivered_bytes * 8 / measured_s
     finally:
         for proc in (locals().get("sender"), receiver):
             if proc is not None and proc.poll() is None:
@@ -101,8 +108,11 @@ def test_small_topology_rtt_access_cap_and_shared_bottleneck():
         assert abs(float(match.group(1)) - 30.0) <= 3.0
 
         access_bps = _udp_goodput(net.get("gw"), net.get("c0"), offered_mbps=20)
-        expected_access_payload_bps = 2_000_000 * (1432 / 1474) * 0.95
-        assert abs(access_bps - expected_access_payload_bps) / expected_access_payload_bps <= 0.08
+        # At 20 Mbit/s offered load the surviving packets still saturate the
+        # 2 Mbit/s TBF, so GE loss is not an extra multiplier on the shaped
+        # egress goodput. Convert the shaped Ethernet frame rate to UDP payload.
+        expected_access_payload_bps = 2_000_000 * (1432 / 1474)
+        assert abs(access_bps - expected_access_payload_bps) / expected_access_payload_bps <= 0.03
 
         bottleneck_bps = _udp_goodput(net.get("gw"), net.get("xt"), offered_mbps=20, port=39174)
         assert 9_600_000 <= bottleneck_bps <= 9_800_000
