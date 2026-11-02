@@ -27,7 +27,8 @@ async def serve(args: argparse.Namespace) -> None:
     core = load_factory(args.gateway_factory)(args.clients)
     endpoints = {i: (f"10.0.0.{i + 1}", args.client_port) for i in range(args.clients)}
     gateway = await LoggingUdpGateway.bind(core, local_addr=("10.0.0.254", args.port),
-                                           endpoints=endpoints, log_dir=args.log_dir)
+                                           endpoints=endpoints, log_dir=args.log_dir,
+                                           profile_scheduler=args.profile_gateway)
     try:
         round_state = RoundStateFile(args.round_state)
         round_state.write(round_id=0, active=False)
@@ -121,6 +122,7 @@ def main() -> None:
     parser.add_argument("--gateway-factory", default="fedgrant.mininet.stub_policy:create_gateway")
     parser.add_argument("--log-dir", required=True)
     parser.add_argument("--round-state", required=True)
+    parser.add_argument("--profile-gateway", action="store_true")
     args = parser.parse_args()
     if (args.clients < 1 or args.rounds < 1 or args.duration_ns < 1
             or args.compute_window_s < 0 or args.late_drain_s < 0 or args.inter_round_s < 0):

@@ -1,13 +1,13 @@
 """Deterministic experiment-grid expansion, execution, resume, and summary.
 The schema's ``expected_runs`` remains the canonical experiment matrix. This
-runner executes grant-based simulator configurations through the Task 16
-run-directory pipeline and FEMNIST/FedAvg FL jobs through the existing FL
-entry point. FL runs receive per-run metadata, run.csv, fl_history.csv, and
+runner executes grant-based and B2/B3 simulator configurations through the
+Task 16 run-directory pipeline, and FEMNIST/FedAvg FL jobs through the existing
+FL entry point. FL runs receive per-run metadata, run.csv, fl_history.csv, and
 fl_result.json; network-only packet/queue logs are deliberately not fabricated.
-F-ref publishes the frozen reference files consumed by F-main/F-abl. Mininet
-and B2/B3 transfer modes remain explicitly blocked until their adapters are
-integrated into the corresponding execution paths.
+F-ref publishes the frozen reference files consumed by F-main/F-abl. Production
+Mininet client/baseline adapters remain unavailable for M1/M2.
 """
+
 from __future__ import annotations
 import argparse
 import csv
@@ -29,6 +29,7 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 from fedgrant.analysis import raw_metrics
+from fedgrant.analysis.metrics import compute_final_accuracy, compute_time_to_target
 from fedgrant.analysis.runs_schema import (
     EXPERIMENTS,
     FL_EXPERIMENTS,
@@ -43,7 +44,7 @@ from fedgrant.analysis.runs_schema import (
     write_runs_csv,
 )
 from fedgrant.common.logschema import SCHEMAS, csv_writer, write_rows
-from fedgrant.analysis.metrics import compute_final_accuracy, compute_time_to_target
+from fedgrant.baselines.sim_adapter import run_baseline_network_round
 from fedgrant.policy.types import PolicyConfig
 from fedgrant.sim.run_net import compute_deadline_ns, run_network_round
 from fedgrant.traces.client_trace import POOL_ID, POOL_OOD
@@ -290,12 +291,16 @@ def _adapter_block_reasons(job: Mapping[str, Any], trace_dir: Path) -> list[str]
             "the FL server/model-update/bitmap-aggregation lifecycle is not integrated with the Mininet run directory",
         ))
     elif experiment in FL_EXPERIMENTS and policy in {"B2", "B3"}:
-        reasons.append(f"{policy} FL transport adapter is not integrated with the FEMNIST/FedAvg entry point")
-    elif experiment not in FL_EXPERIMENTS and policy not in _SIMULATOR_POLICY_CONFIGS:
-        # Do not route B2/B3 through the grant-based simulator. Their separate
-        # baseline implementations remain untouched; a simulator adapter must
-        # be integrated before these matrix rows can execute here.
-        reasons.append(f"simulator transfer-mode adapter for policy {policy!r} is unavailable (the simulator path is grant-based)")
+        reasons.append(
+            f"{policy} FL transport adapter is not integrated with the FEMNIST/FedAvg entry point"
+        )
+    elif policy in {"B2", "B3"} and experiment not in {
+        "N-main", "N-X1", "N-X2", "N-abl", "M-sim",
+    }:
+        reasons.append(f"simulator baseline adapter for {policy!r} is unavailable in {experiment!r}")
+    elif policy not in _SIMULATOR_POLICY_CONFIGS:
+        if policy not in {"B2", "B3"}:
+            reasons.append(f"simulator transfer-mode adapter for policy {policy!r} is unavailable")
     if job["scenario"] in {"L4", "L5"}:
         names = POOL_OOD if job["scenario"] == "L5" else POOL_ID
         split = "ood" if job["scenario"] == "L5" else "test"
@@ -394,7 +399,10 @@ def _row_for_missing(job: Mapping[str, Any]) -> dict[str, Any]:
         cross_mbps=float(job["cross_mbps"]), status="missing",
     )
 def _log_row(schema: str, **values: Any) -> dict[str, Any]:
-    return {column: values.get(column, "") for column in SCHEMAS[schema]}
+    return {
+        column: "" if values.get(column) is None else values.get(column, "")
+        for column in SCHEMAS[schema]
+    }
 def _initialize_logs(directory: Path, job: Mapping[str, Any], *, status: str = "running") -> None:
     directory.mkdir(parents=True, exist_ok=True)
     for filename, schema in _LOG_FILES.items():
@@ -450,54 +458,137 @@ def _write_simulator_run(
     *,
     trace_dir: Path,
     simulation_runner: Callable[..., Mapping[str, Any]],
+    baseline_runner: Callable[..., Mapping[str, Any]],
 ) -> list[dict[str, Any]]:
     _initialize_logs(stage, job)
     round_rows: list[dict[str, Any]] = []
     rtt_rows: list[dict[str, Any]] = []
+    round_event_rows: list[dict[str, Any]] = []
+    packet_rows: list[dict[str, Any]] = []
+    queue_rows: list[dict[str, Any]] = []
     gateway = None
-    policy = _SIMULATOR_POLICY_CONFIGS[str(job["policy"])]
+    policy_name = str(job["policy"])
+    is_baseline = policy_name in {"B2", "B3"}
+    policy = _SIMULATOR_POLICY_CONFIGS.get(policy_name)
     simulation_scenario = "X2" if float(job["cross_mbps"]) > 0 else str(job["scenario"])
     for round_id in range(1, int(job["n_rounds"]) + 1):
+        grant_rtt_count = 0
+
         def sample_hook(record: Mapping[str, Any]) -> None:
+            nonlocal grant_rtt_count
             if record.get("event") == "grant_resolved" and record.get("y") == 1 and record.get("rtt_ns") is not None:
                 rtt_ns = int(record["rtt_ns"])
+                grant_rtt_count += 1
                 rtt_rows.append(_log_row(
                     "rtt_samples",
                     t_mono_ns=int(record.get("abs_t_ns", record["t_ns"])),
                     round_id=round_id,
                     rtt_ms=rtt_ns / 1_000_000.0,
+                    rtt_type="grant_resolution",
+                    client_id=record.get("client_id", ""),
                 ))
-        result = simulation_runner(
-            round_id=round_id,
-            num_clients=int(job["N"]),
-            beta=float(job["beta"]),
-            scenario=simulation_scenario,
-            policy_config=policy,
-            seed=network_round_seed(int(job["seed"]), round_id),
-            gateway=gateway,
-            trace_dir=str(trace_dir),
-            sample_hook=sample_hook,
-        )
+        if is_baseline:
+            result = baseline_runner(
+                round_id=round_id,
+                num_clients=int(job["N"]),
+                beta=float(job["beta"]),
+                scenario=simulation_scenario,
+                policy=policy_name,
+                seed=network_round_seed(int(job["seed"]), round_id),
+                gateway=gateway,
+                trace_dir=str(trace_dir),
+            )
+        else:
+            if policy is None:
+                raise GridError(f"simulator policy adapter for {policy_name!r} is unavailable")
+            result = simulation_runner(
+                round_id=round_id,
+                num_clients=int(job["N"]),
+                beta=float(job["beta"]),
+                scenario=simulation_scenario,
+                policy_config=policy,
+                seed=network_round_seed(int(job["seed"]), round_id),
+                gateway=gateway,
+                trace_dir=str(trace_dir),
+                sample_hook=sample_hook,
+            )
         gateway = result["gateway"]
         metrics = result["metrics"]
         late_metrics = result.get("late_metrics", {})
+        baseline_rtts = result.get("rtt_samples_ns", {})
+        for client_id, rtt_ns_value in baseline_rtts.items():
+            rtt_ns = int(rtt_ns_value)
+            rtt_rows.append(_log_row(
+                "rtt_samples",
+                t_mono_ns=result.get("rtt_sample_times_ns", {}).get(client_id, ""),
+                round_id=round_id,
+                rtt_ms=rtt_ns / 1_000_000.0,
+                rtt_type="plan_data",
+                client_id=client_id,
+            ))
+        for record in result.get("round_events", ()):
+            round_event_rows.append(_log_row(
+                "rounds",
+                t_mono_ns=record["t_ns"],
+                round_id=record["round_id"],
+                event=record["event"],
+                client_id=record["client_id"],
+                detail=record.get("detail", ""),
+            ))
+        for record in result.get("packet_events", ()):
+            packet_rows.append(_log_row(
+                "packets",
+                t_mono_ns=record["t_ns"],
+                round_id=record["round_id"],
+                client_id=record["client_id"],
+                packet_seq=record["packet_seq"],
+                packet_type=record["packet_type"],
+                bytes=record["bytes"],
+                result=record["result"],
+            ))
+        for record in result.get("queue_samples", ()):
+            queue_rows.append(_log_row(
+                "queues",
+                t_mono_ns=record["t_ns"],
+                interface="bottleneck",
+                qdisc="drop-tail",
+                backlog_bytes=record["backlog_bytes"],
+                drops=record["drops"],
+            ))
         round_rows.append(_log_row(
             "round_metrics",
             round_id=round_id,
             eta=float(result["eta"]),
             delivered_blocks=float(sum(result["delivered_counts"])),
-            clients_represented=float(metrics["clients_represented"]),
-            deadline_completion=float(metrics["deadline_completion"]),
-            goodput_bps=float(metrics["goodput_bps"]),
-            utilization=float(metrics["utilization"]),
-            queue_drops_fg=float(metrics["drops_queue_bn_client"]),
-            queue_drops_cross=float(metrics["drops_queue_bn_cross"]),
-            wasted_grants=float(metrics["wasted_grants_ratio"]),
-            late_after_timeout=float(metrics["late_after_timeout"]),
-            late_after_deadline=float(late_metrics.get("late_after_deadline", 0)),
-            # The simulator does not expose enough frame-byte accounting to
-            # calculate the schema's protocol_overhead metric faithfully.
+            clients_represented=metrics.get("clients_represented"),
+            deadline_completion=metrics.get("deadline_completion"),
+            goodput_bps=metrics.get("goodput_bps"),
+            utilization=metrics.get("utilization"),
+            queue_drops_fg=metrics.get("drops_queue_bn_client"),
+            queue_drops_cross=metrics.get(
+                "drops_queue_bn_cross",
+                metrics.get("drops_queue_cross"),
+            ),
+            wasted_grants=metrics.get("wasted_grants_ratio"),
+            late_after_timeout=metrics.get("late_after_timeout"),
+            late_after_deadline=late_metrics.get("late_after_deadline", metrics.get("late_after_deadline")),
+            protocol_overhead=metrics.get("protocol_overhead"),
+            planned_blocks=metrics.get("planned_blocks"),
+            plan_messages_sent=metrics.get("plan_messages_sent"),
+            data_packets_sent=metrics.get("data_packets_sent"),
+            data_bytes_sent=metrics.get("data_bytes_sent"),
+            grants_issued=metrics.get("grants_issued"),
+            grants_delivered=metrics.get("grants_delivered"),
+            grants_timed_out=metrics.get("grants_timed_out"),
+            grant_rtt_samples=grant_rtt_count if not is_baseline else None,
+            plan_data_rtt_samples=len(baseline_rtts) if is_baseline and policy_name == "B3" else None,
+            queue_drops_data=metrics.get("drops_queue_data"),
+            queueing_delay_mean_ms=metrics.get("queueing_delay_mean_ms"),
+            queueing_delay_p99_ms=metrics.get("queueing_delay_p99_ms"),
         ))
+    write_rows(stage / "rounds.csv", "rounds", round_event_rows)
+    write_rows(stage / "packets.csv", "packets", packet_rows)
+    write_rows(stage / "queues.csv", "queues", queue_rows)
     write_rows(stage / "round_metrics.csv", "round_metrics", round_rows)
     write_rows(stage / "rtt_samples.csv", "rtt_samples", rtt_rows)
     run_csv_path = stage / "run.csv"
@@ -510,6 +601,10 @@ def _write_simulator_run(
 def _complete_artifacts_exist(run_dir: Path) -> bool:
     if not all((run_dir / filename).is_file() for filename in _LOG_FILES):
         return False
+    for filename, schema in _LOG_FILES.items():
+        with (run_dir / filename).open("r", newline="", encoding="utf-8") as stream:
+            if tuple(next(csv.reader(stream), ())) != SCHEMAS[schema]:
+                return False
     try:
         raw_metrics.run_row(run_dir)
     except (OSError, ValueError, KeyError, TypeError, RunsSchemaError, json.JSONDecodeError):
@@ -549,6 +644,7 @@ def execute_job(
     *,
     trace_dir: str | Path = "data/traces",
     simulation_runner: Callable[..., Mapping[str, Any]] = run_network_round,
+    baseline_runner: Callable[..., Mapping[str, Any]] = run_baseline_network_round,
 ) -> dict[str, Any]:
     """Run/resume one schema job under a per-run lock; return its summary row."""
     validate_job(job)
@@ -617,7 +713,13 @@ def execute_job(
             if stage.exists():
                 raise GridError(f"attempt staging directory already exists: {stage}")
             try:
-                _write_simulator_run(job, stage, trace_dir=traces, simulation_runner=simulation_runner)
+                _write_simulator_run(
+                    job,
+                    stage,
+                    trace_dir=traces,
+                    simulation_runner=simulation_runner,
+                    baseline_runner=baseline_runner,
+                )
                 stage_meta = {
                     **base,
                     "status": "ok" if attempt_count == 1 else "rerun",

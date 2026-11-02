@@ -18,7 +18,10 @@ ROUND_AVERAGES = (
     "eta", "delivered_blocks", "clients_represented", "deadline_completion", "goodput_bps",
     "utilization", "queue_drops_fg", "queue_drops_cross", "wasted_grants",
     "late_after_timeout", "late_after_deadline", "queueing_delay_mean_ms",
-    "queueing_delay_p99_ms", "protocol_overhead",
+    "queueing_delay_p99_ms", "protocol_overhead", "planned_blocks",
+    "plan_messages_sent", "data_packets_sent", "data_bytes_sent",
+    "grants_issued", "grants_delivered", "grants_timed_out",
+    "grant_rtt_samples", "plan_data_rtt_samples", "queue_drops_data",
 )
 
 
@@ -151,12 +154,24 @@ def run_row(run_dir: str | Path) -> dict[str, Any]:
     _add_queue_metrics(root, rounds, metrics, float(meta.get("cross_mbps", 0.0)))
     _protocol_overhead(root, rounds, metrics)
 
-    rtt = _records(root / "rtt_samples.csv")
-    rtt = [row for row in rtt if int(row["round_id"]) > 20]
-    rtt_values = _finite_values(rtt, "rtt_ms")
-    if rtt_values:
-        metrics["rtt_p50_ms"] = float(np.percentile(rtt_values, 50))
-        metrics["rtt_p99_ms"] = float(np.percentile(rtt_values, 99))
+    rtt = [row for row in _records(root / "rtt_samples.csv") if int(row["round_id"]) > 20]
+    rtt_by_type: dict[str, list[dict[str, str]]] = {
+        "grant_resolution": [],
+        "plan_data": [],
+    }
+    for row in rtt:
+        rtt_type = (row.get("rtt_type") or "").strip() or "grant_resolution"
+        if rtt_type not in rtt_by_type:
+            raise ValueError(f"unknown RTT sample type {rtt_type!r} in rtt_samples.csv")
+        rtt_by_type[rtt_type].append(row)
+    for sample_type, prefix in (
+        ("grant_resolution", "rtt"),
+        ("plan_data", "plan_data_rtt"),
+    ):
+        values = _finite_values(rtt_by_type[sample_type], "rtt_ms")
+        if values:
+            metrics[f"{prefix}_p50_ms"] = float(np.percentile(values, 50))
+            metrics[f"{prefix}_p99_ms"] = float(np.percentile(values, 99))
 
     scheduler = _records(root / "scheduler_samples.csv")
     scheduler = [row for row in scheduler if int(row["round_id"]) > 20]

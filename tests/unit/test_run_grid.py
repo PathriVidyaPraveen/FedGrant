@@ -12,11 +12,20 @@ import numpy as np
 import pytest
 
 from fedgrant.analysis.raw_metrics import run_row
-from fedgrant.analysis.runs_schema import expected_runs, make_config_id, make_row, read_runs_csv, write_runs_csv
+from fedgrant.analysis.runs_schema import (
+    LEGACY_COLUMNS,
+    expected_runs,
+    make_config_id,
+    make_row,
+    read_runs_csv,
+    write_runs_csv,
+)
 from fedgrant.common.logschema import ROUND_METRIC_COLUMNS
+from scripts import run_grid as run_grid_module
 from scripts.run_grid import (
     GridError,
     _run_id,
+    _adapter_block_reasons,
     execute_job,
     expand_grid,
     network_round_seed,
@@ -57,8 +66,74 @@ def _fake_runner(*, round_id, sample_hook, **kwargs):
             "drops_queue_bn_cross": 0,
             "wasted_grants_ratio": 0.1,
             "late_after_timeout": 0,
+            "grants_issued": 2,
+            "grants_delivered": 1,
+            "grants_timed_out": 1,
         },
         "late_metrics": {"late_after_deadline": 0},
+    }
+
+
+def _fake_baseline_runner(*, round_id, policy, num_clients, gateway, **kwargs):
+    b3 = policy == "B3"
+    rtt_ns = {0: 2_000_000} if b3 else {}
+    return {
+        "gateway": gateway if gateway is not None else object(),
+        "eta": 0.25,
+        "delivered_counts": ([1] + [0] * (num_clients - 1)) if b3 else [0] * num_clients,
+        "metrics": {
+            "clients_represented": 1 if b3 else 0,
+            "deadline_completion": None,
+            "goodput_bps": 50.0 if b3 else 0.0,
+            "utilization": 0.1,
+            "drops_queue_cross": 0,
+            "drops_queue_data": 0,
+            "wasted_grants_ratio": None,
+            "late_after_timeout": None,
+            "late_after_deadline": 0,
+            "grants_issued": None,
+            "grants_delivered": None,
+            "grants_timed_out": None,
+            "data_packets_sent": 2 if b3 else 0,
+            "data_bytes_sent": 2864 if b3 else 0,
+            "planned_blocks": 10 if b3 else None,
+            "plan_messages_sent": num_clients if b3 else None,
+            "queueing_delay_mean_ms": 0.0,
+            "queueing_delay_p99_ms": 0.0,
+            "protocol_overhead": None,
+        },
+        "late_metrics": {"late_after_deadline": 0},
+        "rtt_samples_ns": rtt_ns,
+        "rtt_sample_times_ns": {0: round_id * 1_000_000_000 + 2_000_000} if b3 else {},
+        "round_events": [{
+            "t_ns": round_id * 1_000_000_000,
+            "round_id": round_id,
+            "event": "client_transfer_end",
+            "client_id": 0,
+            "detail": "stop_reason=all_blocks_sent;packets_sent=2;application_bytes_sent=2864",
+        }],
+        "packet_events": ([{
+            "t_ns": round_id * 1_000_000_000,
+            "round_id": round_id,
+            "client_id": 0,
+            "packet_seq": 0,
+            "packet_type": "PLAN",
+            "bytes": 28,
+            "result": "sent",
+        }, {
+            "t_ns": round_id * 1_000_000_000 + 2_000_000,
+            "round_id": round_id,
+            "client_id": 0,
+            "packet_seq": 1,
+            "packet_type": "DATA",
+            "bytes": 1432,
+            "result": "sent",
+        }] if b3 else []),
+        "queue_samples": [{
+            "t_ns": round_id * 1_000_000_000 + 10_000_000,
+            "backlog_bytes": 0,
+            "drops": 0,
+        }],
     }
 
 
@@ -140,12 +215,11 @@ def test_unsupported_modes_are_recorded_blocked_not_as_success(tmp_path: Path) -
     }
 
 
-def test_baseline_transfer_and_fl_jobs_are_not_misrepresented_as_grant_runs(tmp_path: Path) -> None:
-    jobs = expand_grid(["N-main", "F-main", "M2"])
+def test_unsupported_baseline_jobs_are_recorded_blocked_not_as_grant_runs(tmp_path: Path) -> None:
+    jobs = expand_grid(["M1", "M2"])
     selected = [
-        next(job for job in jobs if job["experiment_id"] == "N-main" and job["policy"] == "B2"),
-        next(job for job in jobs if job["experiment_id"] == "N-main" and job["policy"] == "B3"),
-        next(job for job in jobs if job["experiment_id"] == "F-main" and job["policy"] == "FG-GRU"),
+        next(job for job in jobs if job["experiment_id"] == "M1" and job["policy"] == "B2"),
+        next(job for job in jobs if job["experiment_id"] == "M1" and job["policy"] == "B3"),
         next(job for job in jobs if job["experiment_id"] == "M2"),
     ]
     for job in selected:
@@ -154,6 +228,101 @@ def test_baseline_transfer_and_fl_jobs_are_not_misrepresented_as_grant_runs(tmp_
         meta = json.loads((tmp_path / job["experiment_id"] / job["run_id"] / "meta.json").read_text())
         assert meta["execution_state"] == "blocked"
         assert meta["block_reasons"]
+
+
+def test_fl_jobs_stay_on_the_fl_entrypoint(tmp_path: Path, monkeypatch) -> None:
+    job = next(
+        job for job in expand_grid(["F-main"])
+        if job["policy"] == "FG-GRU" and job["seed"] == 0
+    )
+    called = []
+
+    def fake_fl_job(received_job, raw_dir, *, trace_dir):
+        called.append((received_job, raw_dir, trace_dir))
+        return {"execution": "fl"}
+
+    monkeypatch.setattr(run_grid_module, "_execute_fl_job", fake_fl_job)
+    result = execute_job(
+        job,
+        tmp_path,
+        simulation_runner=lambda **kwargs: pytest.fail("FL job reached simulator"),
+    )
+    assert result == {"execution": "fl"}
+    assert called == [(job, tmp_path, Path("data/traces"))]
+
+
+def test_fl_baseline_jobs_are_blocked_without_simulator_telemetry(tmp_path: Path) -> None:
+    job = next(
+        job for job in expand_grid(["F-main"])
+        if job["policy"] == "B2" and job["seed"] == 0
+    )
+    reasons = _adapter_block_reasons(job, tmp_path)
+    assert any("B2 FL transport adapter" in reason for reason in reasons)
+
+    row = execute_job(
+        job,
+        tmp_path,
+        simulation_runner=lambda **kwargs: pytest.fail("FL baseline reached simulator"),
+    )
+    assert row["status"] == "missing"
+    run_dir = tmp_path / job["experiment_id"] / job["run_id"]
+    metadata = json.loads((run_dir / "meta.json").read_text())
+    assert metadata["execution_state"] == "blocked"
+    assert any("B2 FL transport adapter" in reason for reason in metadata["block_reasons"])
+    assert not (run_dir / "packets.csv").exists()
+
+
+def test_baseline_protocol_metrics_and_typed_rtt_reach_run_outputs(tmp_path: Path) -> None:
+    jobs = expand_grid(["N-main"], scenarios=["L1"])
+    b2_job = next(job for job in jobs if job["policy"] == "B2" and job["seed"] == 0)
+    b3_job = next(job for job in jobs if job["policy"] == "B3" and job["seed"] == 0)
+
+    b2_row = execute_job(b2_job, tmp_path, baseline_runner=_fake_baseline_runner)
+    b3_row = execute_job(b3_job, tmp_path, baseline_runner=_fake_baseline_runner)
+    assert b2_row["status"] == b3_row["status"] == "ok"
+
+    b2_dir = tmp_path / b2_job["experiment_id"] / b2_job["run_id"]
+    with (b2_dir / "round_metrics.csv").open(newline="") as stream:
+        b2_metrics = list(csv.DictReader(stream))[20]
+    assert b2_metrics["data_packets_sent"] == "0"
+    assert b2_metrics["data_bytes_sent"] == "0"
+    assert b2_metrics["planned_blocks"] == ""
+    assert b2_metrics["plan_messages_sent"] == ""
+    assert b2_metrics["grants_issued"] == ""
+    assert b2_metrics["grant_rtt_samples"] == ""
+    assert b2_metrics["plan_data_rtt_samples"] == ""
+    assert b2_row["data_packets_sent"] == 0
+    assert b2_row["grants_issued"] == ""
+    assert b2_row["rtt_p50_ms"] == ""
+    assert b2_row["plan_data_rtt_p50_ms"] == ""
+
+    b3_dir = tmp_path / b3_job["experiment_id"] / b3_job["run_id"]
+    with (b3_dir / "round_metrics.csv").open(newline="") as stream:
+        b3_metrics = list(csv.DictReader(stream))[20]
+    assert b3_metrics["planned_blocks"] == "10"
+    assert b3_metrics["plan_messages_sent"] == "20"
+    assert b3_metrics["data_packets_sent"] == "2"
+    assert b3_metrics["data_bytes_sent"] == "2864"
+    assert b3_metrics["grants_issued"] == ""
+    assert b3_metrics["grant_rtt_samples"] == ""
+    assert b3_metrics["plan_data_rtt_samples"] == "1"
+    assert b3_row["planned_blocks"] == 10
+    assert b3_row["plan_messages_sent"] == 20
+    assert b3_row["data_packets_sent"] == 2
+    assert b3_row["data_bytes_sent"] == 2864
+    assert b3_row["grants_issued"] == ""
+    assert b3_row["rtt_p50_ms"] == ""
+    assert b3_row["plan_data_rtt_p50_ms"] == pytest.approx(2.0)
+    with (b3_dir / "rtt_samples.csv").open(newline="") as stream:
+        samples = list(csv.DictReader(stream))
+    assert samples[20]["rtt_type"] == "plan_data"
+    assert samples[20]["client_id"] == "0"
+    with (b3_dir / "packets.csv").open(newline="") as stream:
+        packets = list(csv.DictReader(stream))
+    assert {row["packet_type"] for row in packets} == {"PLAN", "DATA"}
+    with (b3_dir / "rounds.csv").open(newline="") as stream:
+        events = list(csv.DictReader(stream))
+    assert "stop_reason=all_blocks_sent" in events[0]["detail"]
 
 
 def test_simulator_run_writes_schema_logs_and_resumes_completed_result(tmp_path: Path) -> None:
@@ -169,11 +338,18 @@ def test_simulator_run_writes_schema_logs_and_resumes_completed_result(tmp_path:
     assert first["status"] == "ok"
     assert first["eta"] == pytest.approx(np.mean(np.arange(21, 201) / 300.0))
     assert first["rtt_p50_ms"] == pytest.approx(2.0)
+    assert first["grants_issued"] == 2.0
+    assert first["grants_delivered"] == 1.0
+    assert first["grants_timed_out"] == 1.0
+    assert first["grant_rtt_samples"] == 3.0
     assert calls == job["n_rounds"]
     run_dir = tmp_path / job["experiment_id"] / job["run_id"]
     assert json.loads((run_dir / "meta.json").read_text())["execution_state"] == "complete"
     with (run_dir / "round_metrics.csv").open(newline="") as stream:
         assert tuple(next(csv.reader(stream))) == ROUND_METRIC_COLUMNS
+    with (run_dir / "rtt_samples.csv").open(newline="") as stream:
+        sample = next(csv.DictReader(stream))
+        assert sample["rtt_type"] == "grant_resolution"
     with (run_dir / "run.csv").open(newline="") as stream:
         assert "n_clients" in next(csv.reader(stream))
 
@@ -356,3 +532,18 @@ def test_raw_metrics_rejects_conflicting_client_count_aliases(tmp_path: Path) ->
     (tmp_path / "meta.json").write_text(json.dumps({"N": 20, "n_clients": 50}))
     with pytest.raises(ValueError, match="disagree"):
         run_row(tmp_path)
+
+
+def test_summary_reader_accepts_schema_v1_columns(tmp_path: Path) -> None:
+    row = make_row(
+        "N-main", "L1", 0.1, 20, "B4", 0, 200, status="missing",
+    )
+    path = tmp_path / "legacy-runs.csv"
+    with path.open("w", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=LEGACY_COLUMNS)
+        writer.writeheader()
+        writer.writerow({column: row[column] for column in LEGACY_COLUMNS})
+
+    run = read_runs_csv(path)[0]
+    assert run.status == "missing"
+    assert np.isnan(run.metrics["planned_blocks"])
