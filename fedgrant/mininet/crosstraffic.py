@@ -9,7 +9,7 @@ from typing import Any
 
 
 class CrossTraffic:
-    def __init__(self, server_host: Any, client_host: Any, *, port: int = 5201):
+    def __init__(self, server_host: Any, client_host: Any, *, port: int = 9999):
         self.server_host = server_host
         self.client_host = client_host
         self.port = int(port)

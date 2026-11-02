@@ -8,7 +8,7 @@ Client one-way access delay is `10 * (1 + client_id mod 4)` ms, access rate is s
 
 The setup code reads back the qdisc state before a run begins and aborts when the expected delay, loss model, TBF rate, or queue limit cannot be verified. Hardware offloads are disabled on veth interfaces where the driver supports those controls. The UDP smoke runner uses the repository's UDP gateway/client cores and an explicitly labeled first-eligible stub policy; its results are protocol and topology checks, not production-policy M1 results.
 
-The Fedora host N=3/L2 topology acceptance test passed on 2026-11-01: configured RTT, client access throughput, and shared-bottleneck payload throughput met the test's acceptance bounds. This does not constitute GE statistical validation, a completed stub-runner experiment, or an M1 policy result.
+The Fedora N=3/L2 root-required acceptance test passed on 2026-11-02 (1 passed, 8.56 s) after correcting the access-rate measurement to count receiver arrivals only during the offered interval. This closes the topology, RTT, access-rate, and shared-bottleneck acceptance gate. It does not constitute a production M1 policy result.
 
 The stub smoke round subsequently completed with 14 accepted DATA blocks across all three clients, zero rejected DATA, and zero invalid events (`results/mininet/smoke-fixed/`). It is a protocol smoke result using synthetic profiles and the stub policy, not an M1 policy result.
 
@@ -34,14 +34,16 @@ For each client, the selected segment is rotated by a deterministic offset from 
 
 ## Experiment and analysis procedure
 
-`make mininet-smoke` exercises a small three-client UDP round. `make test-mininet` runs the root-required RTT, access-rate, and bottleneck checks on a host with Mininet, Open vSwitch, iperf3, netem, and TBF available. Queue, gateway process, packet/action, and round-level measurements are written as headered CSV files with monotonic timestamps. Run metadata records configuration, seed, trace inputs, CPU affinity, and run times.
+`make mininet-smoke` exercises a small three-client UDP round. `make test-mininet` runs the root-required RTT, access-rate, and bottleneck checks on a host with Mininet, Open vSwitch, iperf3, netem, and TBF available. The runner samples the shared bottleneck with `tc -s` every 10 ms and the gateway process every 100 ms. It records per-grant, per-packet, round, queue, process, RTT, scheduler, and trace-rate-replay events in headered CSV files with monotonic timestamps. Metadata records configured and read-back qdiscs, queue capacities, scenario loss targets, trace inputs/hashes, CPU affinity, and run times.
 
-The raw-metrics reader applies the existing `runs_schema.py` contract and excludes rounds 1–20 from per-round means. RTT and scheduler percentiles use sample-level CSVs. The calibration tool pairs M1 and M-sim rows by configuration, policy, and seed, reports Mininet-minus-simulator differences with paired 95% t intervals, and applies Holm correction to the paired tests.
+Round summaries report delivered energy, delivered blocks, represented clients, deadline completion measured before deadline cleanup, delivered DATA payload goodput (the full fixed-size float16 block payload, including zero padding in the final block), wasted grants, late packets, and the round's monotonic start/deadline. The analyzer derives utilization and bottleneck queue drops from cumulative TBF counters, and queueing delay from sampled backlog bytes divided by the 10 Mbit/s capacity. Per-run queue-delay mean and p99 are calculated over the pooled 10 ms samples in warm rounds. Since a shared TBF does not attribute drops by input flow, foreground/cross-traffic drop counts are left blank when cross traffic shares the queue; with no cross traffic the total is foreground traffic. Protocol overhead uses sender-side packet records and subtracts delivered payload bytes from DATA datagrams.
+
+The raw-metrics reader applies `runs_schema.py`, excludes rounds 1–20 from per-round means, and calculates RTT, scheduler latency, and queue-delay percentiles from pooled sample-level records. The calibration tool compares the three primary metrics (eta, utilization, wasted grants) by configuration, policy, and seed and reports paired confidence intervals. Holm correction is used for the primary policy comparisons in the general statistical analysis, not for the Mininet-versus-simulator calibration intervals. Historical runs.csv schema-v1 rows remain readable, with newly added queue-delay columns left blank when the old files did not measure them.
 
 | Calibration output | Status |
 |---|---|
 | Paired M1/M-sim runs | pending real runs |
-| Python 3.14 container build and unit suite | passed (Podman; 552 passed, 6 skipped) |
-| Clean-machine Fedora Mininet reproduction | pending full runner and GE measurements |
+| Python 3.11 container build and clean-machine unit suite | pending |
+| Clean-machine Mininet reproduction | pending |
 
-No simulator-calibration or clean-machine result is claimed until the matching run artifacts are available and the relevant acceptance gates pass.
+The recorded 100,000-packet GE validations and N=3 topology tests are Fedora measurements, the accepted host platform for this project. The current UDP smoke runner intentionally uses a test stub; production M1/M2 execution and paired calibration require Prajin's production gateway/baseline adapters. No M1 or production-policy claim is made from the stub output.

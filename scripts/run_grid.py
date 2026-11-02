@@ -19,6 +19,7 @@ import numpy as np
 
 from fedgrant.analysis.runs_schema import (
     EXPERIMENTS,
+    FL_EXPERIMENTS,
     POLICIES,
     SCENARIOS,
     Run,
@@ -28,8 +29,9 @@ from fedgrant.analysis.runs_schema import (
     read_runs_csv,
     write_runs_csv,
 )
+from fedgrant.analysis.metrics import compute_final_accuracy, compute_time_to_target
 from fedgrant.policy.types import PolicyConfig
-from fedgrant.sim.run_net import run_network_round
+from fedgrant.sim.run_net import compute_deadline_ns, run_network_round
 
 
 def expand_grid(experiments: list[str] | None = None) -> list[dict[str, Any]]:
@@ -94,8 +96,21 @@ def execute_job(job: dict[str, Any], raw_dir: Path) -> dict[str, Any]:
     n_rounds = job["n_rounds"]
     cross = job["cross_mbps"]
 
+    if exp in FL_EXPERIMENTS:
+        return _execute_fl_job(job, raw_dir)
+
     # Only sim runs can be executed directly in the simulator grid runner
     if exp in {"M1", "M2"}:
+        return make_row(exp, scen, beta, N, pol, seed, n_rounds, cross_mbps=cross, status="missing")
+
+    if pol in {"B2", "B3"}:
+        # Their distinct push/plan transports are owned by Prajin. The current
+        # network-round driver only implements the grant protocol, so refusing
+        # these rows is safer than silently scoring them as FG-GRU variants.
+        reason = f"{pol} transport is waiting for Prajin's baseline implementation"
+        raw_file = raw_dir / f"{exp}_{job['config_id']}_{pol}_s{seed}.json"
+        raw_file.parent.mkdir(parents=True, exist_ok=True)
+        raw_file.write_text(json.dumps({"job": job, "status": "missing", "reason": reason}, indent=2) + "\n")
         return make_row(exp, scen, beta, N, pol, seed, n_rounds, cross_mbps=cross, status="missing")
 
     p_cfg = _policy_to_config(pol)
@@ -106,12 +121,25 @@ def execute_job(job: dict[str, Any], raw_dir: Path) -> dict[str, Any]:
         try:
             with open(raw_file, "r") as f:
                 data = json.load(f)
-            return make_row(exp, scen, beta, N, pol, seed, n_rounds, cross_mbps=cross, status="ok", **data["summary_metrics"])
+            summary = dict(data["summary_metrics"])
+            saved_rounds = data.get("rounds", [])
+            sample_rows = [r for r in saved_rounds if int(r.get("round_id", 0)) > 20
+                           and "rtt_samples_ns" in r]
+            if sample_rows:
+                samples = [int(x) for r in sample_rows for x in r["rtt_samples_ns"]]
+                summary["rtt_p50_ms"] = float(np.percentile(samples, 50) / 1e6) if samples else 0.0
+                summary["rtt_p99_ms"] = float(np.percentile(samples, 99) / 1e6) if samples else 0.0
+            elif "rtt_p50_ms" in summary or "rtt_p99_ms" in summary:
+                # Older grid records held only per-round quantiles, which cannot
+                # be pooled back into the required sample-level percentiles.
+                raise ValueError("legacy raw run lacks pooled RTT samples; rerunning this seed")
+            return make_row(exp, scen, beta, N, pol, seed, n_rounds, cross_mbps=cross, status="ok", **summary)
         except Exception:
             pass
 
     # Run rounds 1..n_rounds
     round_metrics = []
+    pooled_rtt_samples_ns: list[int] = []
     gateway = None
     status = "ok"
 
@@ -131,7 +159,10 @@ def execute_job(job: dict[str, Any], raw_dir: Path) -> dict[str, Any]:
                 "round_id": r,
                 "eta": res["eta"],
                 **res["metrics"],
+                "rtt_samples_ns": list(res.get("rtt_samples_ns", ())),
             })
+            if r > 20:
+                pooled_rtt_samples_ns.extend(int(v) for v in res.get("rtt_samples_ns", ()))
     except Exception as e:
         status = "missing"
         return make_row(exp, scen, beta, N, pol, seed, n_rounds, cross_mbps=cross, status=status)
@@ -142,8 +173,8 @@ def execute_job(job: dict[str, Any], raw_dir: Path) -> dict[str, Any]:
     util_mean = float(np.mean([m.get("utilization", 0.0) for m in eval_rounds]))
     goodput_mean = float(np.mean([m.get("goodput_bps", 0.0) for m in eval_rounds]))
     wasted_mean = float(np.mean([m.get("wasted_grants_ratio", 0.0) for m in eval_rounds]))
-    rtt_p50 = float(np.mean([m.get("rtt_median_ms", 0.0) for m in eval_rounds]))
-    rtt_p99 = float(np.mean([m.get("rtt_p99_ms", 0.0) for m in eval_rounds]))
+    rtt_p50 = float(np.percentile(pooled_rtt_samples_ns, 50) / 1e6) if pooled_rtt_samples_ns else 0.0
+    rtt_p99 = float(np.percentile(pooled_rtt_samples_ns, 99) / 1e6) if pooled_rtt_samples_ns else 0.0
     drops_fg = float(np.mean([m.get("drops_queue_bn_client", 0.0) for m in eval_rounds]))
     drops_cross = float(np.mean([m.get("drops_queue_bn_cross", 0.0) for m in eval_rounds]))
     blocks_mean = float(np.mean([m.get("grants_delivered", 0.0) for m in eval_rounds]))
@@ -176,6 +207,77 @@ def execute_job(job: dict[str, Any], raw_dir: Path) -> dict[str, Any]:
         }, f, indent=2)
 
     return make_row(exp, scen, beta, N, pol, seed, n_rounds, cross_mbps=cross, status="ok", **summary)
+
+
+def _load_full_reference_final_accuracies() -> list[float]:
+    """Load the three frozen FULL reference runs required to define a*."""
+    values = []
+    for seed in range(3):
+        path = Path("data/runs") / f"femnist_full_s{seed}.json"
+        if not path.is_file():
+            raise FileNotFoundError(f"run F-ref seeds 0..2 before FL comparisons; missing {path}")
+        data = json.loads(path.read_text(encoding="utf-8"))
+        history = data.get("history", [])
+        evals = [row for row in history if "test_accuracy" in row]
+        values.append(compute_final_accuracy([float(row["test_accuracy"]) for row in evals]))
+    return values
+
+
+def _execute_fl_job(job: dict[str, Any], raw_dir: Path) -> dict[str, Any]:
+    """Run FL experiments through the FEMNIST/FedAvg path, never network-only."""
+    exp, pol, seed = job["experiment_id"], job["policy"], int(job["seed"])
+    scen, beta, n_clients = job["scenario"], float(job["beta"]), int(job["N"])
+    rounds, cross = int(job["n_rounds"]), float(job["cross_mbps"])
+    raw_file = raw_dir / f"{exp}_{job['config_id']}_{pol}_s{seed}.json"
+    # B2 push and B3 plan-then-send require Prajin's client/gateway adapters.
+    # Ignore any old raw record produced by the former incorrect dispatch.
+    if pol in {"B2", "B3"}:
+        reason = f"{pol} FL transport is waiting for Prajin's baseline adapter"
+        raw_file.parent.mkdir(parents=True, exist_ok=True)
+        raw_file.write_text(json.dumps({"job": job, "status": "missing", "reason": reason}, indent=2) + "\n")
+        return make_row(exp, scen, beta, n_clients, pol, seed, rounds, cross_mbps=cross, status="missing")
+    if raw_file.is_file():
+        try:
+            data = json.loads(raw_file.read_text(encoding="utf-8"))
+            return make_row(exp, scen, beta, n_clients, pol, seed, rounds, cross_mbps=cross,
+                            status="ok", tta_censored=data.get("tta_censored"),
+                            **data["summary_metrics"])
+        except Exception:
+            pass
+
+    try:
+        full_final = None if exp == "F-ref" else _load_full_reference_final_accuracies()
+        # Lazy import keeps the non-ML simulator/test commands independent of torch.
+        from fedgrant.fl.run_fl import run_experiment
+
+        bank_path = "data/bank/femnist_full_s0.npz" if exp == "F-ref" and seed == 0 else None
+        no_ef = exp == "F-abl" and pol == "FG-GRU-A1"
+        history = run_experiment(seed=seed, rounds=rounds, policy="FULL" if exp == "F-ref" else pol,
+                                 beta=beta, scenario=scen, no_ef=no_ef, bank_path=bank_path)
+        evaluations = [row for row in history if "test_accuracy" in row]
+        accuracies = [float(row["test_accuracy"]) for row in evaluations]
+        final_acc = compute_final_accuracy(accuracies)
+        summary: dict[str, Any] = {"final_acc": final_acc}
+        censored = None
+        if exp != "F-ref":
+            assert full_final is not None
+            target = 0.9 * float(np.mean(full_final))
+            tta_rounds, tta_seconds = compute_time_to_target(
+                evaluations, target, max_round=rounds, t_c_s=1.0,
+                d_s=compute_deadline_ns(beta, n_clients) / 1e9,
+            )
+            censored = tta_rounds is None
+            summary.update(tta_rounds=(float(tta_rounds) if tta_rounds is not None else None),
+                           tta_seconds=(float(tta_seconds) if tta_seconds is not None else None))
+        raw_file.parent.mkdir(parents=True, exist_ok=True)
+        raw_file.write_text(json.dumps({"job": job, "status": "ok", "tta_censored": censored,
+                                        "summary_metrics": summary, "history": history}, indent=2) + "\n")
+        return make_row(exp, scen, beta, n_clients, pol, seed, rounds, cross_mbps=cross,
+                        status="ok", tta_censored=censored, **summary)
+    except Exception as exc:
+        raw_file.parent.mkdir(parents=True, exist_ok=True)
+        raw_file.write_text(json.dumps({"job": job, "status": "missing", "error": repr(exc)}, indent=2) + "\n")
+        return make_row(exp, scen, beta, n_clients, pol, seed, rounds, cross_mbps=cross, status="missing")
 
 
 def main() -> None:
@@ -219,7 +321,8 @@ def main() -> None:
     if csv_path.is_file():
         try:
             for r in read_runs_csv(csv_path):
-                existing_keys.add(r.key)
+                if r.status != "missing":
+                    existing_keys.add(r.key)
                 rows.append(make_row(r.experiment_id, r.scenario, r.beta, r.N, r.policy, r.seed, r.n_rounds,
                                      cross_mbps=r.cross_mbps, status=r.status, tta_censored=r.tta_censored, **r.metrics))
         except Exception:
@@ -232,6 +335,8 @@ def main() -> None:
         if key in existing_keys:
             print(f"[{idx}/{len(my_jobs)}] Skipping already completed run {key}")
             continue
+        # A missing result is retryable; replace its previous placeholder row.
+        rows = [r for r in rows if not (r.key == key and r.status == "missing")]
         print(f"[{idx}/{len(my_jobs)}] Running {job['experiment_id']} | {job['config_id']} | {job['policy']} | seed {job['seed']}...")
         row = execute_job(job, raw_dir)
         rows.append(row)

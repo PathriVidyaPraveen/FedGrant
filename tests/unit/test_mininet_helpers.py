@@ -8,6 +8,7 @@ from fedgrant.mininet.tcsetup import (
     ACCESS_QUEUE_BYTES, BOTTLENECK_QUEUE_BYTES, bottleneck, client_egress,
     gateway_egress, reverse_access, tbf_change,
 )
+from fedgrant.mininet.telemetry import sample_qdisc
 from fedgrant.policy.constants import Q, S
 
 
@@ -82,3 +83,33 @@ def test_tc_builders_reject_invalid_inputs(args):
 def test_logs_schema_names_are_unique_and_nonempty():
     for name, columns in SCHEMAS.items():
         assert columns and len(columns) == len(set(columns)), name
+
+
+def test_queue_telemetry_normalizes_iproute_backlog_strings_and_delay():
+    class Host:
+        def cmd(self, _command):
+            return '[{"kind":"tbf","backlog":"1474b","stats":{"bytes":10000,"drops":2,"overlimits":3}}]'
+
+    row, = sample_qdisc(Host(), "s1-gw", round_id=21, clock_ns=lambda: 123)
+    assert row["backlog_bytes"] == 1474
+    assert row["round_id"] == 21
+    assert row["queueing_delay_ms"] == pytest.approx(1474 * 8000 / 10_000_000)
+
+
+@pytest.mark.parametrize("qdisc_json", [
+    '{"kind":"tbf","bytes":10000,"packets":9,"drops":2,"overlimits":3,"backlog":"1474b"}',
+    '{"kind":"tbf","stats2":{"basic":{"bytes":10000,"packets":9},'
+    '"queue":{"drops":2,"overlimits":3,"backlog":"1474b"}}}',
+])
+def test_queue_telemetry_reads_flat_and_stats2_iproute_counters(qdisc_json):
+    class Host:
+        def cmd(self, _command):
+            return f"[{qdisc_json}]"
+
+    row, = sample_qdisc(Host(), "s1-gw", round_id=4, clock_ns=lambda: 456)
+    assert row["round_id"] == 4
+    assert row["bytes"] == 10000
+    assert row["packets"] == 9
+    assert row["drops"] == 2
+    assert row["overlimits"] == 3
+    assert row["backlog_bytes"] == 1474
