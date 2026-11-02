@@ -76,6 +76,24 @@ class _FakeTransport:
         pass
 
 
+class _PlanSendTransport(_FakeTransport):
+    def __init__(self, gateway: B3UdpGateway, core: B3GatewayCore, *, fail: bool = False) -> None:
+        super().__init__()
+        self.gateway = gateway
+        self.core = core
+        self.fail = fail
+
+    def sendto(self, packet: bytes, endpoint: tuple[str, int]) -> None:
+        message = decode_message(packet, block_length=self.gateway.L)
+        if message.message_type is MessageType.PLAN:
+            assert self.gateway.plan_send_attempts == 1
+            assert self.gateway.plan_local_handoffs == 0
+            assert message.client_id not in self.core._plan_sent
+            if self.fail:
+                raise OSError("simulated socket send failure")
+        super().sendto(packet, endpoint)
+
+
 class _FakeClock:
     def __init__(self, now_ns: int) -> None:
         self.now_ns = now_ns
@@ -99,6 +117,84 @@ def test_plan_wire_round_trip_uses_existing_message_definition() -> None:
     assert message.message_type is MessageType.PLAN
     assert (message.round_id, message.client_id, message.t_send_ns) == (8, 13, 1234)
     assert message.body == {"k": 7, "rate_bps": 4_000_000}
+
+
+def _gateway_for_plan_send(
+    *, fail: bool = False
+) -> tuple[B3UdpGateway, B3GatewayCore, _PlanSendTransport]:
+    core = _core(client_ids=(1,))
+    core.accept_ready(_ready(1), core.plan_ns)
+    clock = _FakeClock(core.plan_ns)
+    gateway = B3UdpGateway(
+        client_weights={1: 1.0},
+        endpoints={1: ("127.0.0.1", 9102)},
+        d=6,
+        L=2,
+        duration_ns=398_000_000,
+        clock_ns=clock,
+    )
+    gateway.core = core
+    transport = _PlanSendTransport(gateway, core, fail=fail)
+    gateway.transport = transport
+    return gateway, core, transport
+
+
+def test_udp_gateway_counts_plan_handoff_after_sendto_succeeds() -> None:
+    async def scenario() -> None:
+        gateway, core, transport = _gateway_for_plan_send()
+        await gateway._plan_at_deadline()
+
+        assert gateway.plan_send_attempts == 1
+        assert gateway.plan_local_handoffs == 1
+        assert 1 in core._plan_sent
+        assert len(transport.packets) == 1
+        message = decode_message(transport.packets[0][0], block_length=2)
+        assert message.message_type is MessageType.PLAN
+        assert message.body == {
+            "k": core.plans[1].blocks,
+            "rate_bps": core.plans[1].rate_bps,
+        }
+
+    asyncio.run(scenario())
+
+
+def test_udp_gateway_does_not_count_or_mark_failed_plan_handoff() -> None:
+    async def scenario() -> None:
+        gateway, core, transport = _gateway_for_plan_send(fail=True)
+        with pytest.raises(B3PlanError, match="failed to send PLAN"):
+            await gateway._plan_at_deadline()
+
+        assert gateway.plan_send_attempts == 1
+        assert gateway.plan_local_handoffs == 0
+        assert core._plan_sent == set()
+        assert transport.packets == []
+
+    asyncio.run(scenario())
+
+
+def test_udp_gateway_resets_plan_send_counters_for_each_round() -> None:
+    async def scenario() -> None:
+        clock = _FakeClock(1_000_000_000)
+        gateway = B3UdpGateway(
+            client_weights={1: 1.0},
+            endpoints={1: ("127.0.0.1", 9102)},
+            d=6,
+            L=2,
+            duration_ns=398_000_000,
+            clock_ns=clock,
+        )
+        gateway.transport = _FakeTransport()
+        gateway.plan_send_attempts = 4
+        gateway.plan_local_handoffs = 3
+
+        try:
+            gateway.start_round(1)
+            assert gateway.plan_send_attempts == 0
+            assert gateway.plan_local_handoffs == 0
+        finally:
+            await gateway.close()
+
+    asyncio.run(scenario())
 
 
 def test_t_plan_ready_cutoff_median_rtt_budget_caps_and_greedy_allocation() -> None:
