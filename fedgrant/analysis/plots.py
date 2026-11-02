@@ -31,6 +31,7 @@ except ImportError:
 import numpy as np
 
 from fedgrant.analysis.runs_schema import read_runs_csv
+from fedgrant.analysis.calibrate import compare, CALIBRATION_METRICS
 
 INK, INK2, GRID = "#0b0b0b", "#52514e", "#e4e3df"
 COLORS = ["#2a78d6", "#eb6834", "#109618", "#990099", "#ff9900", "#0099c6", "#dd4477", "#66aa00"]
@@ -184,14 +185,31 @@ def plot_tta_bars(runs: list[Any], out_dir: Path) -> None:
 
 
 def plot_mininet_vs_sim(runs: list[Any], out_dir: Path) -> None:
-    """Plot Mininet M1 vs Simulator twin M-sim calibration."""
-    m1_runs = [r for r in runs if r.experiment_id == "M1" and r.status == "ok"]
-    msim_runs = [r for r in runs if r.experiment_id == "M-sim" and r.status == "ok"]
-    if not m1_runs or not msim_runs or not HAS_MPL:
+    """Plot paired Mininet-minus-simulator effects with 95% t intervals."""
+    if not HAS_MPL:
         return
-
-    fig, ax = plt.subplots(figsize=(5, 3.5))
-    ax.set_title("Mininet vs. Simulator Calibration")
+    comparisons, _ = compare(runs)
+    comparisons = [row for row in comparisons if row["metric"] in CALIBRATION_METRICS]
+    if not comparisons:
+        return
+    fig, axes = plt.subplots(len(CALIBRATION_METRICS), 1, figsize=(9, 2.4 * len(CALIBRATION_METRICS)),
+                             squeeze=False)
+    for ax, metric in zip(axes[:, 0], CALIBRATION_METRICS, strict=True):
+        rows = [row for row in comparisons if row["metric"] == metric]
+        x = np.arange(len(rows))
+        means = np.asarray([row["mean_mininet_minus_sim"] for row in rows], dtype=float)
+        lo = np.asarray([row["ci95_low"] for row in rows], dtype=float)
+        hi = np.asarray([row["ci95_high"] for row in rows], dtype=float)
+        ax.axhline(0, color=INK2, linewidth=0.8)
+        valid = np.isfinite(lo) & np.isfinite(hi)
+        if valid.any():
+            ax.errorbar(x[valid], means[valid], yerr=np.vstack((means[valid] - lo[valid], hi[valid] - means[valid])),
+                        fmt="o", capsize=3, color=COLORS[0], markersize=3)
+        ax.scatter(x[~valid], means[~valid], marker="o", color=COLORS[0], s=18)
+        ax.set_ylabel(f"{metric}\n(M1 - M-sim)")
+        ax.set_xticks(x, [f"{row['config_id']} {row['policy']} (n={row['n_pairs']})"
+                          for row in rows], rotation=45, ha="right")
+    axes[0, 0].set_title("Paired Mininet minus simulator (95% Student-t intervals)")
     fig.tight_layout()
     fig.savefig(out_dir / "mininet_vs_sim.pdf", bbox_inches="tight")
     plt.close(fig)

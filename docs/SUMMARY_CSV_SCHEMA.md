@@ -6,7 +6,7 @@ Code: `fedgrant/analysis/runs_schema.py` is the executable form of this document
 so a bad row fails when it is written, not when the statistics run.
 `fedgrant/analysis/stats.py` reads the file with `read_runs_csv()`.
 
-Schema version: **1**.
+Schema version: **2**.
 
 ## 1. File
 
@@ -57,6 +57,7 @@ The same `config_id` is used across experiments, so an M1 run and its M-sim twin
 | `gw_cpu_pct` | mean psutil CPU% of the gateway process during [0, D] |
 | `gw_rss_mb` | peak RSS of the gateway process, MB |
 | `sched_lat_p50_us`, `sched_lat_p99_us` | event receipt to GRANT send, µs |
+| `queueing_delay_mean_ms`, `queueing_delay_p99_ms` | mean and 99th percentile of bottleneck backlog/C samples, sampled every 10 ms |
 | `protocol_overhead` | non-payload bytes / delivered payload bytes |
 
 Per-round metrics are means over rounds 21..last. Percentiles (RTT, scheduler latency) are over all
@@ -67,9 +68,9 @@ samples of rounds 21..last. Gateway metrics (CPU, RSS, scheduler latency) may be
 | Column | Definition |
 |---|---|
 | `final_acc` | mean test accuracy over the last 10 evaluations (rounds 255–300). **Required** |
-| `tta_rounds` | first round whose 3-evaluation moving average ≥ a*. **Blank when censored** |
-| `tta_censored` | `true` if a* was not reached in 300 rounds. **Required** |
-| `tta_seconds` | `tta_rounds · (T_c + D)`; blank when censored |
+| `tta_rounds` | first round whose 3-evaluation moving average ≥ a*. **Blank when censored and for F-ref** |
+| `tta_censored` | `true` if a* was not reached in 300 rounds. **Required except for F-ref** |
+| `tta_seconds` | `tta_rounds · (T_c + D)`; blank when censored and for F-ref |
 
 FL runs also fill the network columns they measure (`eta`, ...). Censored TTA enters the statistics
 as 300 and is flagged in every output table (Section 14).

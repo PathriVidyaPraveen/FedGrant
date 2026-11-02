@@ -2,7 +2,7 @@ PYTHON ?= python3
 PYTEST ?= $(PYTHON) -m pytest
 RUNS ?= results/summary/runs.csv
 
-.PHONY: help install install-ml test test-pure test-ml test-mininet trace-fetch trace-bin mininet-smoke metrics calibrate docker-build
+.PHONY: help install install-ml test test-pure test-ml test-mininet trace-fetch trace-bin data mininet-smoke mininet metrics calibrate plots grid-net grid-fl docker-build
 
 help:
 	@printf '%s\n' 'install       Install Python dependencies from requirements.lock' \
@@ -11,11 +11,16 @@ help:
 	  'test-pure     Run unit tests that do not require PyTorch' \
 	  'test-ml       Run the PyTorch FEMNIST and simulator integration tests' \
 	  'test-mininet  Run root-required Mininet integration tests' \
-	  'trace-fetch   Fetch/copy licensed Mahimahi traces' \
+	  'trace-fetch   Copy existing licensed Mahimahi traces (offline)' \
 	  'trace-bin     Bin raw .up traces into CSVs' \
+	  'data          Prepare trace CSV splits from local raw traces' \
 	  'mininet-smoke Run one three-client Mininet round (requires root)' \
+	  'mininet       Run the root-required Mininet topology acceptance test' \
+	  'grid-net      Execute the simulator network grid (long-running)' \
+	  'grid-fl       Run FULL references, then FL simulator jobs (long-running)' \
 	  'metrics       Build summary CSV rows from run directories (RUN_DIRS=...)' \
 	  'calibrate     Compare paired M1 and M-sim rows' \
+	  'plots         Generate analysis plots from RUNS' \
 	  'docker-build  Build the reproducibility image'
 
 install:
@@ -43,8 +48,20 @@ trace-fetch:
 trace-bin:
 	$(PYTHON) scripts/bin_traces.py
 
+data: trace-fetch trace-bin
+
 mininet-smoke:
-	sudo $(PYTHON) -m fedgrant.mininet.run_mininet --clients 3 --rounds 1 --scenario L2 --output results/mininet/smoke
+	sudo $(PYTHON) -m fedgrant.mininet.run_mininet --clients 3 --rounds 1 --scenario L2 --output results/mininet/smoke-$$(date +%Y%m%d-%H%M%S)
+
+mininet:
+	sudo $(PYTEST) -q tests/integration/test_mininet_round.py
+
+grid-net:
+	$(PYTHON) scripts/run_grid.py --exp N-main N-X1 N-X2 N-abl --run --output-csv $(RUNS)
+
+grid-fl:
+	$(PYTHON) scripts/run_grid.py --exp F-ref --run --output-csv $(RUNS)
+	$(PYTHON) scripts/run_grid.py --exp F-main F-abl --run --output-csv $(RUNS)
 
 metrics:
 	@test -n "$(RUN_DIRS)" || (echo 'Set RUN_DIRS to one or more run directories' >&2; exit 2)
@@ -52,6 +69,9 @@ metrics:
 
 calibrate:
 	$(PYTHON) -m fedgrant.analysis.calibrate --runs $(RUNS)
+
+plots:
+	$(PYTHON) -m fedgrant.analysis.plots --runs $(RUNS)
 
 docker-build:
 	docker build -f docker/Dockerfile -t fedgrant-testbed .

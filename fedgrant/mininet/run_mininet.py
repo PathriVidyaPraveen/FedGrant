@@ -14,25 +14,29 @@ import threading
 import time
 from pathlib import Path
 
-from fedgrant.common.logschema import QUEUE_COLUMNS
+from fedgrant.common.logschema import PACKET_COLUMNS, QUEUE_COLUMNS
 from fedgrant.mininet.crosstraffic import CrossTraffic, udp_payload_bps
 from fedgrant.mininet.profile_update import profile_bank
 from fedgrant.mininet.replay import RateReplay
 from fedgrant.mininet.teardown import teardown
-from fedgrant.mininet.telemetry import ProcessSampler
-from fedgrant.mininet.topo import build, verify_tc
+from fedgrant.mininet.telemetry import ProcessSampler, sample_qdisc
+from fedgrant.mininet.round_state import RoundStateFile
+from fedgrant.mininet.round_summary import enrich_round_metrics
+from fedgrant.mininet.topo import SCENARIO_LOSS, build, client_parameters, verify_tc
 from fedgrant.mininet.tcsetup import tbf_change
 from fedgrant.traces.client_trace import client_trace
 from fedgrant.sim.run_net import compute_deadline_ns
+from fedgrant.policy.constants import C, Q, S
 
 DEFAULT_STUB_FACTORY = "fedgrant.mininet.stub_policy:create_gateway"
 
 
 class _QueueSampler:
-    def __init__(self, net, path: Path, interfaces: list[tuple[str, str]], interval_s: float = 0.1,
-                 cpu_id: int | None = None):
+    def __init__(self, net, path: Path, interfaces: list[tuple[str, str]], interval_s: float = 0.01,
+                 cpu_id: int | None = None, round_state_path: Path | None = None):
         self.net, self.path, self.interfaces, self.interval_s = net, path, interfaces, interval_s
         self.cpu_id = cpu_id
+        self.round_state = RoundStateFile(round_state_path) if round_state_path else None
         self.stop_event = threading.Event()
         self.thread = threading.Thread(target=self._run, name="fedgrant-queue-sampler", daemon=True)
         self.error: BaseException | None = None
@@ -48,25 +52,21 @@ class _QueueSampler:
             with self.path.open("w", newline="", encoding="utf-8") as stream:
                 writer = csv.DictWriter(stream, fieldnames=QUEUE_COLUMNS)
                 writer.writeheader()
+                interval_ns = max(1, int(self.interval_s * 1e9))
+                next_sample_ns = time.monotonic_ns()
                 while not self.stop_event.is_set():
-                    now = time.monotonic_ns()
                     for host_name, iface in self.interfaces:
                         host = self.net.get(host_name)
-                        raw = host.cmd(f"tc -s -j qdisc show dev {iface}")
-                        try:
-                            qdiscs = json.loads(raw)
-                        except json.JSONDecodeError as exc:
-                            raise RuntimeError(f"bad tc JSON on {host_name}:{iface}: {raw[:120]!r}") from exc
-                        for qdisc in qdiscs:
-                            stats = qdisc.get("stats", {})
-                            writer.writerow({"t_mono_ns": now, "interface": iface,
-                                             "qdisc": qdisc.get("kind", "unknown"),
-                                             "backlog_bytes": stats.get("backlog", 0),
-                                             "bytes": stats.get("bytes", 0),
-                                             "drops": stats.get("drops", 0),
-                                             "overlimits": stats.get("overlimits", 0)})
+                        for row in sample_qdisc(host, iface):
+                            row["round_id"] = (self.round_state.round_at(int(row["t_mono_ns"]))
+                                               if self.round_state else 0)
+                            writer.writerow(row)
                     stream.flush()
-                    self.stop_event.wait(self.interval_s)
+                    next_sample_ns += interval_ns
+                    now_ns = time.monotonic_ns()
+                    while next_sample_ns <= now_ns:
+                        next_sample_ns += interval_ns
+                    self.stop_event.wait((next_sample_ns - now_ns) / 1e9)
         except BaseException as exc:
             self.error = exc
             self.stop_event.set()
@@ -148,7 +148,8 @@ def run_experiment(*, n: int, scenario: str, seed: int, rounds: int, beta: float
         log_handles.append(gateway_log)
         gw_cmd = [py, "-m", "fedgrant.mininet.gateway_proc", "--clients", str(n), "--rounds", str(rounds),
                   "--duration-ns", str(duration_ns),
-                  "--gateway-factory", gateway_factory, "--log-dir", str(out)]
+                  "--gateway-factory", gateway_factory, "--log-dir", str(out),
+                  "--round-state", str(out / ".round_state.json")]
         if roles["pinning_enabled"] and roles["gateway"] is not None:
             gw_cmd = ["taskset", "-c", str(roles["gateway"]), *gw_cmd]
         processes.append(net.get("gw").popen(gw_cmd, stdout=gateway_log, stderr=subprocess.STDOUT, env=env))
@@ -160,23 +161,44 @@ def run_experiment(*, n: int, scenario: str, seed: int, rounds: int, beta: float
             if roles["pinning_enabled"] and roles["clients"]:
                 cmd = ["taskset", "-c", str(roles["clients"][i % len(roles["clients"])]), *cmd]
             processes.append(net.get(f"c{i}").popen(cmd, stdout=client_log, stderr=subprocess.STDOUT, env=env))
+        round_state_path = out / ".round_state.json"
+        RoundStateFile(round_state_path).write(round_id=0, active=False)
         process_sampler = ProcessSampler([(processes[0], "gateway")], out / "processes.csv",
-                                         cpu_id=roles["telemetry"]).start()
+                                         cpu_id=roles["telemetry"],
+                                         round_state_path=round_state_path).start()
 
         if scenario.upper() in {"L4", "L5"}:
             split = "ood" if scenario.upper() == "L5" else "test"
             for i in range(n):
                 rates = client_trace(i, split, seed, data_dir=trace_dir)
                 host, iface = net.get(f"c{i}"), f"c{i}-eth0"
+                replay_log = out / f"trace_replay_client_{i}.csv"
+
+                def log_rate_change(actual_ns: int, replay_round: int, bin_index: int,
+                                    rate_bps: int, scheduled_ns: int, *, path=replay_log) -> None:
+                    exists = path.exists()
+                    with path.open("a", newline="", encoding="utf-8") as stream:
+                        writer = csv.writer(stream)
+                        if not exists:
+                            writer.writerow(("t_mono_ns", "round_id", "bin_index", "rate_bps",
+                                             "scheduled_mono_ns", "lag_ns"))
+                        writer.writerow((actual_ns, replay_round, bin_index, rate_bps,
+                                         scheduled_ns, actual_ns - scheduled_ns))
+
                 replayer = RateReplay(rates, lambda rate, h=host, dev=iface: h.cmd(tbf_change(dev, rate)),
-                                      repeat=True)
+                                      repeat=True, round_state_path=round_state_path,
+                                      on_change=log_rate_change)
                 replayers.append(replayer.start())
         if cross_mbps > 0:
             cross = CrossTraffic(net.get("gw"), net.get("xt"))
             cross.start(cross_mbps, duration_s=max(2, int(rounds * 2)))
 
-        queue_ifaces = [("s1", "s1-gw"), *(('s1', f"s1-c{i}") for i in range(n))]
-        sampler = _QueueSampler(net, out / "queues.csv", queue_ifaces, cpu_id=roles["telemetry"]).start()
+        # The specification requires tc -s sampling every 10 ms at the shared
+        # bottleneck. Access-link queues are not part of the reported bottleneck
+        # queueing-delay or drop metrics.
+        queue_ifaces = [("s1", "s1-gw")]
+        sampler = _QueueSampler(net, out / "queues.csv", queue_ifaces, cpu_id=roles["telemetry"],
+                                round_state_path=round_state_path).start()
         deadline = time.monotonic() + max(10.0, rounds * 3.0)
         failures = []
         for proc in processes:
@@ -190,6 +212,29 @@ def run_experiment(*, n: int, scenario: str, seed: int, rounds: int, beta: float
                 failures.append(f"process pid={proc.pid} exited {code}")
         if failures:
             raise RuntimeError("Mininet run failed: " + "; ".join(failures))
+        # Combine sender-side client packets (which include DATA lost on the
+        # access link) with gateway-side observations into the canonical log.
+        packet_path = out / "packets.csv"
+        packet_rows = []
+        with packet_path.open(newline="", encoding="utf-8") as stream:
+            packet_rows.extend(csv.DictReader(stream))
+        for client_path in sorted(out.glob("client_*_packets.csv")):
+            with client_path.open(newline="", encoding="utf-8") as stream:
+                packet_rows.extend(csv.DictReader(stream))
+        packet_rows.sort(key=lambda row: (int(row["t_mono_ns"]), row["direction"], row["client_id"]))
+        with packet_path.open("w", newline="", encoding="utf-8") as stream:
+            writer = csv.DictWriter(stream, fieldnames=PACKET_COLUMNS, extrasaction="raise")
+            writer.writeheader()
+            writer.writerows(packet_rows)
+        if cross is not None:
+            cross_result = cross.wait(timeout=max(5.0, rounds * 2.0 + 3.0))
+        if sampler is not None:
+            sampler.stop()
+            sampler = None
+        if process_sampler is not None:
+            process_sampler.stop()
+            process_sampler = None
+        enrich_round_metrics(out, cross_mbps=cross_mbps)
         if gateway_factory == DEFAULT_STUB_FACTORY:
             summary_path = out / "gateway_summary.json"
             summary = json.loads(summary_path.read_text(encoding="utf-8"))
@@ -200,13 +245,17 @@ def run_experiment(*, n: int, scenario: str, seed: int, rounds: int, beta: float
                     f"stub smoke did not complete a valid grant/data exchange: "
                     f"accepted_data={accepted}, invalid_events={invalid}; see {summary_path}"
                 )
-        if cross is not None:
-            cross_result = cross.wait(timeout=max(5.0, rounds * 2.0 + 3.0))
         trace_root = Path(trace_dir)
         trace_hashes = {
             path.name: hashlib.sha256(path.read_bytes()).hexdigest()
             for path in sorted(trace_root.glob("*.csv"))
         } if trace_root.exists() else {}
+        tc_readback = []
+        for (host_name, iface), commands in sorted(net._fedgrant_expected_tc.items()):
+            host = net.get(host_name)
+            tc_readback.append({"host": host_name, "interface": iface, "configured_commands": commands,
+                                "effective": host.cmd(f"tc -d qdisc show dev {iface}").strip()})
+        loss_target, burst_target = SCENARIO_LOSS[scenario.upper()]
         meta = {
             "experiment_id": "smoke-stub", "platform": "mininet", "scenario": scenario.upper(),
             "seed": int(seed), "N": int(n), "beta": float(beta), "cross_mbps": float(cross_mbps),
@@ -219,6 +268,16 @@ def run_experiment(*, n: int, scenario: str, seed: int, rounds: int, beta: float
             "cpu_affinity": sorted(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else [],
             "cpu_roles": roles,
             "queue_interfaces": [list(item) for item in queue_ifaces],
+            "effective_queue_settings": {
+                "bottleneck_rate_bps": C, "bottleneck_limit_frames": Q,
+                "frame_size_bytes": S, "bottleneck_limit_bytes": Q * S,
+                "sampling_interval_ms": 10, "bottleneck_interface": "s1-gw",
+                "per_client_access": [{"client_id": (p := client_parameters(i)).client_id,
+                                       "delay_ms": p.delay_ms, "rate_bps": p.rate_bps,
+                                       "rtt_ms": p.rtt_ms} for i in range(n)],
+                "ge_target_loss_rate": loss_target, "ge_target_mean_burst": burst_target,
+                "tc_readback": tc_readback,
+            },
             "cross_traffic": ({"iperf3": cross_result, "receiver_payload_bps": udp_payload_bps(cross_result)}
                               if cross_result is not None else None),
         }

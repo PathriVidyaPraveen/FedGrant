@@ -11,6 +11,7 @@ from fedgrant.mininet.profile_update import profile_bank, synthetic_update
 from fedgrant.mininet.replay import RateReplay
 from fedgrant.mininet.stub_policy import create_gateway
 from fedgrant.mininet.run_mininet import DEFAULT_STUB_FACTORY, cpu_roles, smoke_duration_ns
+from fedgrant.mininet.round_state import RoundStateFile
 from fedgrant.encoder.blocks import encode
 
 
@@ -50,6 +51,29 @@ def test_rate_replay_applies_in_order_and_stops():
     time.sleep(0.06)
     replay.stop()
     assert applied == [1000, 2000, 3000]
+
+
+def test_rate_replay_restarts_trace_at_each_round_start(tmp_path):
+    state = RoundStateFile(tmp_path / "round.json")
+    changes = []
+    now = time.monotonic_ns()
+    state.write(round_id=1, start_ns=now, deadline_ns=now + 24_000_000, active=True)
+    replay = RateReplay([1000, 2000, 3000], lambda _rate: None, interval_s=0.01,
+                        round_state_path=tmp_path / "round.json",
+                        on_change=lambda actual, rid, idx, rate, scheduled:
+                            changes.append((rid, idx, rate, actual - scheduled))).start()
+    time.sleep(0.016)
+    state.write(round_id=1, active=False)
+    time.sleep(0.003)
+    now = time.monotonic_ns()
+    state.write(round_id=2, start_ns=now, deadline_ns=now + 24_000_000, active=True)
+    time.sleep(0.016)
+    state.write(round_id=2, active=False)
+    replay.stop()
+    for rid in (1, 2):
+        round_changes = [row for row in changes if row[0] == rid]
+        assert [row[1] for row in round_changes[:2]] == [0, 1]
+        assert [row[2] for row in round_changes[:2]] == [1000, 2000]
 
 
 def test_cpu_roles_prefers_fast_cores_and_assigns_clients_to_efficiency_cores(tmp_path):

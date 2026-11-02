@@ -48,6 +48,7 @@ class UdpClient(asyncio.DatagramProtocol):
         gateway_addr: Endpoint,
         update_provider: UpdateProvider,
         clock_ns: Callable[[], int] = time.monotonic_ns,
+        packet_observer: Callable[[bytes, int], None] | None = None,
     ) -> None:
         if not isinstance(core, ClientCore):
             raise TypeError("core must be a ClientCore")
@@ -57,6 +58,7 @@ class UdpClient(asyncio.DatagramProtocol):
         self.gateway_addr = self._normalise_endpoint(gateway_addr)
         self.update_provider = update_provider
         self.clock_ns = clock_ns
+        self.packet_observer = packet_observer
         self.transport: asyncio.DatagramTransport | None = None
         self._ready_handle: asyncio.TimerHandle | None = None
         self._round_end_handle: asyncio.TimerHandle | None = None
@@ -75,6 +77,7 @@ class UdpClient(asyncio.DatagramProtocol):
         local_addr: Endpoint = ("0.0.0.0", DEFAULT_CLIENT_PORT),
         update_provider: UpdateProvider,
         clock_ns: Callable[[], int] = time.monotonic_ns,
+        packet_observer: Callable[[bytes, int], None] | None = None,
     ) -> "UdpClient":
         """Create, bind, and start a client UDP endpoint."""
         protocol = cls(
@@ -82,6 +85,7 @@ class UdpClient(asyncio.DatagramProtocol):
             gateway_addr=gateway_addr,
             update_provider=update_provider,
             clock_ns=clock_ns,
+            packet_observer=packet_observer,
         )
         loop = asyncio.get_running_loop()
         await loop.create_datagram_endpoint(lambda: protocol, local_addr=local_addr)
@@ -242,7 +246,10 @@ class UdpClient(asyncio.DatagramProtocol):
     def _send(self, packet: bytes) -> bool:
         if self.transport is None or self._closing:
             return False
+        now_ns = self.clock_ns()
         self.transport.sendto(packet, self.gateway_addr)
+        if self.packet_observer is not None:
+            self.packet_observer(packet, now_ns)
         self.stats.sent += 1
         return True
 

@@ -7,13 +7,24 @@ from pathlib import Path
 from typing import Iterable, Mapping, TextIO
 
 ROUND_COLUMNS = ("t_mono_ns", "round_id", "event", "client_id", "detail")
-PACKET_COLUMNS = ("t_mono_ns", "round_id", "client_id", "packet_seq", "packet_type", "bytes", "result")
-QUEUE_COLUMNS = ("t_mono_ns", "interface", "qdisc", "backlog_bytes", "bytes", "drops", "overlimits")
-PROCESS_COLUMNS = ("t_mono_ns", "process", "pid", "cpu_pct", "rss_bytes", "threads")
+PACKET_COLUMNS = (
+    "t_mono_ns", "round_id", "direction", "client_id", "packet_seq", "grant_id", "send_pos",
+    "block_idx", "packet_type", "bytes", "payload_bytes", "result",
+)
+GRANT_COLUMNS = (
+    "t_mono_ns", "round_id", "client_id", "grant_id", "send_pos", "event", "issue_ns",
+    "timeout_ns", "latency_us", "rtt_ms",
+)
+QUEUE_COLUMNS = (
+    "t_mono_ns", "round_id", "interface", "qdisc", "backlog_bytes", "bytes", "packets", "drops",
+    "overlimits", "queueing_delay_ms",
+)
+PROCESS_COLUMNS = ("t_mono_ns", "round_id", "process", "pid", "cpu_pct", "rss_bytes", "threads")
 ROUND_METRIC_COLUMNS = (
-    "round_id", "eta", "delivered_blocks", "clients_represented", "deadline_completion",
-    "goodput_bps", "utilization", "queue_drops_fg", "queue_drops_cross", "wasted_grants",
-    "late_after_timeout", "late_after_deadline", "protocol_overhead",
+    "round_id", "round_start_mono_ns", "deadline_mono_ns", "eta", "delivered_blocks",
+    "clients_represented", "deadline_completion", "goodput_bps", "utilization", "queue_drops_fg",
+    "queue_drops_cross", "wasted_grants", "late_after_timeout", "late_after_deadline",
+    "queueing_delay_mean_ms", "queueing_delay_p99_ms", "protocol_overhead",
 )
 RTT_COLUMNS = ("t_mono_ns", "round_id", "rtt_ms")
 SCHEDULER_COLUMNS = ("t_mono_ns", "round_id", "latency_us")
@@ -21,6 +32,7 @@ RUN_COLUMNS = ("run_id", "experiment_id", "config_id", "policy", "seed", "scenar
 SCHEMAS = {
     "rounds": ROUND_COLUMNS,
     "packets": PACKET_COLUMNS,
+    "grants": GRANT_COLUMNS,
     "queues": QUEUE_COLUMNS,
     "processes": PROCESS_COLUMNS,
     "round_metrics": ROUND_METRIC_COLUMNS,
@@ -57,4 +69,4 @@ def write_rows(path: str | Path, schema: str, rows: Iterable[Mapping[str, object
     return p
 
 
-__all__ = ["ROUND_COLUMNS", "PACKET_COLUMNS", "QUEUE_COLUMNS", "PROCESS_COLUMNS", "ROUND_METRIC_COLUMNS", "RTT_COLUMNS", "SCHEDULER_COLUMNS", "RUN_COLUMNS", "SCHEMAS", "csv_writer", "write_rows"]
+__all__ = ["ROUND_COLUMNS", "PACKET_COLUMNS", "GRANT_COLUMNS", "QUEUE_COLUMNS", "PROCESS_COLUMNS", "ROUND_METRIC_COLUMNS", "RTT_COLUMNS", "SCHEDULER_COLUMNS", "RUN_COLUMNS", "SCHEMAS", "csv_writer", "write_rows"]
