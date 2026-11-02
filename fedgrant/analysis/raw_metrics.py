@@ -18,7 +18,10 @@ ROUND_AVERAGES = (
     "eta", "delivered_blocks", "clients_represented", "deadline_completion", "goodput_bps",
     "utilization", "queue_drops_fg", "queue_drops_cross", "wasted_grants",
     "late_after_timeout", "late_after_deadline", "queueing_delay_mean_ms",
-    "queueing_delay_p99_ms", "protocol_overhead",
+    "queueing_delay_p99_ms", "protocol_overhead", "planned_blocks",
+    "plan_messages_sent", "data_packets_sent", "data_bytes_sent",
+    "grants_issued", "grants_delivered", "grants_timed_out",
+    "grant_rtt_samples", "plan_data_rtt_samples", "queue_drops_data",
 )
 
 
@@ -128,8 +131,15 @@ def run_row(run_dir: str | Path) -> dict[str, Any]:
     if not meta_path.is_file():
         raise FileNotFoundError(f"{root}: expected run.json or meta.json")
     meta = json.loads(meta_path.read_text(encoding="utf-8"))
-    required = ("experiment_id", "scenario", "beta", "N", "policy", "seed")
+    # Summary-schema JSON uses `N`; the older logschema RUN_COLUMNS CSV uses
+    # `n_clients`. Prefer the canonical `N` spelling, but read legacy metadata.
+    client_count = meta.get("N", meta.get("n_clients"))
+    if "N" in meta and "n_clients" in meta and int(meta["N"]) != int(meta["n_clients"]):
+        raise ValueError(f"{meta_path}: N and n_clients disagree")
+    required = ("experiment_id", "scenario", "beta", "policy", "seed")
     missing = [key for key in required if key not in meta]
+    if client_count is None:
+        missing.append("N (or legacy n_clients)")
     if missing:
         raise ValueError(f"{meta_path}: missing run identity fields {missing}")
     round_rows = _records(root / "round_metrics.csv")
@@ -144,12 +154,24 @@ def run_row(run_dir: str | Path) -> dict[str, Any]:
     _add_queue_metrics(root, rounds, metrics, float(meta.get("cross_mbps", 0.0)))
     _protocol_overhead(root, rounds, metrics)
 
-    rtt = _records(root / "rtt_samples.csv")
-    rtt = [row for row in rtt if int(row["round_id"]) > 20]
-    rtt_values = _finite_values(rtt, "rtt_ms")
-    if rtt_values:
-        metrics["rtt_p50_ms"] = float(np.percentile(rtt_values, 50))
-        metrics["rtt_p99_ms"] = float(np.percentile(rtt_values, 99))
+    rtt = [row for row in _records(root / "rtt_samples.csv") if int(row["round_id"]) > 20]
+    rtt_by_type: dict[str, list[dict[str, str]]] = {
+        "grant_resolution": [],
+        "plan_data": [],
+    }
+    for row in rtt:
+        rtt_type = (row.get("rtt_type") or "").strip() or "grant_resolution"
+        if rtt_type not in rtt_by_type:
+            raise ValueError(f"unknown RTT sample type {rtt_type!r} in rtt_samples.csv")
+        rtt_by_type[rtt_type].append(row)
+    for sample_type, prefix in (
+        ("grant_resolution", "rtt"),
+        ("plan_data", "plan_data_rtt"),
+    ):
+        values = _finite_values(rtt_by_type[sample_type], "rtt_ms")
+        if values:
+            metrics[f"{prefix}_p50_ms"] = float(np.percentile(values, 50))
+            metrics[f"{prefix}_p99_ms"] = float(np.percentile(values, 99))
 
     scheduler = _records(root / "scheduler_samples.csv")
     scheduler = [row for row in scheduler if int(row["round_id"]) > 20]
@@ -171,7 +193,7 @@ def run_row(run_dir: str | Path) -> dict[str, Any]:
     if status != "missing" and not rounds:
         raise ValueError(f"{root}: no round metrics remain after warm-up round 20")
     return make_row(
-        str(meta["experiment_id"]), str(meta["scenario"]), float(meta["beta"]), int(meta["N"]),
+        str(meta["experiment_id"]), str(meta["scenario"]), float(meta["beta"]), int(client_count),
         str(meta["policy"]), int(meta["seed"]), n_rounds,
         cross_mbps=float(meta.get("cross_mbps", 0.0)), status=status, **metrics,
     )

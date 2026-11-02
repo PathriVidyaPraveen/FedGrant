@@ -436,6 +436,8 @@ class B3UdpGateway(asyncio.DatagramProtocol):
         self._plan_error: Exception | None = None
         self._closed_event = asyncio.Event()
         self.rejected_datagrams = 0
+        self.plan_send_attempts = 0
+        self.plan_local_handoffs = 0
 
     async def bind(self) -> B3UdpGateway:
         if self.transport is not None:
@@ -486,6 +488,8 @@ class B3UdpGateway(asyncio.DatagramProtocol):
             client_states=self.client_states,
             delivery_ewma=self.delivery_ewma,
         )
+        self.plan_send_attempts = 0
+        self.plan_local_handoffs = 0
         self._closed_event.clear()
         self._plan_error = None
         for cid, endpoint in self.endpoints.items():
@@ -571,13 +575,13 @@ class B3UdpGateway(asyncio.DatagramProtocol):
         plans = core.compute_plans(now_ns)
         for cid, plan in plans.items():
             sent_ns = self.clock_ns()
-            actual = core.mark_plan_sent(cid, sent_ns)
             self._send_message(
                 MessageType.PLAN,
                 client_id=cid,
                 t_send_ns=sent_ns,
-                body={"k": actual.blocks, "rate_bps": actual.rate_bps},
+                body={"k": plan.blocks, "rate_bps": plan.rate_bps},
             )
+            core.mark_plan_sent(cid, sent_ns)
 
     async def _close_at_deadline(self) -> None:
         core = self.core
@@ -618,9 +622,13 @@ class B3UdpGateway(asyncio.DatagramProtocol):
             block_length=self.L,
         )
         try:
+            if message_type is MessageType.PLAN:
+                self.plan_send_attempts += 1
             self.transport.sendto(packet, self.endpoints[client_id])
         except OSError as exc:
             raise B3PlanError(f"failed to send {message_type.name}: {exc}") from exc
+        if message_type is MessageType.PLAN:
+            self.plan_local_handoffs += 1
 
 
 class B3UdpClient(asyncio.DatagramProtocol):

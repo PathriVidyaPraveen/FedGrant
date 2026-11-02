@@ -13,6 +13,8 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 from fedgrant.common.logschema import PROCESS_COLUMNS
 from fedgrant.mininet.round_state import RoundStateFile
 from fedgrant.policy.constants import C
@@ -77,7 +79,7 @@ def sample_qdisc(host: Any, iface: str, *, round_id: int = 0,
 
 def sample_process(process: Any, name: str, *, round_id: int = 0,
                    clock_ns: Callable[[], int] = time.monotonic_ns) -> dict[str, object]:
-    """Sample one local process via psutil, importing it only when requested."""
+    """Sample cumulative CPU time and resident memory for one local process."""
     try:
         import psutil
     except ImportError as exc:
@@ -86,11 +88,140 @@ def sample_process(process: Any, name: str, *, round_id: int = 0,
         int(process.pid if hasattr(process, "pid") else process)
     )
     with proc.oneshot():
-        cpu_pct = proc.cpu_percent(interval=None)
+        cpu_times = proc.cpu_times()
+        cpu_time_s = float(cpu_times.user + cpu_times.system)
         rss = proc.memory_info().rss
         threads = proc.num_threads()
     return {"t_mono_ns": clock_ns(), "round_id": int(round_id), "process": name, "pid": proc.pid,
-            "cpu_pct": cpu_pct, "rss_bytes": rss, "threads": threads}
+            "cpu_time_s": cpu_time_s, "wall_interval_s": "",
+            "cpu_pct": "", "rss_bytes": rss, "threads": threads}
+
+
+def cpu_usage_percent(previous_cpu_time_s: float, current_cpu_time_s: float, wall_interval_s: float) -> float:
+    """Return process CPU-time delta as percent of one CPU over wall time."""
+    values = (previous_cpu_time_s, current_cpu_time_s, wall_interval_s)
+    if any(not np.isfinite(value) for value in values):
+        raise ValueError("CPU and wall-time samples must be finite")
+    if previous_cpu_time_s < 0 or current_cpu_time_s < previous_cpu_time_s:
+        raise ValueError("cumulative process CPU time must be non-negative and monotonic")
+    if wall_interval_s <= 0:
+        raise ValueError("wall_interval_s must be positive")
+    return 100.0 * (current_cpu_time_s - previous_cpu_time_s) / wall_interval_s
+
+
+def _read_csv(path: Path) -> list[dict[str, str]]:
+    if not path.is_file():
+        return []
+    with path.open(newline="", encoding="utf-8") as stream:
+        return list(csv.DictReader(stream))
+
+
+def _percentiles(values: list[float], *, unit: str) -> dict[str, object]:
+    count = len(values)
+    return {
+        "unit": unit,
+        "sample_count": count,
+        "p50": float(np.percentile(values, 50)) if count >= 1 else None,
+        "p95": float(np.percentile(values, 95)) if count >= 20 else None,
+        "p99": float(np.percentile(values, 99)) if count >= 100 else None,
+    }
+
+
+def summarize_gateway_profile(
+    log_dir: str | Path,
+    *,
+    warmup_rounds: int = 20,
+) -> dict[str, object]:
+    """Summarize gateway samples, excluding warm-up rounds without inventing zeros."""
+    if isinstance(warmup_rounds, bool) or not isinstance(warmup_rounds, int) or warmup_rounds < 0:
+        raise ValueError("warmup_rounds must be a non-negative integer")
+    root = Path(log_dir)
+    rounds_path = root / "gateway_summary.json"
+    round_records = (
+        json.loads(rounds_path.read_text(encoding="utf-8"))
+        if rounds_path.is_file()
+        else []
+    )
+    if not isinstance(round_records, list):
+        raise ValueError(f"{rounds_path}: expected a JSON list")
+    first_measured_round = warmup_rounds + 1
+    boundary = next(
+        (
+            int(record["start_mono_ns"])
+            for record in round_records
+            if int(record["round_id"]) == first_measured_round
+        ),
+        None,
+    )
+
+    process_rows = _read_csv(root / "processes.csv")
+    if boundary is None:
+        process_rows = []
+    else:
+        process_rows = [
+            row for row in process_rows
+            if row.get("process") == "gateway"
+            and row.get("t_mono_ns", "").strip()
+            and int(row["t_mono_ns"]) >= boundary
+        ]
+    cpu_values = [
+        float(row["cpu_pct"])
+        for row in process_rows
+        if row.get("cpu_pct", "").strip()
+    ]
+    rss_values = [
+        float(row["rss_bytes"])
+        for row in process_rows
+        if row.get("rss_bytes", "").strip()
+    ]
+    if any(not np.isfinite(value) or value < 0 for value in (*cpu_values, *rss_values)):
+        raise ValueError("gateway profile samples must be finite and non-negative")
+    if boundary is not None:
+        cpu_values = [
+            float(row["cpu_pct"])
+            for row in process_rows
+            if row.get("cpu_pct", "").strip()
+            and int(row["t_mono_ns"]) - int(float(row["wall_interval_s"]) * 1_000_000_000) >= boundary
+        ]
+
+    scheduler_rows = [
+        row for row in _read_csv(root / "scheduler_samples.csv")
+        if row.get("round_id", "").strip()
+        and int(row["round_id"]) > warmup_rounds
+    ]
+    scheduler_values = [
+        float(row["latency_us"])
+        for row in scheduler_rows
+        if row.get("latency_us", "").strip()
+    ]
+    if any(not np.isfinite(value) or value < 0 for value in scheduler_values):
+        raise ValueError("scheduler latency samples must be finite and non-negative")
+
+    rss_mib_values = [value / (1024 * 1024) for value in rss_values]
+    return {
+        "profiling_enabled": True,
+        "warmup_rounds_excluded": warmup_rounds,
+        "process_sample_boundary_mono_ns": boundary,
+        "cpu_usage": {
+            **_percentiles(cpu_values, unit="percent_of_one_cpu"),
+            "definition": "100 * process CPU-time delta / monotonic wall-time delta",
+            "cpu_time_unit": "seconds (user + system, cumulative in processes.csv)",
+            "wall_time_unit": "seconds (per-sample monotonic interval in processes.csv)",
+        },
+        "rss": {
+            **_percentiles(rss_values, unit="bytes"),
+            "p50_mib": float(np.percentile(rss_mib_values, 50)) if rss_values else None,
+            "p95_mib": float(np.percentile(rss_mib_values, 95)) if len(rss_values) >= 20 else None,
+            "p99_mib": float(np.percentile(rss_mib_values, 99)) if len(rss_values) >= 100 else None,
+        },
+        "scheduler_latency": {
+            **_percentiles(scheduler_values, unit="microseconds"),
+            "definition": (
+                "UDP datagram callback or scheduler tick entry to generated GRANT action dispatch; "
+                "trigger is recorded per sample"
+            ),
+        },
+    }
 
 
 class ProcessSampler:
@@ -107,6 +238,7 @@ class ProcessSampler:
         self.stop_event = threading.Event()
         self.thread = threading.Thread(target=self._run, name="fedgrant-process-sampler", daemon=True)
         self.error: BaseException | None = None
+        self._previous_samples: dict[tuple[int, str], tuple[int, float]] = {}
 
     def start(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -131,8 +263,20 @@ class ProcessSampler:
                             try:
                                 now_ns = time.monotonic_ns()
                                 round_id = self.round_state.round_at(now_ns) if self.round_state else 0
-                                writer.writerow(sample_process(process, name, round_id=round_id,
-                                                                clock_ns=lambda: now_ns))
+                                record = sample_process(process, name, round_id=round_id,
+                                                        clock_ns=lambda: now_ns)
+                                sample_key = (int(record["pid"]), name)
+                                cpu_time_s = float(record["cpu_time_s"])
+                                previous = self._previous_samples.get(sample_key)
+                                if previous is not None:
+                                    previous_ns, previous_cpu_s = previous
+                                    interval_s = (now_ns - previous_ns) / 1_000_000_000.0
+                                    record["wall_interval_s"] = interval_s
+                                    record["cpu_pct"] = cpu_usage_percent(
+                                        previous_cpu_s, cpu_time_s, interval_s
+                                    )
+                                self._previous_samples[sample_key] = (now_ns, cpu_time_s)
+                                writer.writerow(record)
                             except psutil.NoSuchProcess:
                                 continue
                         except psutil.Error:
@@ -156,4 +300,10 @@ class ProcessSampler:
             raise RuntimeError("process sampler failed") from self.error
 
 
-__all__ = ["sample_qdisc", "sample_process", "ProcessSampler"]
+__all__ = [
+    "sample_qdisc",
+    "sample_process",
+    "cpu_usage_percent",
+    "summarize_gateway_profile",
+    "ProcessSampler",
+]

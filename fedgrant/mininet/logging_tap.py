@@ -18,8 +18,18 @@ from fedgrant.net.udp_gateway import UdpGateway
 class LoggingUdpGateway(UdpGateway):
     """Same UDP gateway API as UdpGateway plus one strict raw packet log."""
 
-    def __init__(self, core, *, log_dir: str | Path, **kwargs: Any):
+    def __init__(
+        self,
+        core,
+        *,
+        log_dir: str | Path,
+        profile_scheduler: bool = False,
+        **kwargs: Any,
+    ):
+        if not isinstance(profile_scheduler, bool):
+            raise TypeError("profile_scheduler must be a bool")
         super().__init__(core, **kwargs)
+        self.profile_scheduler = profile_scheduler
         directory = Path(log_dir)
         directory.mkdir(parents=True, exist_ok=True)
         self._packet_file = (directory / "packets.csv").open("w", newline="", encoding="utf-8")
@@ -35,13 +45,27 @@ class LoggingUdpGateway(UdpGateway):
         self._grant_writer = csv.DictWriter(self._grant_file, fieldnames=GRANT_COLUMNS, extrasaction="raise")
         self._grant_writer.writeheader()
         self._dispatch_trigger_perf_ns: int | None = None
+        self._dispatch_trigger = ""
         self._grant_sent_ns: dict[tuple[int, int], int] = {}
         self._deadline_snapshot: tuple[int, int] | None = None
 
     @classmethod
-    async def bind(cls, core, *, log_dir: str | Path, local_addr=("0.0.0.0", 9000), **kwargs: Any):
+    async def bind(
+        cls,
+        core,
+        *,
+        log_dir: str | Path,
+        local_addr=("0.0.0.0", 9000),
+        profile_scheduler: bool = False,
+        **kwargs: Any,
+    ):
         """Bind with the subclass-only log_dir constructor argument forwarded."""
-        protocol = cls(core, log_dir=log_dir, **kwargs)
+        protocol = cls(
+            core,
+            log_dir=log_dir,
+            profile_scheduler=profile_scheduler,
+            **kwargs,
+        )
         loop = asyncio.get_running_loop()
         await loop.create_datagram_endpoint(lambda: protocol, local_addr=local_addr)
         return protocol
@@ -63,11 +87,13 @@ class LoggingUdpGateway(UdpGateway):
             pass
         body = message.body if message is not None else {}
         before = self.core.stats.accepted_data
-        self._dispatch_trigger_perf_ns = received_perf_ns
+        self._dispatch_trigger_perf_ns = received_perf_ns if self.profile_scheduler else None
+        self._dispatch_trigger = "datagram" if self.profile_scheduler else ""
         try:
             super().datagram_received(data, addr)
         finally:
             self._dispatch_trigger_perf_ns = None
+            self._dispatch_trigger = ""
         # Persist after the core has scheduled any immediate response, so disk
         # I/O does not inflate event-to-GRANT latency.
         self._write_packet(round_id, client_id, packet_type, len(data), "received", now_ns=received_mono_ns,
@@ -83,7 +109,8 @@ class LoggingUdpGateway(UdpGateway):
                     sent_ns = self._grant_sent_ns.get((client_id, grant_id), grant.t_issue_ns)
                     rtt_ms = (received_mono_ns - sent_ns) / 1e6
                     self._rtt_writer.writerow({"t_mono_ns": received_mono_ns, "round_id": round_id,
-                                               "rtt_ms": rtt_ms})
+                                               "rtt_ms": rtt_ms, "rtt_type": "grant_resolution",
+                                               "client_id": client_id})
                     self._rtt_file.flush()
                     self._grant_writer.writerow({"t_mono_ns": received_mono_ns, "round_id": round_id,
                                                  "client_id": client_id, "grant_id": grant_id,
@@ -130,8 +157,9 @@ class LoggingUdpGateway(UdpGateway):
                                                                 if self._dispatch_trigger_perf_ns is not None else ""),
                                                  "rtt_ms": ""})
                     self._grant_file.flush()
-                    if self._dispatch_trigger_perf_ns is not None:
+                    if self.profile_scheduler and self._dispatch_trigger_perf_ns is not None:
                         self._scheduler_writer.writerow({"t_mono_ns": now_ns, "round_id": round_id,
+                                                         "trigger": self._dispatch_trigger,
                                                          "latency_us": (sent_perf_ns - self._dispatch_trigger_perf_ns) / 1e3})
                         self._scheduler_file.flush()
                 else:
@@ -149,11 +177,15 @@ class LoggingUdpGateway(UdpGateway):
         if (self.core.phase.name == "ACTIVE" and self.core.round is not None
                 and self.clock_ns() >= self.core.round.deadline_ns):
             self.capture_deadline_state()
-        self._dispatch_trigger_perf_ns = time.perf_counter_ns()
+        previous_start = self._dispatch_trigger_perf_ns
+        previous_trigger = self._dispatch_trigger
+        self._dispatch_trigger_perf_ns = time.perf_counter_ns() if self.profile_scheduler else None
+        self._dispatch_trigger = "scheduler_tick" if self.profile_scheduler else ""
         try:
             super()._run_tick()
         finally:
-            self._dispatch_trigger_perf_ns = None
+            self._dispatch_trigger_perf_ns = previous_start
+            self._dispatch_trigger = previous_trigger
 
     def capture_deadline_state(self) -> int:
         """Snapshot unresolved grants before the core's deadline cleanup runs."""
