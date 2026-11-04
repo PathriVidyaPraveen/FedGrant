@@ -1,0 +1,57 @@
+PYTHON ?= python3
+PYTEST ?= $(PYTHON) -m pytest
+RUNS ?= results/summary/runs.csv
+
+.PHONY: help install install-ml test test-pure test-ml test-mininet trace-fetch trace-bin mininet-smoke metrics calibrate docker-build
+
+help:
+	@printf '%s\n' 'install       Install Python dependencies from requirements.lock' \
+	  'install-ml    Install the optional PyTorch ML dependencies' \
+	  'test          Run non-ML tests (Mininet tests skip when host support is absent)' \
+	  'test-pure     Run unit tests that do not require PyTorch' \
+	  'test-ml       Run the PyTorch FEMNIST and simulator integration tests' \
+	  'test-mininet  Run root-required Mininet integration tests' \
+	  'trace-fetch   Fetch/copy licensed Mahimahi traces' \
+	  'trace-bin     Bin raw .up traces into CSVs' \
+	  'mininet-smoke Run one three-client Mininet round (requires root)' \
+	  'metrics       Build summary CSV rows from run directories (RUN_DIRS=...)' \
+	  'calibrate     Compare paired M1 and M-sim rows' \
+	  'docker-build  Build the reproducibility image'
+
+install:
+	$(PYTHON) -m pip install -r requirements.lock
+	$(PYTHON) -m pip install --no-deps -e .
+
+install-ml:
+	$(PYTHON) -m pip install -e '.[ml,test]'
+
+test:
+	$(PYTEST) -q --ignore=tests/integration/test_fl_smoke.py --ignore=tests/unit/test_simulator_fixes.py
+
+test-pure:
+	$(PYTEST) -q tests/unit --ignore=tests/unit/test_simulator_fixes.py
+
+test-ml:
+	$(PYTEST) -q tests/integration/test_fl_smoke.py tests/unit/test_simulator_fixes.py
+
+test-mininet:
+	sudo $(PYTEST) -q tests/integration/test_mininet_round.py
+
+trace-fetch:
+	bash scripts/get_traces.sh
+
+trace-bin:
+	$(PYTHON) scripts/bin_traces.py
+
+mininet-smoke:
+	sudo $(PYTHON) -m fedgrant.mininet.run_mininet --clients 3 --rounds 1 --scenario L2 --output results/mininet/smoke
+
+metrics:
+	@test -n "$(RUN_DIRS)" || (echo 'Set RUN_DIRS to one or more run directories' >&2; exit 2)
+	$(PYTHON) -m fedgrant.analysis.raw_metrics $(RUN_DIRS) --output $(RUNS)
+
+calibrate:
+	$(PYTHON) -m fedgrant.analysis.calibrate --runs $(RUNS)
+
+docker-build:
+	docker build -f docker/Dockerfile -t fedgrant-testbed .

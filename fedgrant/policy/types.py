@@ -80,10 +80,13 @@ class PolicyConfig:
         if not isinstance(self.predictor, str) or self.predictor not in PREDICTORS:
             raise ValueError(f"predictor must be one of {sorted(PREDICTORS)}, got {self.predictor!r}")
         for name in ("pred_in_pacing", "pred_in_eligibility", "retransmit"):
-            if not isinstance(getattr(self, name), bool):
+            val = getattr(self, name)
+            if isinstance(val, (bool, np.bool_)):
+                setattr(self, name, bool(val))
+            else:
                 raise TypeError(f"{name} must be a bool, got {getattr(self, name)!r}")
         eps = self.explore_eps
-        if isinstance(eps, bool) or not isinstance(eps, (int, float)):
+        if isinstance(eps, bool) or not isinstance(eps, (int, float, np.number)):
             raise TypeError(f"explore_eps must be a number, got {eps!r}")
         eps = float(eps)
         if not math.isfinite(eps) or not 0.0 <= eps <= 1.0:

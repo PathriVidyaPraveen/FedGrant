@@ -1,0 +1,5 @@
+scenario: L2
+loss_probability: 0.05
+mean_loss_burst_packets: 8
+access_rate_profile: constant_by_client
+cross_traffic_mbps: 0
