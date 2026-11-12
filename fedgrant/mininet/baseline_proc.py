@@ -215,9 +215,9 @@ class _LoggingB3Gateway(B3UdpGateway):
         self.owner = owner
 
     def datagram_received(self, data: bytes, addr) -> None:
-        received_ns = self.clock_ns()
+        received_ns = self.clock_ns()  # one timestamp for both the core and the log
         before = self.rejected_datagrams
-        super().datagram_received(data, addr)
+        self.receive_datagram(data, addr, received_ns)
         self.owner._log_b3_datagram(data, received_ns, accepted=self.rejected_datagrams == before)
 
     def _send_message(self, message_type, *, client_id: int, t_send_ns: int, body) -> None:
@@ -713,13 +713,15 @@ async def _run_b3_client(cfg, client_id, provider, logs, round_timeout_s, comple
     sent = 0
     try:
         for _ in range(cfg.rounds):
-            timeouts_before = client.round_end_timeouts
             try:
-                round_id = await client.wait_for_round_end(timeout=round_timeout_s)
+                # One immutable record per round, published after the PLAN
+                # transfer has settled (completed, cancelled at round end or failed).
+                record = await client.wait_for_round_record(timeout=round_timeout_s)
             except asyncio.TimeoutError:
                 break
-            transfer = client.last_transfer
-            if transfer is not None and transfer.round_id == round_id:
+            round_id = record.round_id
+            transfer = record.transfer
+            if transfer is not None:
                 sent += transfer.packets_sent
                 for pos, (block_idx, sent_ns) in enumerate(zip(transfer.sent_indices, transfer.send_times_ns), 1):
                     logs.packets.write(t_mono_ns=sent_ns, round_id=round_id, direction="sent", client_id=client_id,
@@ -730,10 +732,10 @@ async def _run_b3_client(cfg, client_id, provider, logs, round_timeout_s, comple
             # these are the energies the client reported in READY.
             base = getattr(provider, "provider", provider)  # deterministic: same u as sent
             energies = _block_energies(encode(base(round_id), cfg.L))
-            logs.round({"round_id": round_id, "ready_sent_ns": client.ready_sent_ns,
-                        "plan_start_ns": client.plan_start_ns, "delivered": list(client.last_delivered_indices),
-                        "packets_sent": transfer.packets_sent if transfer is not None and transfer.round_id == round_id else 0,
-                        "status": "round_end_timeout" if client.round_end_timeouts > timeouts_before else "round_end",
+            logs.round({"round_id": round_id, "ready_sent_ns": record.ready_sent_ns,
+                        "plan_start_ns": record.plan_start_ns, "delivered": list(record.delivered_indices),
+                        "packets_sent": record.packets_sent, "status": record.finished_by,
+                        "transfer_status": record.transfer_status, "transfer_error": record.transfer_error,
                         "block_energies": [float(x) for x in energies]})
             completed.append(round_id)
             if hasattr(provider, "prefetch"):

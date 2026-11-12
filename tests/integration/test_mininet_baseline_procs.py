@@ -160,11 +160,29 @@ def test_baseline_processes_complete_rounds_over_real_sockets(policy, tmp_path) 
         events = [row for row in _csv(run_dir / "rounds.csv") if row["event"] == "plan_data_rtt"]
         assert rtts and len(rtts) == len(events)
         assert {row["rtt_type"] for row in rtts} == {"plan_data"}
+        accepted_data = [p for p in packets if p["packet_type"] == "DATA" and p["result"] == "accepted"]
+        plans_sent = [p for p in packets if p["packet_type"] == "PLAN" and p["direction"] == "sent"]
+        seen: set[tuple[str, str]] = set()
         for rtt, event in zip(rtts, events, strict=True):
             detail = dict(item.split("=") for item in event["detail"].split(";"))
-            assert int(detail["send_pos"]) >= 1
+            key = (rtt["round_id"], rtt["client_id"])
+            # Client and round stay paired between the RTT row and its event.
+            assert key == (event["round_id"], event["client_id"]) and key not in seen
+            seen.add(key)  # at most one sample per client per round
             assert int(detail["arrival_ns"]) - int(detail["plan_sent_ns"]) == int(detail["rtt_ns"]) > 0
             assert float(rtt["rtt_ms"]) == pytest.approx(int(detail["rtt_ns"]) / 1e6)
+            assert int(rtt["t_mono_ns"]) == int(detail["arrival_ns"])
+            # send_pos names the accepted DATA that produced the sample: it is
+            # that client's earliest accepted DATA of the round, at that time.
+            mine = [p for p in accepted_data if (p["round_id"], p["client_id"]) == key]
+            first = min(mine, key=lambda p: int(p["t_mono_ns"]))
+            assert (first["send_pos"], int(first["t_mono_ns"])) == (detail["send_pos"], int(detail["arrival_ns"]))
+            # The PLAN was handed off for this client and round before the DATA arrived.
+            plan_rows = [p for p in plans_sent if (p["round_id"], p["client_id"]) == key]
+            assert len(plan_rows) == 1 and int(plan_rows[0]["t_mono_ns"]) >= int(detail["plan_sent_ns"])
+            assert int(detail["plan_sent_ns"]) < int(detail["arrival_ns"])
+        # Every client with accepted DATA in a round has exactly one sample.
+        assert seen == {(p["round_id"], p["client_id"]) for p in accepted_data}
         for row in metrics:
             assert int(row["plan_messages_sent"]) == N
             assert int(row["plan_data_rtt_samples"]) == sum(1 for e in events if e["round_id"] == row["round_id"])
