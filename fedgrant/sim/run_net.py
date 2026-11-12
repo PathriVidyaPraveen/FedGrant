@@ -464,7 +464,16 @@ class GatewaySim(_GatewaySimState):
 
     def _decision_hook(self, event: dict[str, Any]) -> None:
         if self.decision_hook is not None:
-            self.decision_hook(dict(event))
+            record = dict(event)
+            # Keep the simulator's public decision schema: GatewayCore names the
+            # chosen client ``client_id``; pacing has just set view.P_target.
+            record.setdefault("selection_method", self.cfg.selector)
+            record.setdefault("selected_client_id", record.get("client_id"))
+            record.setdefault("p_pacing", float(pacing_p(record["p_hat"], self.cfg)))
+            record.setdefault("p_target", float(self.view.P_target))
+            for key in ("grant_id", "send_pos", "timeout_ns"):
+                record.setdefault(key, None)  # pacing-blocked decisions issue no grant
+            self.decision_hook(record)
         if event.get("outcome") != "grant_issued":
             return
         client_id = int(event["client_id"])
