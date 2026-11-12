@@ -208,9 +208,13 @@ def test_m1_requires_value_bank(tmp_path, monkeypatch):
     assert not (tmp_path / "run").exists()
 
 
-def test_unimplemented_baseline_and_unknown_policy_fail_early(tmp_path):
+def test_unimplemented_baseline_and_unknown_policy_fail_early(tmp_path, monkeypatch):
     bank = tmp_path / "bank.npz"
     bank.write_bytes(b"x")
+    # baseline_proc now exists; simulate a checkout without it to keep the guard covered.
+    real_find_spec = contract.importlib.util.find_spec
+    monkeypatch.setattr(contract.importlib.util, "find_spec",
+                        lambda name, *a: None if name == contract.BASELINE_MODULE else real_find_spec(name, *a))
     with pytest.raises(RuntimeError, match="baseline_proc"):
         _run(tmp_path, experiment_id="M1", policy="B2", value_bank=str(bank))
     with pytest.raises(ValueError, match="no Mininet implementation"):

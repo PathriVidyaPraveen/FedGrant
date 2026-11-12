@@ -14,9 +14,17 @@ fallback to another policy exists: an unavailable checkpoint or value bank
 raises. The runtime P-EWMA fallback of Section 9 is ``FallbackPredictor``,
 applied automatically by ``GatewayCore``.
 
-Compatibility: ``create_b4_gateway`` / ``create_b6_gateway`` /
-``create_fg_gru_gateway`` match the ``--gateway-factory module:function``
-contract of ``fedgrant.mininet.gateway_proc`` (``factory(num_clients)``).
+Runner contract (``fedgrant.mininet.gateway_proc`` with
+``fedgrant.mininet.contract.build_gateway``): the gateway process builds one
+``MininetGatewayContext`` (weights from the value bank, seed, D, K, L, models
+directory) and calls ``--gateway-factory module:function`` once as
+``factory(ctx)``; the returned ``GatewayCore`` serves every round. Use
+``fedgrant.mininet.production:create_gateway`` there. ``create_b4_gateway`` /
+``create_b6_gateway`` / ``create_fg_gru_gateway`` take a bare client count and
+load the bank weights themselves, for direct callers only.
+
+The factory opens no sockets and starts no event loop or thread; the gateway
+process drives every lifecycle callback.
 """
 
 from __future__ import annotations
@@ -135,7 +143,18 @@ def create_gateway(ctx: Any) -> GatewayCore:
     ``ctx`` is a ``GatewayContext`` or any object with the same attributes
     (``num_clients``, ``policy``, ``client_weights``; optional ``seed``,
     ``deadline_ns``, ``K``, ``L``, ``models_dir``, ``log_dir``).
+
+    This is the runner's ``--gateway-factory`` entry point:
+    ``fedgrant.mininet.gateway_proc`` builds a
+    ``fedgrant.mininet.contract.MininetGatewayContext`` and calls
+    ``create_gateway(ctx)`` once per run.
     """
+    if not all(hasattr(ctx, name) for name in ("num_clients", "policy", "client_weights")):
+        raise TypeError(
+            f"create_gateway expects a gateway context (MininetGatewayContext), got "
+            f"{type(ctx).__name__}; for a bare client count use create_b4_gateway, "
+            "create_b6_gateway or create_fg_gru_gateway"
+        )
     config = _resolved_config(ctx)
     weights = _validated_weights(ctx)
     K = int(getattr(ctx, "K", K_DEFAULT))
@@ -204,6 +223,12 @@ def bank_client_weights(num_clients: int, bank_path: str | Path | None = None) -
 
 
 def _from_bank(policy: str, num_clients: int) -> GatewayCore:
+    if isinstance(num_clients, bool) or not isinstance(num_clients, (int, np.integer)):
+        raise TypeError(
+            f"create_{policy.lower().replace('-', '_')}_gateway takes a client count, got "
+            f"{type(num_clients).__name__}; gateway_proc passes a MininetGatewayContext, so use "
+            "--gateway-factory fedgrant.mininet.production:create_gateway"
+        )
     return create_gateway(GatewayContext(
         num_clients=int(num_clients), policy=policy, client_weights=bank_client_weights(int(num_clients)),
     ))

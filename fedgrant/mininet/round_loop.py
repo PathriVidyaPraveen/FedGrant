@@ -220,22 +220,31 @@ async def run_round_loop(
         if round_state is not None:
             # Publish the window before ROUND_START leaves, as run_rounds does.
             round_state.write(round_id=round_id, start_ns=start_ns, deadline_ns=deadline_ns, active=True)
-        await _maybe_await(hooks.start_round(round_id, start_ns, deadline_ns, rho_us))
-        remaining_ns = deadline_ns - clock_ns()
-        if remaining_ns > 0:
-            await sleep(remaining_ns / 1e9)
-        await _maybe_await(hooks.on_deadline(round_id, deadline_ns))
+        try:
+            await _maybe_await(hooks.start_round(round_id, start_ns, deadline_ns, rho_us))
+            remaining_ns = deadline_ns - clock_ns()
+            if remaining_ns > 0:
+                await sleep(remaining_ns / 1e9)
+            await _maybe_await(hooks.on_deadline(round_id, deadline_ns))
+        except BaseException:
+            # A failing hook or a cancelled task never leaves a stale active
+            # window for trace replay or the samplers.
+            if round_state is not None:
+                round_state.write(round_id=round_id, active=False)
+            raise
         handled_ns = clock_ns()
         # Same drain semantics as run_rounds: drain until D + late drain.
         drain_until_ns = deadline_ns + schedule.late_drain_ns
         if round_state is not None:
             round_state.write(round_id=round_id, start_ns=start_ns, deadline_ns=deadline_ns,
                               active=False, drain_until_ns=drain_until_ns)
-        await sleep(max(0, drain_until_ns - clock_ns()) / 1e9)
-        await _maybe_await(hooks.finalize_round(round_id))
-        outcomes.append(RoundOutcome(round_id, start_ns, deadline_ns, handled_ns, clock_ns()))
-        if round_state is not None:
-            round_state.write(round_id=round_id, active=False)
+        try:
+            await sleep(max(0, drain_until_ns - clock_ns()) / 1e9)
+            await _maybe_await(hooks.finalize_round(round_id))
+            outcomes.append(RoundOutcome(round_id, start_ns, deadline_ns, handled_ns, clock_ns()))
+        finally:
+            if round_state is not None:
+                round_state.write(round_id=round_id, active=False)
         if round_id < rounds and schedule.inter_round_ns:
             await sleep(schedule.inter_round_ns / 1e9)
     return outcomes
