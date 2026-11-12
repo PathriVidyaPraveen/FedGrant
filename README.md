@@ -45,7 +45,9 @@ sudo .venv/bin/python -m fedgrant.mininet.run_mininet \
   --clients 3 --rounds 1 --scenario L2 --output results/mininet/smoke
 ```
 
-The runner currently uses an explicitly labeled first-eligible stub policy and synthetic client updates. Its output validates transport/topology/logging only; it must not be labeled production M1 data. It records effective `tc` readbacks, 10 ms bottleneck queue samples, 100 ms process samples, per-grant and per-packet logs, round summaries, and trace-replay updates. For cross traffic, `--cross-mbps 3` sends UDP from `xt` to the gateway sink on port 9999. A single TBF qdisc does not reveal which flow caused a drop, so the analyzer reports the foreground/cross-traffic split as unmeasured when both share the queue.
+The specified form is `sudo .venv/bin/python -m fedgrant.mininet.run_mininet --config <yaml> --seed <s>` (or `make mininet-run CONFIG=<yaml> SEED=<s>`). The config may be a scenario file (`configs/scenarios/L3.yaml`) or a grid file (`configs/grids/mn_m1.yaml`); for a grid, pick one value of each listed factor with `--scenario`/`--policy`. Command-line values override the file, and grid values must be in the file's lists. The runner refuses to label stub output as M1/M2: those runs need `--gateway-factory module:function` for the production gateway. A failed run leaves `run_failure.json` instead of `meta.json`, so `make metrics` cannot mistake it for a complete run.
+
+The default gateway is an explicitly labeled first-eligible stub policy with synthetic client updates. Its output validates transport/topology/logging only; it must not be labeled production M1 data. It records effective `tc` readbacks, 10 ms bottleneck queue samples, 100 ms process samples, per-grant and per-packet logs, round summaries, and trace-replay updates. For cross traffic, `--cross-mbps 3` sends UDP from `xt` to the gateway sink on port 9999. A single TBF qdisc does not reveal which flow caused a drop, so the analyzer reports the foreground/cross-traffic split as unmeasured when both share the queue.
 
 ## Experiment grid and analysis
 
