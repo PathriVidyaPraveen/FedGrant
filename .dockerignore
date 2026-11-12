@@ -1,0 +1,12 @@
+# Build context for docker/Dockerfile: code, configs, tests and models only.
+# Local datasets and run outputs never enter the image (a clean machine has none).
+.git
+data
+results/mininet
+results/raw
+.venv
+**/__pycache__
+**/*.pyc
+.pytest_cache
+*.egg-info
+overnight.log

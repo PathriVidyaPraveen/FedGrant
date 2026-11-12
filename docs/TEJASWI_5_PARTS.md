@@ -123,3 +123,12 @@ Finish Parts 1 and 2 first because they are pure and unblock both the topology a
 - `validate_ge measure` passes PYTHONPATH to its child processes.
 - Added `configs/grids/mn_m2.yaml`, `make mininet-run`, and a proposed Fedora platform amendment in `CHANGELOG.md`.
 - Still open: a production gateway factory and production client process for M1 (B1/B2/B3 adapters, B4/B6/FG-GRU providers), the M1 runs themselves, accepted M-sim rows, calibration, and the Docker clean-machine reproduction.
+
+## Update 2026-11-13 (local, uncommitted)
+
+- Cross-traffic drop split implemented (`fedgrant/mininet/cross_drops.py`): gateway capture of numbered iperf3 datagrams; per-round `queue_drops_cross` / `queue_drops_fg` in `round_metrics.csv` and `runs.csv`. Needs a root X2 run to confirm on real traffic.
+- Container reproduction: `.dockerignore` (no local data in the image), lock files moved to `docker/` (spec Section 15), scipy pinned to a Python 3.11 release, CPU PyTorch in `docker/requirements-ml.lock`, `make docker-test` (docker or podman). Result: 843 passed, 1 skipped inside the image.
+- Report generator `make testbed-report` (byte-stable tables in `results/summary/testbed_*`, figures in `results/figures/testbed_*.pdf`); report draft expanded with replay timing and reproducibility notes.
+- Pending: N=20 stub scale runs (L2, L4, X2) on the Fedora host; production M1 runs after Prajin's gateway/baseline processes.
+- N = 20 stub scale runs on the Fedora host (L2, L4, X2, 25 rounds each) completed with 0 invalid events and ±2 ms round timing. Trace replay moved to per-client rtnetlink agents (median lag 3.5 ms vs 9.0 ms before) with a ready handshake before round 1. Cross-drop attribution validated under 12 Mbit/s overload (capture 8,330 vs iperf3 8,432 drops).
+- **Open, needs a team decision:** READY is lost on the lossy uplink in 13–16% of client-rounds at N = 20 (Section 7 applies loss to all client egress; the simulator delivers READY without loss), so eta is blank in most rounds. Options: exempt READY from netem loss on the testbed (Section 7 amendment), or retransmit READY in the client.

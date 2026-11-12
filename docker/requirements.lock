@@ -1,7 +1,8 @@
 # Python dependencies for analysis, unit tests, and testbed utilities.
 # Mininet/Open vSwitch/netem/tbf remain host OS/kernel dependencies; see docs/TEJASWI_5_PARTS.md.
+# Pins must install on Python 3.11 (docker/Dockerfile); check with `make docker-test`.
 numpy==2.4.6
-scipy==1.18.1
+scipy==1.17.1  # last release supporting Python 3.11 (spec runtime); 1.18 needs >=3.12
 PyYAML==6.0.3
 pyroute2==0.9.7
 psutil==7.2.2

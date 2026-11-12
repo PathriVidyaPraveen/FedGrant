@@ -20,17 +20,15 @@ from fedgrant.mininet.contract import (
     BASELINE_MODES, DEFAULT_MODELS_DIR, DEFAULT_VALUE_BANK, GRANT_POLICIES, POLICY_MODEL_FILES, STUB_POLICY,
     check_entry_points_available, entry_points, is_baseline,
 )
-from fedgrant.mininet.crosstraffic import CrossTraffic, udp_payload_bps
+from fedgrant.mininet.cross_drops import write_cross_drops
+from fedgrant.mininet.crosstraffic import CrossCapture, CrossTraffic, cross_duration_s, udp_payload_bps
 from fedgrant.mininet.profile_update import profile_bank
-from fedgrant.mininet.replay import RateReplay
 from fedgrant.mininet.teardown import teardown
 from fedgrant.mininet.telemetry import ProcessSampler, sample_qdisc
 from fedgrant.mininet.round_state import RoundStateFile
 from fedgrant.mininet.round_summary import enrich_round_metrics
 from fedgrant.mininet.topo import SCENARIO_LOSS, build, client_parameters, verify_tc
 from fedgrant.mininet.telemetry import summarize_gateway_profile
-from fedgrant.mininet.tcsetup import tbf_change
-from fedgrant.traces.client_trace import client_trace
 from fedgrant.sim.run_net import compute_deadline_ns
 from fedgrant.policy.constants import C, Q, S
 
@@ -256,6 +254,57 @@ def process_commands(*, python: str, policy: str, n: int, rounds: int, seed: int
     return gw_cmd, client_cmds
 
 
+def replay_agent_command(*, python: str, client_id: int, scenario: str, seed: int, trace_dir: str | Path,
+                         round_state_path: Path, out: Path) -> list[str] | None:
+    """Command for one client's trace-replay agent, or None when the scenario has constant rates."""
+    if scenario not in {"L4", "L5"}:
+        return None
+    return [python, "-m", "fedgrant.mininet.replay_agent", "--client-id", str(client_id),
+            "--split", "ood" if scenario == "L5" else "test", "--seed", str(seed),
+            "--trace-dir", str(trace_dir), "--iface", f"c{client_id}-eth0",
+            "--round-state", str(round_state_path), "--log", str(out / f"trace_replay_client_{client_id}.csv")]
+
+
+def wait_for_replay_agents(agents: list, log_paths: list[Path], *, timeout_s: float = 30.0,
+                           poll_s: float = 0.05) -> None:
+    """Block until every agent logged its ready line; fail if one exits or times out.
+
+    Starting 20 agents next to 20 clients can take longer than the gateway's
+    start-up delay; without this wait every agent missed round 1.
+    """
+    from fedgrant.mininet.replay_agent import READY_MARKER
+
+    deadline = time.monotonic() + timeout_s
+    pending = set(range(len(agents)))
+    while pending:
+        for i in sorted(pending):
+            if log_paths[i].is_file() and READY_MARKER in log_paths[i].read_text(encoding="utf-8", errors="replace"):
+                pending.discard(i)
+            elif agents[i].poll() is not None:
+                raise RuntimeError(f"replay agent {i} exited {agents[i].returncode} before ready; see {log_paths[i]}")
+        if pending and time.monotonic() > deadline:
+            raise RuntimeError(f"replay agents {sorted(pending)} not ready after {timeout_s:.0f} s")
+        if pending:
+            time.sleep(poll_s)
+
+
+def stop_replay_agents(agents: list) -> list[str]:
+    """SIGTERM every agent, wait, and return a failure line per agent that did not exit 0."""
+    for proc in agents:
+        if proc.poll() is None:
+            proc.terminate()
+    failures = []
+    for proc in agents:
+        try:
+            code = proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            code = proc.wait(timeout=2)
+        if code not in (0, -15):
+            failures.append(f"replay agent pid={proc.pid} exited {code}")
+    return failures
+
+
 def _sha256(path: Path) -> str | None:
     return hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
 
@@ -306,9 +355,12 @@ def run_experiment(*, n: int, scenario: str, seed: int, rounds: int, beta: float
     net = None
     processes = []
     log_handles = []
-    replayers = []
+    replay_agents = []
+    agent_logs: list[Path] = []
     cross = None
     cross_result = None
+    capture = None
+    cross_drop_count = None
     sampler = None
     process_sampler = None
     try:
@@ -326,6 +378,22 @@ def run_experiment(*, n: int, scenario: str, seed: int, rounds: int, beta: float
             compute_window_s=compute_window_s, out=out, round_state_path=round_state_path,
             gateway_factory=gateway_factory, value_bank=value_bank, models_dir=models_dir,
             profile_gateway=profile_gateway)
+        # Trace replay (L4/L5): one agent per client inside its own namespace,
+        # started before the gateway so it is waiting when round 1 begins.
+        for i in range(n):
+            agent_cmd = replay_agent_command(python=py, client_id=i, scenario=scenario, seed=seed,
+                                             trace_dir=trace_dir, round_state_path=round_state_path, out=out)
+            if agent_cmd is None:
+                break
+            if roles["pinning_enabled"] and roles["clients"]:
+                agent_cmd = ["taskset", "-c", str(roles["clients"][i % len(roles["clients"])]), *agent_cmd]
+            agent_log = (out / f"replay_agent_{i}.log").open("w", encoding="utf-8")
+            log_handles.append(agent_log)
+            agent_logs.append(out / f"replay_agent_{i}.log")
+            replay_agents.append(net.get(f"c{i}").popen(agent_cmd, stdout=agent_log,
+                                                         stderr=subprocess.STDOUT, env=env))
+        if replay_agents:
+            wait_for_replay_agents(replay_agents, agent_logs)
         gateway_log = (out / "gateway.log").open("w", encoding="utf-8")
         log_handles.append(gateway_log)
         if roles["pinning_enabled"] and roles["gateway"] is not None:
@@ -343,31 +411,12 @@ def run_experiment(*, n: int, scenario: str, seed: int, rounds: int, beta: float
                                              cpu_id=roles["telemetry"],
                                              round_state_path=round_state_path).start()
 
-        if scenario.upper() in {"L4", "L5"}:
-            split = "ood" if scenario.upper() == "L5" else "test"
-            for i in range(n):
-                rates = client_trace(i, split, seed, data_dir=trace_dir)
-                host, iface = net.get(f"c{i}"), f"c{i}-eth0"
-                replay_log = out / f"trace_replay_client_{i}.csv"
-
-                def log_rate_change(actual_ns: int, replay_round: int, bin_index: int,
-                                    rate_bps: int, scheduled_ns: int, *, path=replay_log) -> None:
-                    exists = path.exists()
-                    with path.open("a", newline="", encoding="utf-8") as stream:
-                        writer = csv.writer(stream)
-                        if not exists:
-                            writer.writerow(("t_mono_ns", "round_id", "bin_index", "rate_bps",
-                                             "scheduled_mono_ns", "lag_ns"))
-                        writer.writerow((actual_ns, replay_round, bin_index, rate_bps,
-                                         scheduled_ns, actual_ns - scheduled_ns))
-
-                replayer = RateReplay(rates, lambda rate, h=host, dev=iface: h.cmd(tbf_change(dev, rate)),
-                                      repeat=True, round_state_path=round_state_path,
-                                      on_change=log_rate_change)
-                replayers.append(replayer.start())
         if cross_mbps > 0:
+            # Capture first: every cross datagram is numbered, so the gaps seen
+            # at the gateway are exactly its bottleneck drops (cross_drops.py).
+            capture = CrossCapture(net.get("gw"), "gw-eth0", out / "cross_capture.pcap").start()
             cross = CrossTraffic(net.get("gw"), net.get("xt"))
-            cross.start(cross_mbps, duration_s=max(2, int(rounds * 2)))
+            cross.start(cross_mbps, duration_s=cross_duration_s(rounds, duration_ns, compute_window_s))
 
         # The specification requires tc -s sampling every 10 ms at the shared
         # bottleneck. Access-link queues are not part of the reported bottleneck
@@ -386,6 +435,8 @@ def run_experiment(*, n: int, scenario: str, seed: int, rounds: int, beta: float
                 continue
             if code != 0:
                 failures.append(f"process pid={proc.pid} exited {code}")
+        failures += stop_replay_agents(replay_agents)
+        replay_agents = []
         if failures:
             raise RuntimeError("Mininet run failed: " + "; ".join(failures))
         # Combine sender-side client packets (which include DATA lost on the
@@ -403,7 +454,12 @@ def run_experiment(*, n: int, scenario: str, seed: int, rounds: int, beta: float
             writer.writeheader()
             writer.writerows(packet_rows)
         if cross is not None:
-            cross_result = cross.wait(timeout=max(5.0, rounds * 2.0 + 3.0))
+            cross_result = cross.wait(
+                timeout=cross_duration_s(rounds, duration_ns, compute_window_s) + 10.0)
+        if capture is not None:
+            capture.stop()
+            cross_drop_count = write_cross_drops(out / "cross_capture.pcap", out / "cross_drops.csv",
+                                                 capture.realtime_minus_mono_ns)
         if sampler is not None:
             sampler.stop()
             sampler = None
@@ -466,7 +522,9 @@ def run_experiment(*, n: int, scenario: str, seed: int, rounds: int, beta: float
                 "ge_target_loss_rate": loss_target, "ge_target_mean_burst": burst_target,
                 "tc_readback": tc_readback,
             },
-            "cross_traffic": ({"iperf3": cross_result, "receiver_payload_bps": udp_payload_bps(cross_result)}
+            "cross_traffic": ({"iperf3": cross_result, "receiver_payload_bps": udp_payload_bps(cross_result),
+                               "capture": "cross_capture.pcap", "drops_detected": cross_drop_count,
+                               "realtime_minus_mono_ns": capture.realtime_minus_mono_ns if capture else None}
                               if cross_result is not None else None),
             "gateway_profiling": {
                 "enabled": profile_gateway,
@@ -501,9 +559,14 @@ def run_experiment(*, n: int, scenario: str, seed: int, rounds: int, beta: float
                 resource.stop()
             except BaseException as exc:
                 cleanup_errors.append(exc)
-        for replayer in replayers:
+        if replay_agents:
             try:
-                replayer.stop()
+                stop_replay_agents(replay_agents)
+            except BaseException as exc:
+                cleanup_errors.append(exc)
+        if capture is not None:
+            try:
+                capture.stop()
             except BaseException as exc:
                 cleanup_errors.append(exc)
         if cross is not None:
@@ -568,6 +631,9 @@ def resolve_cli(argv: list[str] | None = None) -> dict:
 
 def main(argv: list[str] | None = None) -> None:
     s = resolve_cli(argv)
+    if hasattr(os, "geteuid") and os.geteuid() != 0:
+        # Check before creating the run directory, so a forgotten sudo leaves nothing behind.
+        raise SystemExit("run_mininet needs root (network namespaces and tc): rerun with sudo")
     path = run_experiment(n=int(s["clients"]), scenario=s["scenario"], seed=int(s["seed"]),
                           rounds=int(s["rounds"]), beta=float(s["beta"]), trace_dir=s["trace_dir"],
                           output_dir=s["output"], cross_mbps=float(s["cross_mbps"]),
