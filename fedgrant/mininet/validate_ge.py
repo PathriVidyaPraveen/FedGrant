@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import socket
 import struct
 import subprocess
@@ -76,18 +77,22 @@ def run_scenario(scenario: str, *, count: int = 100_000, interval_s: float = 0.0
     out = Path(output)
     out.parent.mkdir(parents=True, exist_ok=True)
     net = build(n=1, scenario=scenario)
+    # Child processes run inside Mininet hosts; make the checkout importable
+    # even when the package is not pip-installed (run_mininet does the same).
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[2]) + os.pathsep + env.get("PYTHONPATH", "")
     receiver = sender = None
     try:
         receiver = net.get("gw").popen(
             [sys.executable, "-m", "fedgrant.mininet.validate_ge", "receive", "--bind", "10.0.0.254",
              "--port", "6000", "--count", str(count), "--timeout-s", "45", "--output", str(out)],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
         )
         time.sleep(0.2)
         sender = net.get("c0").popen(
             [sys.executable, "-m", "fedgrant.mininet.validate_ge", "send", "--destination", "10.0.0.254",
              "--port", "6000", "--count", str(count), "--interval-s", str(interval_s)],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
         )
         _, sender_err = sender.communicate(timeout=max(30.0, count * interval_s + 10.0))
         if sender.returncode != 0:

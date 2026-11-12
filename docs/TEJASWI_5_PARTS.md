@@ -114,3 +114,12 @@ Finish Parts 1 and 2 first because they are pure and unblock both the topology a
 - Part 4 has a stub-policy UDP runner, replay, cross-traffic process, telemetry, logs, and cleanup. The runner fails closed if it produces no valid grant/DATA exchange; a previous smoke run accepted 14 DATA blocks across three clients with zero invalid events. The required injected-failure teardown test is still absent. The runner also does not yet accept the specification's `--config <yaml> --seed <s>` command or execute the M1 grid.
 - Part 5 has raw-metric and paired calibration code with synthetic-fixture tests, scenario/grid files, a Dockerfile, Makefile, lock file, and report/setup drafts. Non-ML and ML tests passed in the current checkout during the previous verification pass; container clean-machine and Mininet reproduction still need a recorded run. Empirical M1/M-sim results remain pending and calibration requires production M1 rows plus matching Jayadev M-sim rows.
 - PyTorch-only FL tests are kept behind `make test-ml`; the testbed suite does not require downloading Torch.
+
+## Update 2026-11-12 (local, uncommitted)
+
+- `run_mininet` accepts `--config <yaml> --seed <s>` (scenario or grid YAML; CLI overrides; grid values validated), plus `--experiment-id`, `--policy`, `--compute-window-s`. `meta.json` now records experiment id, policy, `n_rounds`, `config_id` (M1/M2), config path/hash, and the compute window actually passed to the gateway. The stub factory cannot be labelled M1/M2.
+- Round state is initialised before the gateway starts (removes the start-up race). Failed runs write `run_failure.json` and no `meta.json`.
+- `tests/unit/test_mininet_teardown.py` adds the injected-failure teardown tests (build failure, `verify_tc` failure, client crash with a hung gateway, spawn failure) and teardown idempotency/kill tests, all without root.
+- `validate_ge measure` passes PYTHONPATH to its child processes.
+- Added `configs/grids/mn_m2.yaml`, `make mininet-run`, and a proposed Fedora platform amendment in `CHANGELOG.md`.
+- Still open: a production gateway factory and production client process for M1 (B1/B2/B3 adapters, B4/B6/FG-GRU providers), the M1 runs themselves, accepted M-sim rows, calibration, and the Docker clean-machine reproduction.

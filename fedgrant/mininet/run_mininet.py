@@ -14,6 +14,7 @@ import threading
 import time
 from pathlib import Path
 
+from fedgrant.analysis.runs_schema import make_config_id
 from fedgrant.common.logschema import PACKET_COLUMNS, QUEUE_COLUMNS
 from fedgrant.mininet.crosstraffic import CrossTraffic, udp_payload_bps
 from fedgrant.mininet.profile_update import profile_bank
@@ -30,6 +31,105 @@ from fedgrant.sim.run_net import compute_deadline_ns
 from fedgrant.policy.constants import C, Q, S
 
 DEFAULT_STUB_FACTORY = "fedgrant.mininet.stub_policy:create_gateway"
+STUB_EXPERIMENT_ID = "smoke-stub"
+STUB_POLICY = "STUB-FIRST-ELIGIBLE"
+MININET_EXPERIMENTS = frozenset({"M1", "M2"})
+SCENARIOS = ("L1", "L2", "L3", "L4", "L5")
+
+# Run settings a --config YAML may provide. Scenario files use
+# cross_traffic_mbps; grid files use clients/policies/seeds/scenario lists.
+_CONFIG_ALIASES = {
+    "clients": "clients", "N": "clients", "n_clients": "clients",
+    "scenario": "scenario", "seed": "seed", "seeds": "seed",
+    "rounds": "rounds", "n_rounds": "rounds", "beta": "beta",
+    "cross_traffic_mbps": "cross_mbps", "cross_mbps": "cross_mbps",
+    "trace_dir": "trace_dir", "output": "output",
+    "gateway_factory": "gateway_factory", "policy": "policy", "policies": "policy",
+    "experiment_id": "experiment_id", "compute_window_s": "compute_window_s",
+}
+# Scenario-file keys that describe the scenario itself; they are checked
+# against the code's scenario table rather than used as run settings.
+_SCENARIO_DESCRIPTIVE_KEYS = frozenset({
+    "loss_probability", "mean_loss_burst_packets", "access_rate_profile", "trace_split", "platform",
+})
+
+
+def _pick(name: str, value, override):
+    """Resolve a config value (scalar or grid list) against an optional CLI override."""
+    if isinstance(value, list):
+        if override is None:
+            if len(value) != 1:
+                raise ValueError(f"config gives several values for {name} {value}; select one with --{name.replace('_', '-')}")
+            return value[0]
+        if override not in value and str(override) not in [str(v) for v in value]:
+            raise ValueError(f"--{name.replace('_', '-')} {override!r} is not in the config's {name} list {value}")
+        return override
+    return value if override is None else override
+
+
+def load_run_config(path: str | Path, overrides: dict | None = None) -> dict:
+    """Load a scenario or grid YAML and resolve it to one run's settings.
+
+    Values given on the command line (``overrides`` entries that are not
+    None) win over the file; for grid files a command-line value must be one
+    of the listed values. Returns a dict with keys from ``_CONFIG_ALIASES``.
+    """
+    try:
+        import yaml
+    except ImportError as exc:  # pragma: no cover - pyyaml is in the testbed extra
+        raise RuntimeError("--config needs PyYAML (pip install pyyaml)") from exc
+    config_path = Path(path)
+    data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    if not isinstance(data, dict):
+        raise ValueError(f"{config_path}: top level must be a mapping")
+    overrides = {k: v for k, v in (overrides or {}).items() if v is not None}
+    unknown = sorted(set(data) - set(_CONFIG_ALIASES) - _SCENARIO_DESCRIPTIVE_KEYS)
+    if unknown:
+        raise ValueError(f"{config_path}: unknown keys {unknown}")
+    if data.get("platform") not in (None, "mininet"):
+        raise ValueError(f"{config_path}: platform {data['platform']!r} is not a Mininet config")
+    resolved: dict = {}
+    for key, value in data.items():
+        if key in _SCENARIO_DESCRIPTIVE_KEYS:
+            continue
+        name = _CONFIG_ALIASES[key]
+        resolved[name] = _pick(name, value, overrides.get(name))
+    for name, value in overrides.items():
+        resolved.setdefault(name, value)
+    if "scenario" in resolved:
+        resolved["scenario"] = str(resolved["scenario"]).upper()
+        if resolved["scenario"] == "X2":
+            # The X2 scenario file is L2 loss/capacity plus 3 Mbit/s cross traffic.
+            resolved["scenario"] = "L2"
+        _check_scenario_loss(config_path, data, resolved["scenario"])
+    resolved["config_path"] = str(config_path)
+    resolved["config_sha256"] = hashlib.sha256(config_path.read_bytes()).hexdigest()
+    return resolved
+
+
+def _check_scenario_loss(config_path: Path, data: dict, scenario: str) -> None:
+    if scenario not in SCENARIO_LOSS:
+        raise ValueError(f"{config_path}: unknown scenario {scenario!r}")
+    loss, burst = SCENARIO_LOSS[scenario]
+    if "loss_probability" in data and abs(float(data["loss_probability"]) - loss) > 1e-12:
+        raise ValueError(f"{config_path}: loss_probability {data['loss_probability']} != {loss} for {scenario}")
+    if "mean_loss_burst_packets" in data and abs(float(data["mean_loss_burst_packets"]) - burst) > 1e-9:
+        raise ValueError(f"{config_path}: mean_loss_burst_packets {data['mean_loss_burst_packets']} != {burst} for {scenario}")
+
+
+def run_identity(experiment_id: str | None, policy: str | None, gateway_factory: str) -> tuple[str, str]:
+    """Return (experiment_id, policy) for meta.json, refusing to label stub output as M1/M2."""
+    is_stub = gateway_factory == DEFAULT_STUB_FACTORY
+    experiment_id = experiment_id or (STUB_EXPERIMENT_ID if is_stub else None)
+    policy = policy or (STUB_POLICY if is_stub else None)
+    if experiment_id is None or policy is None:
+        raise ValueError("a non-stub gateway factory needs --experiment-id and --policy")
+    if is_stub and (experiment_id in MININET_EXPERIMENTS or policy != STUB_POLICY):
+        raise ValueError(
+            f"the first-eligible stub gateway cannot produce {experiment_id}/{policy} results; "
+            "pass the production --gateway-factory for M1/M2 runs"
+        )
+    return str(experiment_id), str(policy)
 
 
 class _QueueSampler:
@@ -122,14 +222,30 @@ def smoke_duration_ns(beta: float, n: int, gateway_factory: str) -> int:
 def run_experiment(*, n: int, scenario: str, seed: int, rounds: int, beta: float,
                    trace_dir: str | Path, output_dir: str | Path, cross_mbps: float = 0.0,
                    gateway_factory: str = DEFAULT_STUB_FACTORY,
-                   profile_gateway: bool = False) -> Path:
-    """Run a real UDP smoke round with local stub policy providers."""
+                   profile_gateway: bool = False, experiment_id: str | None = None,
+                   policy: str | None = None, compute_window_s: float = 1.0,
+                   config: dict | None = None) -> Path:
+    """Run Mininet UDP rounds; the default stub factory is a protocol smoke test only.
+
+    Every exit path stops samplers, replay threads, cross traffic, child
+    processes and the Mininet network. A failed run leaves ``run_failure.json``
+    (not ``meta.json``), so the analysis never mistakes it for a complete run.
+    """
     if not isinstance(profile_gateway, bool):
         raise TypeError("profile_gateway must be a bool")
+    scenario = str(scenario).upper()
+    if scenario not in SCENARIOS:
+        raise ValueError(f"unknown scenario {scenario!r}")
+    if not compute_window_s >= 0:
+        raise ValueError("compute_window_s must be non-negative")
+    experiment_id, policy = run_identity(experiment_id, policy, gateway_factory)
     out = Path(output_dir)
     if out.exists() and any(out.iterdir()):
         raise FileExistsError(f"output directory is not empty: {out}")
     out.mkdir(parents=True, exist_ok=True)
+    identity = {"experiment_id": experiment_id, "policy": policy, "scenario": scenario,
+                "seed": int(seed), "N": int(n), "beta": float(beta), "cross_mbps": float(cross_mbps),
+                "n_rounds": int(rounds), "platform": "mininet"}
     started = time.monotonic_ns()
     roles = cpu_roles()
     net = None
@@ -153,7 +269,7 @@ def run_experiment(*, n: int, scenario: str, seed: int, rounds: int, beta: float
         gateway_log = (out / "gateway.log").open("w", encoding="utf-8")
         log_handles.append(gateway_log)
         gw_cmd = [py, "-m", "fedgrant.mininet.gateway_proc", "--clients", str(n), "--rounds", str(rounds),
-                  "--duration-ns", str(duration_ns),
+                  "--duration-ns", str(duration_ns), "--compute-window-s", repr(float(compute_window_s)),
                   "--gateway-factory", gateway_factory, "--log-dir", str(out),
                   "--round-state", str(round_state_path)]
         if profile_gateway:
@@ -264,9 +380,12 @@ def run_experiment(*, n: int, scenario: str, seed: int, rounds: int, beta: float
                                 "effective": host.cmd(f"tc -d qdisc show dev {iface}").strip()})
         loss_target, burst_target = SCENARIO_LOSS[scenario.upper()]
         meta = {
-            "experiment_id": "smoke-stub", "platform": "mininet", "scenario": scenario.upper(),
-            "seed": int(seed), "N": int(n), "beta": float(beta), "cross_mbps": float(cross_mbps),
-            "rounds": int(rounds), "compute_window_s": 1.0, "duration_ns": int(duration_ns),
+            **identity, "status": "ok", "rounds": int(rounds),
+            "config_id": (make_config_id(scenario, beta, n, cross_mbps)
+                          if experiment_id in MININET_EXPERIMENTS else None),
+            "config": ({k: config[k] for k in ("config_path", "config_sha256") if k in config}
+                       if config else None),
+            "compute_window_s": float(compute_window_s), "duration_ns": int(duration_ns),
             "started_mono_ns": started, "ended_mono_ns": time.monotonic_ns(),
             "gateway_factory": gateway_factory, "trace_dir": str(trace_dir),
             "trace_files": sorted(trace_hashes), "trace_sha256": trace_hashes,
@@ -302,6 +421,16 @@ def run_experiment(*, n: int, scenario: str, seed: int, rounds: int, beta: float
             meta["gateway_profiling"]["summary_file"] = "gateway_profile.json"
         (out / "meta.json").write_text(json.dumps(meta, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         return out
+    except BaseException as exc:
+        try:
+            failure = {**identity, "status": "failed", "error_type": type(exc).__name__, "error": str(exc),
+                       "started_mono_ns": started, "failed_mono_ns": time.monotonic_ns(),
+                       "gateway_factory": gateway_factory}
+            (out / "run_failure.json").write_text(json.dumps(failure, indent=2, sort_keys=True) + "\n",
+                                                  encoding="utf-8")
+        except OSError:
+            pass
+        raise
     finally:
         active_error = sys.exc_info()[0] is not None
         cleanup_errors = []
@@ -331,24 +460,55 @@ def run_experiment(*, n: int, scenario: str, seed: int, rounds: int, beta: float
             raise RuntimeError("one or more Mininet cleanup steps failed") from cleanup_errors[0]
 
 
-def main() -> None:
+_DEFAULTS = {"clients": 3, "scenario": "L2", "seed": 0, "rounds": 1, "beta": 0.10, "cross_mbps": 0.0,
+             "trace_dir": "data/traces", "gateway_factory": DEFAULT_STUB_FACTORY, "compute_window_s": 1.0,
+             "experiment_id": None, "policy": None, "output": None, "profile_gateway": False}
+
+
+def resolve_cli(argv: list[str] | None = None) -> dict:
+    """Parse the command line; ``--config <yaml> --seed <s>`` is the specified form (Section 7)."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--clients", type=int, default=3)
-    parser.add_argument("--scenario", choices=("L1", "L2", "L3", "L4", "L5"), default="L2")
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--rounds", type=int, default=1)
-    parser.add_argument("--beta", type=float, default=0.10)
-    parser.add_argument("--cross-mbps", type=float, default=0.0)
-    parser.add_argument("--trace-dir", default="data/traces")
-    parser.add_argument("--output", required=True)
-    parser.add_argument("--gateway-factory", default=DEFAULT_STUB_FACTORY)
-    parser.add_argument("--profile-gateway", action="store_true",
+    parser.add_argument("--config", help="scenario or grid YAML (e.g. configs/grids/mn_m1.yaml)")
+    parser.add_argument("--clients", type=int)
+    parser.add_argument("--scenario", type=str.upper, choices=SCENARIOS)
+    parser.add_argument("--seed", type=int)
+    parser.add_argument("--rounds", type=int)
+    parser.add_argument("--beta", type=float)
+    parser.add_argument("--cross-mbps", dest="cross_mbps", type=float)
+    parser.add_argument("--trace-dir", dest="trace_dir")
+    parser.add_argument("--output", help="new, empty run directory (default: results/mininet/<run id>)")
+    parser.add_argument("--gateway-factory", dest="gateway_factory")
+    parser.add_argument("--experiment-id", dest="experiment_id")
+    parser.add_argument("--policy")
+    parser.add_argument("--compute-window-s", dest="compute_window_s", type=float)
+    parser.add_argument("--profile-gateway", dest="profile_gateway", action="store_true", default=None,
                         help="collect gateway process CPU/RSS and scheduler-latency samples")
-    args = parser.parse_args()
-    path = run_experiment(n=args.clients, scenario=args.scenario, seed=args.seed, rounds=args.rounds,
-                          beta=args.beta, trace_dir=args.trace_dir, output_dir=args.output,
-                          cross_mbps=args.cross_mbps, gateway_factory=args.gateway_factory,
-                          profile_gateway=args.profile_gateway)
+    args = vars(parser.parse_args(argv))
+    config_path = args.pop("config")
+    overrides = {k: v for k, v in args.items() if v is not None}
+    try:
+        settings = load_run_config(config_path, overrides) if config_path else dict(overrides)
+    except (OSError, ValueError) as exc:
+        parser.error(str(exc))
+    for key, value in _DEFAULTS.items():
+        settings.setdefault(key, value)
+    if settings["output"] is None:
+        label = "-".join(str(part) for part in (
+            settings["experiment_id"] or STUB_EXPERIMENT_ID, settings["scenario"],
+            settings["policy"] or "stub", f"s{settings['seed']}", time.strftime("%Y%m%d-%H%M%S")))
+        settings["output"] = str(Path("results/mininet") / label)
+    return settings
+
+
+def main(argv: list[str] | None = None) -> None:
+    s = resolve_cli(argv)
+    path = run_experiment(n=int(s["clients"]), scenario=s["scenario"], seed=int(s["seed"]),
+                          rounds=int(s["rounds"]), beta=float(s["beta"]), trace_dir=s["trace_dir"],
+                          output_dir=s["output"], cross_mbps=float(s["cross_mbps"]),
+                          gateway_factory=s["gateway_factory"], profile_gateway=bool(s["profile_gateway"]),
+                          experiment_id=s["experiment_id"],
+                          policy=s["policy"], compute_window_s=float(s["compute_window_s"]),
+                          config=s if "config_path" in s else None)
     print(path)
 
 

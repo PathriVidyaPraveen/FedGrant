@@ -1,0 +1,9 @@
+experiment_id: M2
+platform: mininet
+scenario: [L2]
+beta: [0.10]
+clients: 20
+cross_traffic_mbps: 0
+policies: [B3, FG-GRU]
+seeds: [0]
+rounds: 300

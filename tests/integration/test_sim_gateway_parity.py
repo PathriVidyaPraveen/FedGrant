@@ -126,14 +126,20 @@ class _ReplayAssembly:
         p_issue = pacing_p(p_hat, self.cfg)
         allowed = self.inflight.can_issue(p_issue, self.view.P_target)
         self.pacing_inputs.append((client_id, p_hat, p_issue, self.view.P_target, allowed))
-        if allowed:
-            grant_id = self.gateway.next_grant_id
-            self.inflight.add(grant_id, p_issue)
-            state = self.states[client_id]
-            self.rate_windows[client_id].set_outstanding(
-                now_ns, len(state.outstanding) + 1
-            )
         return allowed
+
+    def issue_probability(self, client_id, p_hat):
+        # GatewayCore records this value in view.inflight when it issues the grant.
+        return pacing_p(p_hat, self.cfg)
+
+    def data_arrival(self, client_id, t_ns):
+        window = self.rate_windows[client_id]
+        window.advance(self.states[client_id], t_ns)
+        window.add_delivery(t_ns, 8 * S)
+
+    def grant_issued(self, client_id, grant, t_ns):
+        state = self.states[client_id]
+        self.rate_windows[client_id].set_outstanding(t_ns, len(state.outstanding))
 
     def timeout_ns(self, client_id, issue_ns):
         return grant_timeout(issue_ns, self.states[client_id], self.gateway.round.deadline_ns)
@@ -149,16 +155,14 @@ class _ReplayAssembly:
         state = self.states[client_id]
         window = self.rate_windows[client_id]
         window.advance(state, t_ns)
-        # The hook contract supplies OutstandingGrant but not its ID; recover
-        # it from GatewayCore's just-recorded resolved-grant index.
+        # GatewayCore calls resolve() before removing the grant (same contract
+        # as sim/run_net.py), so recover its id from the client's outstanding map;
+        # resolve_event then performs the authoritative Phi/state transition.
         grant_id = next(
-            gid for gid, resolved in self.gateway.resolved_grants[client_id].items()
-            if resolved is grant
+            (gid for gid, value in state.outstanding.items() if value is grant), None
         )
-        # GatewayCore's EstimatorHooks contract runs after it removes the grant;
-        # restore only the shared resolver's precondition, then let resolve_event
-        # perform the authoritative Phi/state/statistics transition.
-        state.outstanding[grant_id] = grant
+        if grant_id is None:
+            raise KeyError("GatewayCore estimator callback ran after grant removal")
         self.view.t_ns = t_ns
         self.view.P_target = self._target()
         rtt_ns = t_ns - grant.t_issue_ns if delivered else None
@@ -197,10 +201,8 @@ class _ReplayAssembly:
                 t_ns = event["t_ns"]
                 if t_ns <= self.gateway.round.deadline_ns:
                     self.view.t_ns = t_ns
-                    self.view.arrivals.record(t_ns, 8 * S)
-                    window = self.rate_windows[event["client_id"]]
-                    window.advance(self.states[event["client_id"]], t_ns)
-                    window.add_delivery(t_ns, 8 * S)
+                # GatewayCore records the arrival in view.arrivals and calls
+                # data_arrival() for the rate window (same as sim/run_net.py).
                 self.gateway.on_data(
                     event["client_id"], event["grant_id"], event["send_pos"],
                     event["block_idx"], event["payload"], t_ns,
@@ -272,6 +274,8 @@ def test_simulator_replay_is_deterministic_and_reports_only_gateway_observables(
         "n_coords", "payload", "t_ns", "abs_t_ns", "energies", "deadline_ns",
         "selection_method", "candidate_client_ids", "selected_client_id", "p_hat",
         "p_pacing", "p_target", "timeout_ns", "outcome",
+        # GatewayCore decision_hook fields forwarded into the event stream.
+        "candidate_next_values", "candidate_undelivered", "rr_pointer", "pacing_allowed",
     }
     assert all(set(event).issubset(event_fields) for event in a_events)
     assert all("y" not in event for event in a_events)

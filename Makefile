@@ -2,7 +2,7 @@ PYTHON ?= python3
 PYTEST ?= $(PYTHON) -m pytest
 RUNS ?= results/summary/runs.csv
 
-.PHONY: help install install-ml test test-pure test-ml test-mininet trace-fetch trace-bin data mininet-smoke mininet metrics calibrate plots grid-net grid-fl docker-build
+.PHONY: help install install-ml test test-pure test-ml test-mininet trace-fetch trace-bin data mininet-smoke mininet mininet-run metrics calibrate plots grid-net grid-fl docker-build
 
 help:
 	@printf '%s\n' 'install       Install Python dependencies from requirements.lock' \
@@ -16,6 +16,7 @@ help:
 	  'data          Prepare trace CSV splits from local raw traces' \
 	  'mininet-smoke Run one three-client Mininet round (requires root)' \
 	  'mininet       Run the root-required Mininet topology acceptance test' \
+	  'mininet-run   One Mininet run: CONFIG=<yaml> SEED=<s> [ARGS="--scenario L2 --policy B6 ..."]' \
 	  'grid-net      Execute the simulator network grid (long-running)' \
 	  'grid-fl       Run FULL references, then FL simulator jobs (long-running)' \
 	  'metrics       Build summary CSV rows from run directories (RUN_DIRS=...)' \
@@ -41,6 +42,10 @@ test-ml:
 
 test-mininet:
 	sudo $(PYTEST) -q tests/integration/test_mininet_round.py
+
+mininet-run:
+	@test -n "$(CONFIG)" || (echo 'Set CONFIG=<yaml> (e.g. configs/grids/mn_m1.yaml) and SEED=<s>' >&2; exit 2)
+	sudo $(PYTHON) -m fedgrant.mininet.run_mininet --config $(CONFIG) --seed $(or $(SEED),0) $(ARGS)
 
 trace-fetch:
 	bash scripts/get_traces.sh
