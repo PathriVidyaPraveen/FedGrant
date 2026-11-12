@@ -43,3 +43,7 @@ class PEWMA:
         """Stored p_hat for each requested client, float32 [n]."""
         get, init = self._p.get, self.init
         return np.fromiter((get(int(c), init) for c in inp.client_ids), dtype=np.float32, count=inp.n)
+
+# Backward-compatible name used by older simulator callers.
+EWMAPredictor = PEWMA
+__all__ = ["PEWMA", "EWMAPredictor"]

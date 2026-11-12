@@ -16,6 +16,11 @@ Re-running an analysis must rewrite the whole file from the raw logs (`make plot
 
 A run is identified by **(experiment_id, config_id, policy, seed)**. Duplicates are an error.
 
+The current v2 writer emits every column listed in §2. The reader remains compatible with
+older summaries that omit v2-only baseline and queue-delay columns; omitted optional values
+are treated as unmeasured. Required identity columns, applicable required metrics, and the
+status field must still be present and valid.
+
 ## 2. Columns
 
 Empty cell = not measured (read as NaN). Booleans are `true` / `false`.
@@ -54,14 +59,29 @@ The same `config_id` is used across experiments, so an M1 run and its M-sim twin
 | `late_after_timeout` | DATA arriving after its timeout but before D, per round |
 | `late_after_deadline` | DATA arriving after D, per round |
 | `rtt_p50_ms`, `rtt_p99_ms` | median / 99th percentile of grant RTT samples, ms |
+| `plan_data_rtt_p50_ms`, `plan_data_rtt_p99_ms` | median / 99th percentile of B3 first-DATA-after-PLAN RTT samples, ms |
+| `planned_blocks` | B3 total allocated blocks per round; blank for other protocols |
+| `plan_messages_sent` | B3 PLAN datagrams successfully handed to the simulator network per round; blank for other protocols |
+| `data_packets_sent`, `data_bytes_sent` | B2/B3 client DATA datagrams and their application datagram bytes sent per round; blank when not collected |
+| `grants_issued`, `grants_delivered`, `grants_timed_out` | FedGrant grant counters per round; blank for B2/B3 |
+| `grant_rtt_samples`, `plan_data_rtt_samples` | Measured grant-resolution and B3 PLAN/DATA RTT sample counts per round, respectively; the inapplicable count is blank |
+| `queue_drops_data` | Access and bottleneck queue drops for B2/B3 DATA; blank for other protocols |
+| `queueing_delay_mean_ms`, `queueing_delay_p99_ms` | Mean and 99th percentile of sampled bottleneck backlog divided by link capacity |
 | `gw_cpu_pct` | mean psutil CPU% of the gateway process during [0, D] |
 | `gw_rss_mb` | peak RSS of the gateway process, MB |
 | `sched_lat_p50_us`, `sched_lat_p99_us` | event receipt to GRANT send, µs |
 | `queueing_delay_mean_ms`, `queueing_delay_p99_ms` | mean and 99th percentile of bottleneck backlog/C samples, sampled every 10 ms |
 | `protocol_overhead` | non-payload bytes / delivered payload bytes |
 
-Per-round metrics are means over rounds 21..last. Percentiles (RTT, scheduler latency) are over all
-samples of rounds 21..last. Gateway metrics (CPU, RSS, scheduler latency) may be blank in the simulator.
+Per-round metrics are means over rounds 21..last. Grant RTT percentiles use only
+`rtt_type=grant_resolution`; B3 PLAN/DATA percentiles use only `rtt_type=plan_data`.
+Percentiles (RTT, scheduler latency) are over all samples of rounds 21..last. Gateway metrics
+(CPU, RSS, scheduler latency) may be blank in the simulator.
+
+B2/B3 fields are protocol-specific: B2 has no grants or PLAN allocation; B3 has PLAN allocation
+and PLAN/DATA RTT but no grants. Empty cells mean not applicable or unavailable, while `0` means
+the measurement was performed and its measured value was zero. In the simulator adapters,
+`protocol_overhead` remains blank because control-path framing is not modeled completely.
 
 ### FL metrics (F-main, F-ref, F-abl, M2)
 

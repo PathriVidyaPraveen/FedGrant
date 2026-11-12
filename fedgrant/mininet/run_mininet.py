@@ -24,6 +24,7 @@ from fedgrant.mininet.telemetry import ProcessSampler, sample_qdisc
 from fedgrant.mininet.round_state import RoundStateFile
 from fedgrant.mininet.round_summary import enrich_round_metrics
 from fedgrant.mininet.topo import SCENARIO_LOSS, build, client_parameters, verify_tc
+from fedgrant.mininet.telemetry import summarize_gateway_profile
 from fedgrant.mininet.tcsetup import tbf_change
 from fedgrant.traces.client_trace import client_trace
 from fedgrant.sim.run_net import compute_deadline_ns
@@ -220,7 +221,8 @@ def smoke_duration_ns(beta: float, n: int, gateway_factory: str) -> int:
 
 def run_experiment(*, n: int, scenario: str, seed: int, rounds: int, beta: float,
                    trace_dir: str | Path, output_dir: str | Path, cross_mbps: float = 0.0,
-                   gateway_factory: str = DEFAULT_STUB_FACTORY, experiment_id: str | None = None,
+                   gateway_factory: str = DEFAULT_STUB_FACTORY,
+                   profile_gateway: bool = False, experiment_id: str | None = None,
                    policy: str | None = None, compute_window_s: float = 1.0,
                    config: dict | None = None) -> Path:
     """Run Mininet UDP rounds; the default stub factory is a protocol smoke test only.
@@ -229,6 +231,8 @@ def run_experiment(*, n: int, scenario: str, seed: int, rounds: int, beta: float
     processes and the Mininet network. A failed run leaves ``run_failure.json``
     (not ``meta.json``), so the analysis never mistakes it for a complete run.
     """
+    if not isinstance(profile_gateway, bool):
+        raise TypeError("profile_gateway must be a bool")
     scenario = str(scenario).upper()
     if scenario not in SCENARIOS:
         raise ValueError(f"unknown scenario {scenario!r}")
@@ -255,20 +259,21 @@ def run_experiment(*, n: int, scenario: str, seed: int, rounds: int, beta: float
     try:
         net = build(n=n, scenario=scenario, seed=seed)
         verify_tc(net, net._fedgrant_expected_tc)
+        round_state_path = out / ".round_state.json"
+        RoundStateFile(round_state_path).write(round_id=0, active=False)
         env = os.environ.copy()
         project_root = str(Path(__file__).resolve().parents[2])
         env["PYTHONPATH"] = project_root + os.pathsep + env.get("PYTHONPATH", "")
         py = sys.executable
         duration_ns = smoke_duration_ns(beta, n, gateway_factory)
-        round_state_path = out / ".round_state.json"
-        # Initialise the shared round state before any child can write it.
-        RoundStateFile(round_state_path).write(round_id=0, active=False)
         gateway_log = (out / "gateway.log").open("w", encoding="utf-8")
         log_handles.append(gateway_log)
         gw_cmd = [py, "-m", "fedgrant.mininet.gateway_proc", "--clients", str(n), "--rounds", str(rounds),
                   "--duration-ns", str(duration_ns), "--compute-window-s", repr(float(compute_window_s)),
                   "--gateway-factory", gateway_factory, "--log-dir", str(out),
                   "--round-state", str(round_state_path)]
+        if profile_gateway:
+            gw_cmd.append("--profile-gateway")
         if roles["pinning_enabled"] and roles["gateway"] is not None:
             gw_cmd = ["taskset", "-c", str(roles["gateway"]), *gw_cmd]
         processes.append(net.get("gw").popen(gw_cmd, stdout=gateway_log, stderr=subprocess.STDOUT, env=env))
@@ -280,9 +285,10 @@ def run_experiment(*, n: int, scenario: str, seed: int, rounds: int, beta: float
             if roles["pinning_enabled"] and roles["clients"]:
                 cmd = ["taskset", "-c", str(roles["clients"][i % len(roles["clients"])]), *cmd]
             processes.append(net.get(f"c{i}").popen(cmd, stdout=client_log, stderr=subprocess.STDOUT, env=env))
-        process_sampler = ProcessSampler([(processes[0], "gateway")], out / "processes.csv",
-                                         cpu_id=roles["telemetry"],
-                                         round_state_path=round_state_path).start()
+        if profile_gateway:
+            process_sampler = ProcessSampler([(processes[0], "gateway")], out / "processes.csv",
+                                             cpu_id=roles["telemetry"],
+                                             round_state_path=round_state_path).start()
 
         if scenario.upper() in {"L4", "L5"}:
             split = "ood" if scenario.upper() == "L5" else "test"
@@ -400,7 +406,19 @@ def run_experiment(*, n: int, scenario: str, seed: int, rounds: int, beta: float
             },
             "cross_traffic": ({"iperf3": cross_result, "receiver_payload_bps": udp_payload_bps(cross_result)}
                               if cross_result is not None else None),
+            "gateway_profiling": {
+                "enabled": profile_gateway,
+                "profiled_process": "gateway" if profile_gateway else None,
+                "warmup_rounds_excluded": 20 if profile_gateway else None,
+            },
         }
+        if profile_gateway:
+            profile = summarize_gateway_profile(out)
+            (out / "gateway_profile.json").write_text(
+                json.dumps(profile, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            meta["gateway_profiling"]["summary_file"] = "gateway_profile.json"
         (out / "meta.json").write_text(json.dumps(meta, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         return out
     except BaseException as exc:
@@ -444,7 +462,7 @@ def run_experiment(*, n: int, scenario: str, seed: int, rounds: int, beta: float
 
 _DEFAULTS = {"clients": 3, "scenario": "L2", "seed": 0, "rounds": 1, "beta": 0.10, "cross_mbps": 0.0,
              "trace_dir": "data/traces", "gateway_factory": DEFAULT_STUB_FACTORY, "compute_window_s": 1.0,
-             "experiment_id": None, "policy": None, "output": None}
+             "experiment_id": None, "policy": None, "output": None, "profile_gateway": False}
 
 
 def resolve_cli(argv: list[str] | None = None) -> dict:
@@ -463,6 +481,8 @@ def resolve_cli(argv: list[str] | None = None) -> dict:
     parser.add_argument("--experiment-id", dest="experiment_id")
     parser.add_argument("--policy")
     parser.add_argument("--compute-window-s", dest="compute_window_s", type=float)
+    parser.add_argument("--profile-gateway", dest="profile_gateway", action="store_true", default=None,
+                        help="collect gateway process CPU/RSS and scheduler-latency samples")
     args = vars(parser.parse_args(argv))
     config_path = args.pop("config")
     overrides = {k: v for k, v in args.items() if v is not None}
@@ -485,7 +505,8 @@ def main(argv: list[str] | None = None) -> None:
     path = run_experiment(n=int(s["clients"]), scenario=s["scenario"], seed=int(s["seed"]),
                           rounds=int(s["rounds"]), beta=float(s["beta"]), trace_dir=s["trace_dir"],
                           output_dir=s["output"], cross_mbps=float(s["cross_mbps"]),
-                          gateway_factory=s["gateway_factory"], experiment_id=s["experiment_id"],
+                          gateway_factory=s["gateway_factory"], profile_gateway=bool(s["profile_gateway"]),
+                          experiment_id=s["experiment_id"],
                           policy=s["policy"], compute_window_s=float(s["compute_window_s"]),
                           config=s if "config_path" in s else None)
     print(path)

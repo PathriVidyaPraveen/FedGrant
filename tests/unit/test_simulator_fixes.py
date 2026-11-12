@@ -49,6 +49,37 @@ def test_network_round_seeds_are_distinct_and_reproducible() -> None:
     assert first != _network_round_seed(17, 2)
 
 
+def test_predictor_batches_ready_clients_on_five_ms_tick_and_observes_resolution() -> None:
+    class CountingPredictor:
+        def __init__(self) -> None:
+            self.batch_sizes: list[int] = []
+            self.observations: list[tuple[int, int]] = []
+
+        def reset_round(self, _ctx) -> None:
+            pass
+
+        def observe(self, client, y, _t_ns, _obs) -> None:
+            self.observations.append((client, y))
+
+        def predict(self, inp):
+            self.batch_sizes.append(inp.n)
+            return np.full(inp.n, 0.9, dtype=np.float32)
+
+    predictor = CountingPredictor()
+    gateway = GatewaySim(2, np.array([0.5, 0.5], dtype=np.float32), predictor, D_ns=500_000_000, K=1, L=1)
+    gateway.on_round_start(1, round_start_abs_ns=1)
+    grants = []
+    grants.extend(gateway.on_ready(0, np.array([1.0], dtype=np.float32), t_ns=0))
+    grants.extend(gateway.on_ready(1, np.array([1.0], dtype=np.float32), t_ns=0))
+
+    grants.extend(gateway.on_tick(5_000_000))
+
+    assert predictor.batch_sizes[-1] == 2
+    grant = next(grant for grant in grants if grant.client_id == 0)
+    gateway.on_data(0, grant.grant_id, grant.pos, 0, np.zeros(1, dtype=np.float16), t_ns=6_000_000)
+    assert predictor.observations == [(0, 1)]
+
+
 def test_gateway_diagnostics_reset_each_round() -> None:
     gateway = GatewaySim(1, np.array([1.0], dtype=np.float32), PEWMA(), K=1)
     gateway.on_round_start(1, round_start_abs_ns=1)
@@ -59,7 +90,10 @@ def test_gateway_diagnostics_reset_each_round() -> None:
     gateway.late_after_timeout = 5
     gateway.late_after_deadline = 6
 
-    gateway.on_round_start(2, round_start_abs_ns=2)
+    # A round is only reusable after its deadline transition has completed.
+    gateway.on_deadline(gateway.D_ns)
+    next_round_start = gateway.round_start_abs_ns + gateway.D_ns + 1
+    gateway.on_round_start(2, round_start_abs_ns=next_round_start)
 
     assert (gateway.grants_issued, gateway.grants_delivered, gateway.grants_timed_out) == (0, 0, 0)
     assert (gateway.duplicate_packets, gateway.late_after_timeout, gateway.late_after_deadline) == (0, 0, 0)
@@ -73,7 +107,7 @@ def test_late_data_is_counted_without_entering_deadline_state() -> None:
     assert gateway.arrivals.horizon_ns is None
 
 
-def test_empty_heap_is_rebuilt_when_a_client_becomes_eligible() -> None:
+def test_scheduler_waits_until_a_client_becomes_eligible() -> None:
     class DelayedPredictor:
         def reset_round(self, _ctx) -> None:
             pass
@@ -92,8 +126,7 @@ def test_empty_heap_is_rebuilt_when_a_client_becomes_eligible() -> None:
         K=1,
     )
     gateway.on_round_start(1, round_start_abs_ns=1)
-    gateway.on_ready(0, np.array([1.0], dtype=np.float32), t_ns=0)
-    assert gateway.heap == []
+    assert gateway.on_ready(0, np.array([1.0], dtype=np.float32), t_ns=0) == []
 
     grants = gateway.on_tick(5_000_000)
 
@@ -137,7 +170,7 @@ def test_round_robin_pointer_does_not_advance_when_pacing_blocks_grant() -> None
 def test_duplicate_data_packets_contribute_to_delivered_rate() -> None:
     from fedgrant.policy.constants import S
 
-    gateway = GatewaySim(1, np.array([1.0], dtype=np.float32), PEWMA(), D_ns=1_000_000_000, K=1)
+    gateway = GatewaySim(1, np.array([1.0], dtype=np.float32), PEWMA(), D_ns=1_000_000_000, K=1, L=1)
     gateway.on_round_start(1, round_start_abs_ns=1)
     gateway.on_ready(0, np.array([1.0], dtype=np.float32), t_ns=0)
     payload = np.zeros(1, dtype=np.float16)

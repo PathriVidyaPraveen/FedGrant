@@ -77,7 +77,7 @@ still the position where the window would end (the start of that (run, client)'s
 | `run_pi` | float64 | [R] | average loss π |
 | `run_beta` | float64 | [R] | budget ratio β |
 | `run_D_ns` | int64 | [R] | deadline D |
-| `run_capacity` | `<U32` | [R] | `"constant"` or the trace name |
+| `run_capacity` | `<U32` | [R] | `"constant"`, `"trace-ID"`, or `"trace-OOD"` (the capacity source used for the run) |
 | `meta_json` | `<U…` | [] | JSON: `schema_version`, `split`, `seed_range` [lo, hi), `generator`, `n_runs`, `n_events`, `n_samples` |
 
 ## 3. Time
@@ -139,7 +139,12 @@ rec.save(f"data/mldata/{split}.npz")               # validates, then writes
 ```
 
 Generating policy (Section 4.5): selector `value`, P-EWMA for eligibility and pacing,
-exploration ε = 0.1 (Section 9), N = 20, 50 rounds per run, scenario drawn uniformly per run.
+exploration ε = 0.1 (Section 9), N = 20, 50 rounds per run. Train, validation and test-ID
+runs cycle through a seeded permutation of the full grid: constant or ID-trace capacity,
+π ∈ {0.02, 0.05, 0.10}, mean burst ∈ {1, 8, 32}, and β ∈ {0.05, 0.10, 0.20}. Test-OOD
+runs cycle through OOD-trace capacity, π ∈ {0.05, 0.15}, mean burst ∈ {8, 32}, and the
+same β values. The split trace inputs are `_train`, `_val`, `_test`, and `_ood` respectively.
+Loss and burst settings override the scenario defaults, and run metadata records those values.
 Record every DATA arriving at the gateway (FedGrant DATA only, not cross traffic) in
 `view.arrivals` and call `view.arrivals.reset()` at ROUND_START.
 

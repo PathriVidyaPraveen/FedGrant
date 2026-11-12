@@ -20,7 +20,7 @@ import numpy as np
 from fedgrant.common.constants import DATA_GRANT_ID, L as L_DEFAULT, MessageType, TransferMode
 from fedgrant.common.wire import WireProtocolError, decode_message
 from fedgrant.encoder.ef import bitmap_from_indices
-from fedgrant.policy.constants import K as K_DEFAULT
+from fedgrant.policy.constants import K as K_DEFAULT, S
 from fedgrant.policy.features import build_pred_input
 from fedgrant.policy.types import CandidateView, Selector
 from fedgrant.predictors.base import Predictor, RoundCtx
@@ -109,6 +109,9 @@ class PacingProvider(Protocol):
     def allow(self, client_id: int, p_hat: float, now_ns: int, deadline_ns: int) -> bool:
         ...
 
+    def issue_probability(self, client_id: int, p_hat: float) -> float:
+        """Probability stored in Phi for an issued grant (may implement A3)."""
+        ...
 
 @runtime_checkable
 class PredictionProvider(Protocol):
@@ -142,6 +145,11 @@ class EstimatorHooks(Protocol):
     ) -> None:
         ...
 
+    def grant_issued(self, client_id: int, grant: OutstandingGrant, t_ns: int) -> None:
+        ...
+
+    def data_arrival(self, client_id: int, t_ns: int) -> None:
+        ...
     def on_tick(self, t_ns: int) -> None:
         ...
 
@@ -205,6 +213,11 @@ class GatewayCore:
     The caller is responsible for decoding datagrams and sending returned
     actions. No socket, scheduler policy, estimator, or aggregation algorithm
     is implemented here.
+
+    Optional ``decision_hook`` records are observational callbacks invoked
+    before grant-state mutation. Records use ``event=grant_decision`` and
+    include round/time, candidate IDs and score metadata, selected client,
+    prediction, pacing result, and (when issued) grant/position/timeout IDs.
     """
 
     def __init__(
@@ -221,6 +234,7 @@ class GatewayCore:
         aggregate: AggregateProvider | None = None,
         value_integrity: ValueIntegrityChecker | None = None,
         view: Any | None = None,
+        decision_hook: Callable[[dict[str, Any]], None] | None = None,
         retransmit: bool = True,
     ) -> None:
         self.phase = GatewayPhase.IDLE
@@ -241,6 +255,7 @@ class GatewayCore:
         self.aggregate = aggregate
         self.value_integrity = value_integrity
         self.view = view
+        self.decision_hook = decision_hook
         if not isinstance(retransmit, bool):
             raise TypeError("retransmit must be a bool")
         self.retransmit = retransmit
@@ -253,6 +268,7 @@ class GatewayCore:
         self.timed_out_grants: dict[int, set[int]] = {}
         self.round_min_value: float | None = None
         self.stats = GatewayStats()
+        self._p_hat: dict[int, float] = {}
 
     def register_client(self, client_id: int, state: ClientState) -> None:
         """Attach one connected client state before or between rounds."""
@@ -330,6 +346,7 @@ class GatewayCore:
         self.last_round_id = round_id
         self.phase = GatewayPhase.ACTIVE
         self.next_grant_id = 1
+        self._p_hat.clear()
         self.energies.clear()
         self.delivered_blocks = {client_id: set() for client_id in self.clients}
         self.resolved_grants = {client_id: {} for client_id in self.clients}
@@ -482,6 +499,7 @@ class GatewayCore:
             self._reject("READY")
             return []
         self.energies[client_id] = values.copy()
+        self._p_hat.pop(client_id, None)
         minimum = float(np.min(state.val))
         self.round_min_value = minimum if self.round_min_value is None else min(self.round_min_value, minimum)
         return self._pump(t_ns)
@@ -562,6 +580,7 @@ class GatewayCore:
             if already_delivered:
                 self.stats.duplicate_data += 1
                 if not grant_is_outstanding:
+                    self._record_data_arrival(client_id, t_ns)
                     if late_after_timeout:
                         self.stats.late_data += 1
                         self.stats.late_after_timeout += 1
@@ -577,6 +596,11 @@ class GatewayCore:
             self._reject("DATA")
             return []
 
+        # Count every valid FedGrant DATA frame that reaches the gateway,
+        # including duplicates. The delivery bitmap and learning event remain
+        # first-delivery / one-resolution state, but the rate window measures
+        # bytes that crossed the path (see RateWindow's documented contract).
+        self._record_data_arrival(client_id, t_ns)
         if self.round.mode is TransferMode.GRANT:
             active_grant = state.outstanding.get(grant_id)
             if active_grant is not None and t_ns > active_grant.timeout_ns:
@@ -605,10 +629,12 @@ class GatewayCore:
             self.stats.late_data += 1
             self.stats.late_after_timeout += 1
         if grant is not None:
-            state.outstanding.pop(grant_id, None)
-            self.resolved_grants.setdefault(client_id, {})[grant_id] = grant
             if self.estimator is not None and not late_after_timeout:
                 self.estimator.resolve(client_id, grant, True, t_ns)
+            state.outstanding.pop(grant_id, None)
+            self.resolved_grants.setdefault(client_id, {})[grant_id] = grant
+            self._remove_inflight_if_unowned(grant_id)
+            self._p_hat.pop(client_id, None)
         return self._pump(t_ns)
 
     def on_tick(self, t_ns: int) -> list[GatewayAction]:
@@ -627,6 +653,8 @@ class GatewayCore:
                 self._resolve_timeout(client_id, state, grant_id, grant, t_ns)
         if self.estimator is not None:
             self.estimator.on_tick(t_ns)
+        if self.predictor is not None and (t_ns - self.round.start_ns) % 5_000_000 == 0:
+            self._refresh_predictions(t_ns)
         return self._pump(t_ns)
 
     def on_deadline(self, t_ns: int) -> list[GatewayAction]:
@@ -643,7 +671,6 @@ class GatewayCore:
             return []
         deadline_ns = self.round.deadline_ns
         actions: list[GatewayAction] = []
-        pending_resolutions: list[tuple[int, OutstandingGrant]] = []
         for client_id, state in self.clients.items():
             for grant_id, grant in list(state.outstanding.items()):
                 self._resolve_timeout(
@@ -652,9 +679,8 @@ class GatewayCore:
                     grant_id,
                     grant,
                     deadline_ns,
-                    notify_estimator=False,
+                    notify_estimator=True,
                 )
-                pending_resolutions.append((client_id, grant))
             state.update_starve()
             actions.append(
                 SendRoundEnd(
@@ -665,8 +691,6 @@ class GatewayCore:
             )
         self.phase = GatewayPhase.DEADLINE
         if self.estimator is not None:
-            for client_id, grant in pending_resolutions:
-                self.estimator.resolve(client_id, grant, False, deadline_ns)
             self.estimator.on_deadline(deadline_ns)
         if self.aggregate is not None:
             actions.append(
@@ -691,12 +715,14 @@ class GatewayCore:
         *,
         notify_estimator: bool = True,
     ) -> None:
+        if notify_estimator and self.estimator is not None:
+            self.estimator.resolve(client_id, grant, False, t_ns)
         state.outstanding.pop(grant_id, None)
         state.mark_timeout(grant.pos)
         self.resolved_grants.setdefault(client_id, {})[grant_id] = grant
         self.timed_out_grants.setdefault(client_id, set()).add(grant_id)
-        if notify_estimator and self.estimator is not None:
-            self.estimator.resolve(client_id, grant, False, t_ns)
+        self._remove_inflight_if_unowned(grant_id)
+        self._p_hat.pop(client_id, None)
 
     def _pump(self, t_ns: int) -> list[GatewayAction]:
         if self.round is None or self.phase is not GatewayPhase.ACTIVE:
@@ -728,7 +754,22 @@ class GatewayCore:
                 p_hat = self._predict_probability(client_id, t_ns)
             if not np.isfinite(p_hat) or not 0.0 <= p_hat <= 1.0:
                 raise GatewayError("prediction probability must be finite and in [0, 1]")
-            if not self.pacing.allow(client_id, p_hat, t_ns, self.round.deadline_ns):
+            pacing_allowed = self.pacing.allow(client_id, p_hat, t_ns, self.round.deadline_ns)
+            if not pacing_allowed:
+                if self.decision_hook is not None:
+                    self.decision_hook({
+                        "event": "grant_decision",
+                        "round_id": self.round.round_id,
+                        "t_ns": t_ns,
+                        "client_id": client_id,
+                        "candidate_client_ids": tuple(int(cid) for cid in candidates.client_id),
+                        "candidate_next_values": tuple(float(v) for v in candidates.next_value),
+                        "candidate_undelivered": tuple(int(n) for n in candidates.undelivered),
+                        "rr_pointer": candidates.rr_pointer,
+                        "p_hat": p_hat,
+                        "pacing_allowed": False,
+                        "outcome": "pacing_blocked",
+                    })
                 break
             state = self.clients[client_id]
             send_pos = state.next_pos(self.retransmit)
@@ -740,11 +781,53 @@ class GatewayCore:
                 raise GatewayError("timeout_ns must be after grant issue time")
             timeout_ns = min(timeout_ns, self.round.deadline_ns)
             grant_id = self.next_grant_id
+            issue_probability = float(
+                self.pacing.issue_probability(client_id, p_hat)
+                if hasattr(self.pacing, "issue_probability")
+                else p_hat
+            )
+            if not np.isfinite(issue_probability) or not 0.0 <= issue_probability <= 1.0:
+                raise GatewayError("issued probability must be finite and in [0, 1]")
+            if self.decision_hook is not None:
+                # Emit the decision with its final identity before state mutation.
+                self.decision_hook({
+                    "event": "grant_decision",
+                    "round_id": self.round.round_id,
+                    "t_ns": t_ns,
+                    "client_id": client_id,
+                    "candidate_client_ids": tuple(int(cid) for cid in candidates.client_id),
+                    "candidate_next_values": tuple(float(v) for v in candidates.next_value),
+                    "candidate_undelivered": tuple(int(n) for n in candidates.undelivered),
+                    "rr_pointer": candidates.rr_pointer,
+                    "p_hat": p_hat,
+                    "pacing_allowed": True,
+                    "outcome": "grant_issued",
+                    "grant_id": grant_id,
+                    "send_pos": send_pos,
+                    "timeout_ns": timeout_ns,
+                })
             self.next_grant_id += 1
             state.take_position(send_pos, self.retransmit)
-            state.outstanding[grant_id] = OutstandingGrant(send_pos, t_ns, p_hat, timeout_ns)
+            grant = OutstandingGrant(send_pos, t_ns, issue_probability, timeout_ns)
+            state.outstanding[grant_id] = grant
+            if self.view is not None:
+                inflight = getattr(self.view, "inflight", None)
+                if inflight is not None and hasattr(inflight, "add"):
+                    inflight.add(grant_id, issue_probability)
+            if self.estimator is not None:
+                on_issue = getattr(self.estimator, "grant_issued", None)
+                if on_issue is not None:
+                    on_issue(client_id, grant, t_ns)
             actions.append(SendGrant(client_id, grant_id, send_pos))
         return actions
+
+    def _remove_inflight_if_unowned(self, grant_id: int) -> None:
+        """Keep an injected feature view consistent when no estimator owns Phi."""
+        if self.estimator is not None or self.view is None:
+            return
+        inflight = getattr(self.view, "inflight", None)
+        if inflight is not None and grant_id in inflight:
+            inflight.remove(grant_id)
 
     def _predict_probability(self, client_id: int, t_ns: int) -> float:
         """Run the configured Predictor on the selected client before mutation.
@@ -757,6 +840,8 @@ class GatewayCore:
         """
         if self.round is None or self.predictor is None or self.view is None:
             raise GatewayError("predictor and feature view are required")
+        if client_id in self._p_hat:
+            return self._p_hat[client_id]
         feature_view = copy.copy(self.view)
         feature_view.t_ns = t_ns - self.round.start_ns
         feature_view.D_ns = self.round.deadline_ns - self.round.start_ns
@@ -764,7 +849,25 @@ class GatewayCore:
         output = np.asarray(self.predictor.predict(inp))
         if output.shape != (1,):
             raise GatewayError("predictor must return one probability for one client")
-        return float(output[0])
+        result = float(output[0])
+        self._p_hat[client_id] = result
+        return result
+
+    def _refresh_predictions(self, t_ns: int) -> None:
+        """Refresh ready-client predictions in one batched model call."""
+        if self.round is None or self.predictor is None or self.view is None:
+            return
+        client_ids = [client_id for client_id, state in self.clients.items() if state.ready]
+        if not client_ids:
+            return
+        feature_view = copy.copy(self.view)
+        feature_view.t_ns = t_ns - self.round.start_ns
+        feature_view.D_ns = self.round.deadline_ns - self.round.start_ns
+        inp = build_pred_input([self.clients[client_id] for client_id in client_ids], feature_view)
+        output = np.asarray(self.predictor.predict(inp))
+        if output.shape != (len(client_ids),) or not np.all(np.isfinite(output)) or np.any((output < 0) | (output > 1)):
+            raise GatewayError("predictor must return one probability in [0, 1] per ready client")
+        self._p_hat.update({client_id: float(probability) for client_id, probability in zip(client_ids, output, strict=True)})
 
     def _event_allowed(self, t_ns: int) -> bool:
         return self.round is not None and self.phase is GatewayPhase.ACTIVE and self._valid_time(t_ns)
@@ -801,9 +904,23 @@ class GatewayCore:
             return
         if isinstance(arrivals, np.ndarray):
             arrivals[...] = 0
+        elif hasattr(arrivals, "reset"):
+            arrivals.reset()
         elif hasattr(arrivals, "clear"):
             arrivals.clear()
 
+    def _record_data_arrival(self, client_id: int, t_ns: int) -> None:
+        """Record a valid FedGrant DATA frame, including a repeated frame."""
+        if self.round is None or self.round.mode is not TransferMode.GRANT:
+            return
+        if self.view is not None:
+            arrivals = getattr(self.view, "arrivals", None)
+            if arrivals is not None and hasattr(arrivals, "record"):
+                arrivals.record(t_ns - self.round.start_ns, 8 * S)
+        if self.estimator is not None:
+            on_arrival = getattr(self.estimator, "data_arrival", None)
+            if on_arrival is not None:
+                on_arrival(client_id, t_ns)
     def _normalize_rho_us(self, rho_us: int | float | Mapping[int, int | float]) -> dict[int, int]:
         values = rho_us if isinstance(rho_us, Mapping) else {client_id: rho_us for client_id in self.clients}
         result: dict[int, int] = {}

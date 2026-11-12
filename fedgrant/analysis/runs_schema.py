@@ -33,10 +33,20 @@ NET_METRICS: tuple[str, ...] = (
     "eta", "delivered_blocks", "clients_represented", "deadline_completion", "goodput_bps", "utilization",
     "queue_drops_fg", "queue_drops_cross", "wasted_grants", "late_after_timeout", "late_after_deadline",
     "rtt_p50_ms", "rtt_p99_ms", "gw_cpu_pct", "gw_rss_mb", "sched_lat_p50_us", "sched_lat_p99_us",
-    "queueing_delay_mean_ms", "queueing_delay_p99_ms", "protocol_overhead",
+    "protocol_overhead", "planned_blocks", "plan_messages_sent", "data_packets_sent", "data_bytes_sent",
+    "grants_issued", "grants_delivered", "grants_timed_out", "grant_rtt_samples", "plan_data_rtt_samples",
+    "plan_data_rtt_p50_ms", "plan_data_rtt_p99_ms", "queue_drops_data",
+    "queueing_delay_mean_ms", "queueing_delay_p99_ms",
 )
 FL_METRICS: tuple[str, ...] = ("final_acc", "tta_rounds", "tta_censored", "tta_seconds")
 COLUMNS: tuple[str, ...] = (*ID_COLUMNS, *NET_METRICS, *FL_METRICS, "status")
+LEGACY_COLUMNS: tuple[str, ...] = (
+    *ID_COLUMNS,
+    "eta", "delivered_blocks", "clients_represented", "deadline_completion", "goodput_bps", "utilization",
+    "queue_drops_fg", "queue_drops_cross", "wasted_grants", "late_after_timeout", "late_after_deadline",
+    "rtt_p50_ms", "rtt_p99_ms", "gw_cpu_pct", "gw_rss_mb", "sched_lat_p50_us", "sched_lat_p99_us",
+    "protocol_overhead", *FL_METRICS, "status",
+)
 FLOAT_METRICS: tuple[str, ...] = (*NET_METRICS, "final_acc", "tta_rounds", "tta_seconds")
 
 
@@ -163,10 +173,10 @@ def read_runs_csv(path: str | Path) -> list[Run]:
     seen: set[tuple[str, str, str, int]] = set()
     with Path(path).open(newline="") as f:
         r = csv.DictReader(f)
-        # Schema v1 did not include explicit queueing-delay scalar columns.
-        # Accept that historical header and normalize absent values to blanks;
-        # all newly written files use the full v2 schema.
-        legacy_optional = {"queueing_delay_mean_ms", "queueing_delay_p99_ms"}
+        # Older summaries predate queue-delay and baseline-specific metrics.
+        # Accept those headers, but normalize absent values to blanks.
+        legacy_optional = set(COLUMNS) - set(LEGACY_COLUMNS)
+        legacy_optional.update({"queueing_delay_mean_ms", "queueing_delay_p99_ms"})
         missing = [c for c in COLUMNS if c not in (r.fieldnames or []) and c not in legacy_optional]
         if missing:
             raise RunsSchemaError(f"{path}: missing columns {missing}")

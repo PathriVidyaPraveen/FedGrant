@@ -18,14 +18,10 @@ from fedgrant.policy.constants import D_MODEL, K
 
 
 from fedgrant.policy.types import PolicyConfig
+from fedgrant.sim.run_baselines import BaselineState, run_baseline_round
 from fedgrant.sim.run_net import run_network_round
+from fedgrant.sim.seeding import network_round_seed as _network_round_seed
 
-
-def _network_round_seed(seed: int, round_id: int) -> int:
-    """Derive a deterministic, distinct simulator seed for each FL round."""
-    if round_id < 1:
-        raise ValueError("round_id must be >= 1")
-    return int(np.random.SeedSequence([seed, round_id - 1]).generate_state(1)[0])
 
 
 def aggregate_updates(updates: Sequence[np.ndarray], weights: np.ndarray) -> np.ndarray:
@@ -162,6 +158,7 @@ def run_fl_simulated(
     split: str = "test",
     trace_dir: str = "data/traces",
     policy_config: PolicyConfig | None = None,
+    transport_baseline: str | None = None,
     device: torch.device | str = "cpu",
     eval_every: int = 5,
     log_every: int = 5,
@@ -182,11 +179,16 @@ def run_fl_simulated(
         raise ValueError("client data, loaders, EF states, and weights must have matching lengths")
     if not np.isclose(weights.sum(dtype=np.float64), 1.0):
         raise ValueError("client weights must sum to 1")
+    if transport_baseline is not None:
+        transport_baseline = transport_baseline.upper()
+        if transport_baseline not in {"B2", "B3"}:
+            raise ValueError("transport_baseline must be B2 or B3")
 
     dev = torch.device(device)
     model.to(dev)
     history: list[dict[str, Any]] = []
     gateway = None
+    baseline_state: BaselineState | None = None
 
     def train_one(client_id: int, round_id: int) -> np.ndarray:
         images, labels = train_clients[client_id]
@@ -215,29 +217,58 @@ def run_fl_simulated(
             D_ns = d_ms * 1_000_000
             round_start_abs_ns = int((round_id - 1) * (1_000_000_000 + D_ns))
 
-            net_res = run_network_round(
-                round_id=round_id,
-                num_clients=n,
-                client_weights=weights,
-                client_energies=energies_sorted,
-                client_payloads=client_payloads,
-                send_orders=send_orders,
-                beta=beta,
-                scenario=scenario,
-                split=split,
-                trace_dir=trace_dir,
-                policy_config=policy_config,
-                seed=_network_round_seed(seed, round_id),
-                gateway=gateway,
-                round_start_abs_ns=round_start_abs_ns,
-            )
-            gateway = net_res["gateway"]  # Persist gateway state across rounds
+            network_seed = _network_round_seed(seed, round_id)
+            baseline_result = None
+            if transport_baseline is None:
+                net_res = run_network_round(
+                    round_id=round_id,
+                    num_clients=n,
+                    client_weights=weights,
+                    client_energies=energies_sorted,
+                    client_payloads=client_payloads,
+                    send_orders=send_orders,
+                    beta=beta,
+                    scenario=scenario,
+                    split=split,
+                    trace_dir=trace_dir,
+                    policy_config=policy_config,
+                    seed=network_seed,
+                    gateway=gateway,
+                    round_start_abs_ns=round_start_abs_ns,
+                )
+                gateway = net_res["gateway"]  # Persist gateway state across rounds
+                delivered_indices = [re.delivered_indices for re in net_res["round_ends"]]
+            else:
+                baseline_result = run_baseline_round(
+                    transport_baseline,
+                    round_id=round_id,
+                    num_clients=n,
+                    client_weights=weights,
+                    encoded_updates=enc_list,
+                    beta=beta,
+                    scenario=scenario,
+                    split=split,
+                    trace_dir=trace_dir,
+                    seed=network_seed,
+                    state=baseline_state,
+                    round_start_abs_ns=round_start_abs_ns,
+                )
+                baseline_state = baseline_result["baseline_state"]
+                round_result = baseline_result["round_result"]
+                delivered_indices = [
+                    round_result.client_results[cid].delivered_indices for cid in range(n)
+                ]
+                net_res = {
+                    "eta": baseline_result["eta"],
+                    "delivered_counts": baseline_result["delivered_counts"],
+                    "metrics": baseline_result["metrics"],
+                    "late_metrics": baseline_result["late_metrics"],
+                }
 
             # 4. Client error feedback update based on delivered ROUND_END bitmap
-            round_ends = net_res["round_ends"]
             decoded = [
-                ef.finish_round(u, re.delivered_indices)
-                for ef, u, re in zip(error_feedback, u_list, round_ends, strict=True)
+                ef.finish_round(u, indices)
+                for ef, u, indices in zip(error_feedback, u_list, delivered_indices, strict=True)
             ]
 
             # 5. Global model aggregation
@@ -252,7 +283,15 @@ def run_fl_simulated(
                 "delivered_blocks": sum(net_res["delivered_counts"]),
                 "metrics": net_res["metrics"],
                 "late_metrics": net_res["late_metrics"],
+                "rtt_samples_ns": (
+                    [] if baseline_result is not None else net_res.get("rtt_samples_ns", [])
+                ),
             }
+            if transport_baseline == "B3" and baseline_result is not None:
+                # B3 mode-2 RTT: first DATA arrival minus PLAN send, one sample
+                # per client per round. Kept separate from grant RTT samples.
+                b3_rtt = baseline_result.get("b3_rtt_samples_ns", {})
+                record["plan_data_rtt_samples_ns"] = [int(b3_rtt[cid]) for cid in sorted(b3_rtt)]
             if round_id % eval_every == 0 or round_id == num_rounds:
                 test_clients = test_client_loader()
                 loss, accuracy = evaluate(model, test_clients, dev)

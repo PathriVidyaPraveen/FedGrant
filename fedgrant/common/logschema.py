@@ -19,15 +19,22 @@ QUEUE_COLUMNS = (
     "t_mono_ns", "round_id", "interface", "qdisc", "backlog_bytes", "bytes", "packets", "drops",
     "overlimits", "queueing_delay_ms",
 )
-PROCESS_COLUMNS = ("t_mono_ns", "round_id", "process", "pid", "cpu_pct", "rss_bytes", "threads")
+PROCESS_COLUMNS = (
+    "t_mono_ns", "round_id", "process", "pid", "cpu_time_s", "wall_interval_s",
+    "cpu_pct", "rss_bytes", "threads",
+)
 ROUND_METRIC_COLUMNS = (
     "round_id", "round_start_mono_ns", "deadline_mono_ns", "eta", "delivered_blocks",
     "clients_represented", "deadline_completion", "goodput_bps", "utilization", "queue_drops_fg",
     "queue_drops_cross", "wasted_grants", "late_after_timeout", "late_after_deadline",
-    "queueing_delay_mean_ms", "queueing_delay_p99_ms", "protocol_overhead",
+    "protocol_overhead",
+    "planned_blocks", "plan_messages_sent", "data_packets_sent", "data_bytes_sent",
+    "grants_issued", "grants_delivered", "grants_timed_out",
+    "grant_rtt_samples", "plan_data_rtt_samples", "queue_drops_data",
+    "queueing_delay_mean_ms", "queueing_delay_p99_ms",
 )
-RTT_COLUMNS = ("t_mono_ns", "round_id", "rtt_ms")
-SCHEDULER_COLUMNS = ("t_mono_ns", "round_id", "latency_us")
+RTT_COLUMNS = ("t_mono_ns", "round_id", "rtt_ms", "rtt_type", "client_id")
+SCHEDULER_COLUMNS = ("t_mono_ns", "round_id", "trigger", "latency_us")
 RUN_COLUMNS = ("run_id", "experiment_id", "config_id", "policy", "seed", "scenario", "beta", "n_clients", "cross_mbps", "status", "started_mono_ns", "ended_mono_ns")
 SCHEMAS = {
     "rounds": ROUND_COLUMNS,

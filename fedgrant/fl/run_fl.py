@@ -22,6 +22,26 @@ from fedgrant.policy.constants import D_MODEL, K
 from fedgrant.policy.types import PolicyConfig
 
 
+def fl_policy_settings(policy: str) -> tuple[PolicyConfig | None, str | None]:
+    """Return the configured FL policy and optional push/plan transport mode."""
+    name = policy.upper()
+    if name in {"B2", "B3"}:
+        return None, name
+    mapping = {
+        "B4": PolicyConfig(selector="rr", predictor="ewma"),
+        "B5": PolicyConfig(selector="srpt", predictor="ewma"),
+        "B6": PolicyConfig(selector="value", predictor="ewma"),
+        "B7": PolicyConfig(selector="value", predictor="hmm"),
+        "FG-GRU": PolicyConfig(selector="value", predictor="gru"),
+        "FG-MLP": PolicyConfig(selector="value", predictor="mlp"),
+        "ORACLE": PolicyConfig(selector="value", predictor="oracle"),
+    }
+    try:
+        return mapping[name], None
+    except KeyError as exc:
+        raise ValueError(f"no end-to-end FL policy configured for {policy!r}") from exc
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as f:
@@ -138,24 +158,7 @@ def run_experiment(
             )
         metrics_path = run_dir / f"femnist_full_s{seed}.json"
     else:
-        # Map policy name to PolicyConfig
-        selector = "value"
-        predictor_name = "ewma"
-        if "rr" in pol_lower:
-            selector = "rr"
-        elif "srpt" in pol_lower:
-            selector = "srpt"
-
-        if "oracle" in pol_lower:
-            predictor_name = "oracle"
-        elif "hmm" in pol_lower:
-            predictor_name = "hmm"
-        elif "gru" in pol_lower:
-            predictor_name = "gru"
-        elif "mlp" in pol_lower:
-            predictor_name = "mlp"
-
-        cfg = PolicyConfig(selector=selector, predictor=predictor_name)
+        cfg, transport_baseline = fl_policy_settings(policy)
 
         history = run_fl_simulated(
             model=model,
@@ -171,12 +174,14 @@ def run_experiment(
             split=split,
             trace_dir=trace_dir,
             policy_config=cfg,
+            transport_baseline=transport_baseline,
             device=device,
             eval_every=eval_every,
             log_every=log_every,
             client_workers=client_workers,
         )
-        metrics_path = run_dir / f"fl_{pol_lower}_b{int(beta*100):02d}_{scenario}_s{seed}.json"
+        noef_suffix = "_noef" if no_ef else ""
+        metrics_path = run_dir / f"fl_{pol_lower}_b{int(beta*100):02d}_{scenario}_s{seed}{noef_suffix}.json"
 
     metrics_path.write_text(json.dumps({
         "seed": seed,

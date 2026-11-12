@@ -1,87 +1,104 @@
 #!/usr/bin/env bash
-# Download and preprocess LEAF FEMNIST into FedGrant's ignored data/ tree.
-# Usage: bash scripts/get_femnist.sh
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-DATA_ROOT="$ROOT/data/femnist/reproduced"
-LEAF_ROOT="$DATA_ROOT/leaf-source"
+DATA_ROOT="$ROOT/data/femnist"
 LEAF_COMMIT="09ec454a5675e32e1f0546b456b77857fdece018"
-if [[ $# -ne 0 ]]; then
-    echo "This script reproduces the full FEMNIST source; it takes no arguments." >&2
-    exit 2
+PREPROCESS_ARGS=(-s niid -sf 0.1 -k 100 -t sample --smplseed 1549786595 --spltseed 1549786796)
+OUTPUT_ROOT="${1:-$DATA_ROOT/reproduced}"
+
+# Never replace an existing dataset. Pick another output path to keep both.
+if [[ -e "$OUTPUT_ROOT" ]]; then
+  echo "Refusing to overwrite existing output: $OUTPUT_ROOT" >&2
+  exit 2
 fi
-SAMPLE_FRACTION=1.0
-
-for command in git wget unzip python3; do
-    command -v "$command" >/dev/null || {
-        echo "Required command not found: $command" >&2
-        exit 1
-    }
-done
-
-python3 - <<'PY'
-import numpy, PIL, torch
-print(f"Python dependencies available: numpy={numpy.__version__}, Pillow={PIL.__version__}, torch={torch.__version__}")
-PY
 
 mkdir -p "$DATA_ROOT"
+KEEP_BUILD=false
+if [[ -n "${FEMNIST_BUILD_ROOT:-}" ]]; then
+  BUILD_ROOT="$FEMNIST_BUILD_ROOT"
+  case "$BUILD_ROOT" in
+    "$DATA_ROOT"/.femnist-build.*) ;;
+    *) echo "FEMNIST_BUILD_ROOT must be a .femnist-build.* path under $DATA_ROOT" >&2; exit 2 ;;
+  esac
+  [[ -d "$BUILD_ROOT" ]] || { echo "Build directory not found: $BUILD_ROOT" >&2; exit 2; }
+  KEEP_BUILD=true
+else
+  BUILD_ROOT="$(mktemp -d "$DATA_ROOT/.femnist-build.XXXXXX")"
+fi
+trap 'if [[ "$KEEP_BUILD" == false && "$BUILD_OK" == true ]]; then rm -rf -- "$BUILD_ROOT"; fi' EXIT
+BUILD_OK=false
+LEAF_ROOT="$BUILD_ROOT/leaf-src"
+OUT="$BUILD_ROOT/output"
+
 if [[ ! -d "$LEAF_ROOT/.git" ]]; then
-    git clone --no-checkout https://github.com/TalwalkarLab/leaf.git "$LEAF_ROOT"
+  git clone --depth 1 --filter=blob:none --no-checkout --sparse \
+    https://github.com/TalwalkarLab/leaf.git "$LEAF_ROOT"
 fi
-if [[ "$(git -C "$LEAF_ROOT" rev-parse HEAD 2>/dev/null || true)" != "$LEAF_COMMIT" ]]; then
-    git -C "$LEAF_ROOT" fetch --depth 1 origin "$LEAF_COMMIT"
-    git -C "$LEAF_ROOT" checkout --detach "$LEAF_COMMIT"
-fi
-
-FEMNIST_DIR="$LEAF_ROOT/data/femnist"
-# The pinned LEAF converter predates Pillow 10, where Image.ANTIALIAS was removed.
-python3 - "$FEMNIST_DIR/preprocess/data_to_json.py" <<'PY'
-from pathlib import Path
-import sys
-p = Path(sys.argv[1])
-text = p.read_text(encoding="utf-8")
-p.write_text(text.replace("Image.ANTIALIAS", "Image.Resampling.LANCZOS"), encoding="utf-8")
-PY
-if ! compgen -G "$FEMNIST_DIR/data/train/*.json" >/dev/null \
-    || ! compgen -G "$FEMNIST_DIR/data/test/*.json" >/dev/null; then
-    (
-        cd "$FEMNIST_DIR"
-        ./preprocess.sh -s niid --sf "$SAMPLE_FRACTION" -k 0 -t sample \
-            --smplseed 1549786595 --spltseed 1549786796
-    )
-fi
-if ! compgen -G "$FEMNIST_DIR/data/train/*.json" >/dev/null \
-    || ! compgen -G "$FEMNIST_DIR/data/test/*.json" >/dev/null; then
-    echo "LEAF preprocessing did not create train and test JSON shards" >&2
-    exit 1
+git -C "$LEAF_ROOT" fetch --depth 1 origin "$LEAF_COMMIT"
+git -C "$LEAF_ROOT" checkout --detach "$LEAF_COMMIT"
+git -C "$LEAF_ROOT" sparse-checkout set data/femnist data/utils
+ACTUAL_COMMIT="$(git -C "$LEAF_ROOT" rev-parse HEAD)"
+if [[ "$ACTUAL_COMMIT" != "$LEAF_COMMIT" ]]; then
+  echo "LEAF checkout mismatch: expected $LEAF_COMMIT, got $ACTUAL_COMMIT" >&2
+  exit 1
 fi
 
-OUT_LEAF="$DATA_ROOT/leaf"
-mkdir -p "$OUT_LEAF/data"
-if [[ ! -d "$OUT_LEAF/data/train" || ! -d "$OUT_LEAF/data/test" ]]; then
-    cp -a "$FEMNIST_DIR/data/train" "$FEMNIST_DIR/data/test" "$OUT_LEAF/data/"
-fi
-cat > "$DATA_ROOT/provenance.json" <<EOF
+# Pillow 10 removed this alias; keep the pinned LEAF logic and apply this
+# compatibility-only source edit to the temporary checkout.
+sed -i 's/Image\.ANTIALIAS/Image.Resampling.LANCZOS/g' \
+  "$LEAF_ROOT/data/femnist/preprocess/data_to_json.py"
+# Make extraction non-interactive so a partial prior extraction is completed
+# instead of silently accepting unzip's EOF response and deleting the archive.
+sed -i -E \
+  -e 's@^wget .*by_class\.zip.*$@wget -c -q https://s3.amazonaws.com/nist-srd/SD19/by_class.zip@' \
+  -e 's@^wget .*by_write\.zip.*$@wget -c -q https://s3.amazonaws.com/nist-srd/SD19/by_write.zip@' \
+  -e 's@^unzip .*by_class\.zip.*$@unzip -oq by_class.zip@' \
+  -e 's@^unzip .*by_write\.zip.*$@unzip -oq by_write.zip@' \
+  "$LEAF_ROOT/data/femnist/preprocess/get_data.sh"
+sed -i 's@if \[ ! -d "../data/raw_data" \]; then@if [ ! -d "../data/raw_data/by_class" ] || [ ! -d "../data/raw_data/by_write" ]; then@' \
+  "$LEAF_ROOT/data/femnist/preprocess/data_to_json.sh"
+sed -i 's@mkdir ../data/raw_data@mkdir -p ../data/raw_data@' \
+  "$LEAF_ROOT/data/femnist/preprocess/data_to_json.sh"
+for script in \
+  "$LEAF_ROOT/data/femnist/preprocess/data_to_json.sh" \
+  "$LEAF_ROOT/data/femnist/preprocess.sh"; do
+  if ! grep -q '^set -euo pipefail$' "$script"; then
+    sed -i '2i set -euo pipefail' "$script"
+  fi
+done
+
+(
+  cd "$LEAF_ROOT/data/femnist"
+  ./preprocess.sh "${PREPROCESS_ARGS[@]}"
+)
+
+cd "$ROOT"
+mkdir -p "$OUT/leaf/data/train" "$OUT/leaf/data/test" "$OUT/clients"
+cp -a "$LEAF_ROOT/data/femnist/data/train/." "$OUT/leaf/data/train/"
+cp -a "$LEAF_ROOT/data/femnist/data/test/." "$OUT/leaf/data/test/"
+
+cat > "$OUT/provenance.json" <<EOF
 {
-  "source": "LEAF FEMNIST; NIST Special Database 19",
-  "source_repository": "https://github.com/TalwalkarLab/leaf.git",
-  "source_commit": "$LEAF_COMMIT",
-  "source_archives": [
-    "https://s3.amazonaws.com/nist-srd/SD19/by_class.zip",
-    "https://s3.amazonaws.com/nist-srd/SD19/by_write.zip"
-  ],
-  "preprocessing_version": "LEAF preprocess.sh; niid; sample_fraction=$SAMPLE_FRACTION; keep_min=0; split=sample; sample_seed=1549786595; split_seed=1549786796",
-  "sample_fraction": $SAMPLE_FRACTION,
-  "num_writers": 200,
-  "writers_per_client": 10
+  "source": "https://github.com/TalwalkarLab/leaf",
+  "preprocessing_version": "fedgrant-femnist-v1",
+  "leaf_commit": "$LEAF_COMMIT",
+  "preprocess_args": ["-s", "niid", "-sf", "0.1", "-k", "100", "-t", "sample", "--smplseed", "1549786595", "--spltseed", "1549786796"],
+  "compatibility_patches": ["Pillow Image.ANTIALIAS replaced with Image.Resampling.LANCZOS", "LEAF extraction is non-interactive and safely resumes partial extracts", "LEAF download checks for extracted folders so partial downloads can resume", "LEAF raw-data folder creation is idempotent", "LEAF preprocessing wrappers fail immediately on errors"],
+  "writer_selection": "first 200 writer IDs in lexicographic order from train and test output",
+  "client_grouping": "20 clients; 10 consecutive sorted writers per client",
+  "image_format": "28x28 grayscale, float32, [0,1]; no augmentation"
 }
 EOF
 
-cd "$ROOT"
-python3 -m fedgrant.fl.femnist \
-    --leaf-root "$OUT_LEAF/data" \
-    --output-dir "$DATA_ROOT/clients" \
-    --num-writers 200 --writers-per-client 10 \
-    --provenance-file "$DATA_ROOT/provenance.json"
-echo "FEMNIST data prepared under $DATA_ROOT"
+"${PYTHON:-$ROOT/.venv/bin/python}" -m fedgrant.fl.femnist \
+  --leaf-root "$OUT/leaf/data" \
+  --output-dir "$OUT/clients" \
+  --num-writers 200 \
+  --writers-per-client 10 \
+  --provenance-file "$OUT/provenance.json"
+
+mkdir -p "$(dirname "$OUTPUT_ROOT")"
+mv -- "$OUT" "$OUTPUT_ROOT"
+BUILD_OK=true
+echo "FEMNIST data prepared under $OUTPUT_ROOT"
