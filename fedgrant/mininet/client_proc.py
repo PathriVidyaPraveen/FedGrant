@@ -11,6 +11,7 @@ from pathlib import Path
 import numpy as np
 
 from fedgrant.core.client_core import ClientCore
+from fedgrant.mininet.contract import bank_update_provider, load_bank
 from fedgrant.mininet.profile_update import profile_bank, synthetic_update
 from fedgrant.common.constants import MessageType
 from fedgrant.common.logschema import PACKET_COLUMNS
@@ -18,13 +19,24 @@ from fedgrant.common.wire import decode_message, WireProtocolError
 from fedgrant.net.udp_client import UdpClient
 
 
-async def run(args: argparse.Namespace) -> None:
+def make_update_provider(args: argparse.Namespace):
+    """Bank profiles for real runs (contract Section 3); synthetic ones only for smoke runs."""
+    if args.value_bank:
+        if args.clients is None:
+            raise ValueError("--value-bank needs --clients (the bank is validated for N clients)")
+        return bank_update_provider(load_bank(args.value_bank, args.clients), args.seed, args.client_id)
     profiles = profile_bank(args.seed + args.client_id)
-    core = ClientCore(args.client_id)
 
-    def update_provider(round_id: int) -> np.ndarray:
+    def synthetic_provider(round_id: int) -> np.ndarray:
         profile = profiles[(round_id - 1) % len(profiles)]
         return synthetic_update(profile, seed=args.seed + args.client_id * 1009 + round_id)
+
+    return synthetic_provider
+
+
+async def run(args: argparse.Namespace) -> None:
+    update_provider = make_update_provider(args)
+    core = ClientCore(args.client_id)
 
     packet_path = Path(args.log_file).with_name(f"client_{args.client_id}_packets.csv")
     packet_stream = packet_path.open("w", newline="", encoding="utf-8")
@@ -78,7 +90,7 @@ async def run(args: argparse.Namespace) -> None:
             packet_stream.close()
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--client-id", type=int, required=True)
     parser.add_argument("--rounds", type=int, default=1)
@@ -86,7 +98,10 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=9000)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--log-file", required=True)
-    args = parser.parse_args()
+    parser.add_argument("--clients", type=int, default=None, help="N; required with --value-bank")
+    parser.add_argument("--value-bank", default=None,
+                        help="FULL value bank (.npz); omit only for synthetic smoke profiles")
+    args = parser.parse_args(argv)
     asyncio.run(run(args))
 
 

@@ -60,12 +60,22 @@ class FixedTimeout:
         return issue_ns + self.duration_ns
 
 
-def create_gateway(num_clients: int, *, timeout_ns: int = 100_000_000) -> GatewayCore:
-    """Gateway factory for tests; each client has unit weight and one grant in flight."""
+def create_gateway(ctx_or_num_clients, *, timeout_ns: int = 100_000_000) -> GatewayCore:
+    """Smoke/test gateway factory: one grant in flight per client.
+
+    Accepts the contract's ``MininetGatewayContext`` (as gateway_proc passes it)
+    or a plain client count (unit tests); with a context it uses its weights.
+    """
+    weights = None
+    if hasattr(ctx_or_num_clients, "num_clients"):
+        weights = [float(w) for w in ctx_or_num_clients.client_weights]
+        num_clients = ctx_or_num_clients.num_clients
+    else:
+        num_clients = ctx_or_num_clients
     if isinstance(num_clients, bool) or not 1 <= int(num_clients) <= 50:
         raise ValueError("num_clients must be in [1, 50]")
     n = int(num_clients)
-    states = {i: ClientState(i, 1.0 / n) for i in range(n)}
+    states = {i: ClientState(i, weights[i] if weights else 1.0 / n) for i in range(n)}
     # Limit the smoke provider to one in-flight grant per client; this keeps the
     # protocol exercise compact while still testing grant/timeout/retransmit state.
     for state in states.values():

@@ -16,6 +16,10 @@ from pathlib import Path
 
 from fedgrant.analysis.runs_schema import make_config_id
 from fedgrant.common.logschema import PACKET_COLUMNS, QUEUE_COLUMNS
+from fedgrant.mininet.contract import (
+    BASELINE_MODES, DEFAULT_MODELS_DIR, DEFAULT_VALUE_BANK, GRANT_POLICIES, POLICY_MODEL_FILES, STUB_POLICY,
+    check_entry_points_available, entry_points, is_baseline,
+)
 from fedgrant.mininet.crosstraffic import CrossTraffic, udp_payload_bps
 from fedgrant.mininet.profile_update import profile_bank
 from fedgrant.mininet.replay import RateReplay
@@ -32,7 +36,6 @@ from fedgrant.policy.constants import C, Q, S
 
 DEFAULT_STUB_FACTORY = "fedgrant.mininet.stub_policy:create_gateway"
 STUB_EXPERIMENT_ID = "smoke-stub"
-STUB_POLICY = "STUB-FIRST-ELIGIBLE"
 MININET_EXPERIMENTS = frozenset({"M1", "M2"})
 SCENARIOS = ("L1", "L2", "L3", "L4", "L5")
 
@@ -46,6 +49,7 @@ _CONFIG_ALIASES = {
     "trace_dir": "trace_dir", "output": "output",
     "gateway_factory": "gateway_factory", "policy": "policy", "policies": "policy",
     "experiment_id": "experiment_id", "compute_window_s": "compute_window_s",
+    "value_bank": "value_bank", "models_dir": "models_dir",
 }
 # Scenario-file keys that describe the scenario itself; they are checked
 # against the code's scenario table rather than used as run settings.
@@ -118,7 +122,13 @@ def _check_scenario_loss(config_path: Path, data: dict, scenario: str) -> None:
 
 
 def run_identity(experiment_id: str | None, policy: str | None, gateway_factory: str) -> tuple[str, str]:
-    """Return (experiment_id, policy) for meta.json, refusing to label stub output as M1/M2."""
+    """Return (experiment_id, policy) for meta.json, refusing to label stub output as M1/M2.
+
+    B1/B2/B3 run their own gateway/client processes, so --gateway-factory
+    does not apply to them.
+    """
+    if policy in BASELINE_MODES:
+        return str(experiment_id or STUB_EXPERIMENT_ID), str(policy)
     is_stub = gateway_factory == DEFAULT_STUB_FACTORY
     experiment_id = experiment_id or (STUB_EXPERIMENT_ID if is_stub else None)
     policy = policy or (STUB_POLICY if is_stub else None)
@@ -219,12 +229,44 @@ def smoke_duration_ns(beta: float, n: int, gateway_factory: str) -> int:
     return duration_ns
 
 
+def process_commands(*, python: str, policy: str, n: int, rounds: int, seed: int, duration_ns: int,
+                     compute_window_s: float, out: Path, round_state_path: Path,
+                     gateway_factory: str, value_bank: str | None, models_dir: str,
+                     profile_gateway: bool, late_drain_s: float = 0.1,
+                     round_timeout_s: float = 5.0) -> tuple[list[str], list[list[str]]]:
+    """Return the gateway command and one command per client (contract Section 2)."""
+    gw_prefix, client_prefix = entry_points(policy)
+    gw_cmd = [python, *gw_prefix, "--clients", str(n), "--rounds", str(rounds), "--seed", str(seed),
+              "--duration-ns", str(duration_ns), "--compute-window-s", repr(float(compute_window_s)),
+              "--late-drain-s", repr(float(late_drain_s)),
+              "--log-dir", str(out), "--round-state", str(round_state_path)]
+    if not is_baseline(policy):
+        gw_cmd += ["--gateway-factory", gateway_factory, "--policy", policy, "--models-dir", str(models_dir)]
+    if value_bank:
+        gw_cmd += ["--value-bank", str(value_bank)]
+    if profile_gateway:
+        gw_cmd.append("--profile-gateway")
+    client_cmds = []
+    for i in range(n):
+        cmd = [python, *client_prefix, "--client-id", str(i), "--rounds", str(rounds), "--seed", str(seed),
+               "--round-timeout-s", repr(float(round_timeout_s)), "--log-file", str(out / f"client_{i}.json")]
+        if value_bank:
+            cmd += ["--clients", str(n), "--value-bank", str(value_bank)]
+        client_cmds.append(cmd)
+    return gw_cmd, client_cmds
+
+
+def _sha256(path: Path) -> str | None:
+    return hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
+
+
 def run_experiment(*, n: int, scenario: str, seed: int, rounds: int, beta: float,
                    trace_dir: str | Path, output_dir: str | Path, cross_mbps: float = 0.0,
                    gateway_factory: str = DEFAULT_STUB_FACTORY,
                    profile_gateway: bool = False, experiment_id: str | None = None,
                    policy: str | None = None, compute_window_s: float = 1.0,
-                   config: dict | None = None) -> Path:
+                   config: dict | None = None, value_bank: str | None = None,
+                   models_dir: str = DEFAULT_MODELS_DIR) -> Path:
     """Run Mininet UDP rounds; the default stub factory is a protocol smoke test only.
 
     Every exit path stops samplers, replay threads, cross traffic, child
@@ -239,6 +281,19 @@ def run_experiment(*, n: int, scenario: str, seed: int, rounds: int, beta: float
     if not compute_window_s >= 0:
         raise ValueError("compute_window_s must be non-negative")
     experiment_id, policy = run_identity(experiment_id, policy, gateway_factory)
+    stub_run = policy == STUB_POLICY
+    if not stub_run and policy not in GRANT_POLICIES and policy not in BASELINE_MODES:
+        raise ValueError(f"policy {policy!r} has no Mininet implementation; "
+                         f"expected one of {sorted(GRANT_POLICIES | set(BASELINE_MODES))}")
+    if experiment_id in MININET_EXPERIMENTS:
+        # Spec Section 5.2/12: real runs use the FULL value bank and always
+        # record gateway CPU/RSS (sampling is otherwise opt-in).
+        value_bank = value_bank or DEFAULT_VALUE_BANK
+        profile_gateway = True
+    if value_bank is not None and not Path(value_bank).is_file():
+        raise FileNotFoundError(f"value bank not found: {value_bank} (get it from the FULL seed-0 run)")
+    if not stub_run:
+        check_entry_points_available(policy)
     out = Path(output_dir)
     if out.exists() and any(out.iterdir()):
         raise FileExistsError(f"output directory is not empty: {out}")
@@ -265,23 +320,21 @@ def run_experiment(*, n: int, scenario: str, seed: int, rounds: int, beta: float
         project_root = str(Path(__file__).resolve().parents[2])
         env["PYTHONPATH"] = project_root + os.pathsep + env.get("PYTHONPATH", "")
         py = sys.executable
-        duration_ns = smoke_duration_ns(beta, n, gateway_factory)
+        duration_ns = smoke_duration_ns(beta, n, DEFAULT_STUB_FACTORY if stub_run else policy)
+        gw_cmd, client_cmds = process_commands(
+            python=py, policy=policy, n=n, rounds=rounds, seed=seed, duration_ns=duration_ns,
+            compute_window_s=compute_window_s, out=out, round_state_path=round_state_path,
+            gateway_factory=gateway_factory, value_bank=value_bank, models_dir=models_dir,
+            profile_gateway=profile_gateway)
         gateway_log = (out / "gateway.log").open("w", encoding="utf-8")
         log_handles.append(gateway_log)
-        gw_cmd = [py, "-m", "fedgrant.mininet.gateway_proc", "--clients", str(n), "--rounds", str(rounds),
-                  "--duration-ns", str(duration_ns), "--compute-window-s", repr(float(compute_window_s)),
-                  "--gateway-factory", gateway_factory, "--log-dir", str(out),
-                  "--round-state", str(round_state_path)]
-        if profile_gateway:
-            gw_cmd.append("--profile-gateway")
         if roles["pinning_enabled"] and roles["gateway"] is not None:
             gw_cmd = ["taskset", "-c", str(roles["gateway"]), *gw_cmd]
         processes.append(net.get("gw").popen(gw_cmd, stdout=gateway_log, stderr=subprocess.STDOUT, env=env))
         for i in range(n):
             client_log = (out / f"client_{i}.log").open("w", encoding="utf-8")
             log_handles.append(client_log)
-            cmd = [py, "-m", "fedgrant.mininet.client_proc", "--client-id", str(i), "--rounds", str(rounds),
-                   "--seed", str(seed), "--log-file", str(out / f"client_{i}.json")]
+            cmd = client_cmds[i]
             if roles["pinning_enabled"] and roles["clients"]:
                 cmd = ["taskset", "-c", str(roles["clients"][i % len(roles["clients"])]), *cmd]
             processes.append(net.get(f"c{i}").popen(cmd, stdout=client_log, stderr=subprocess.STDOUT, env=env))
@@ -358,7 +411,7 @@ def run_experiment(*, n: int, scenario: str, seed: int, rounds: int, beta: float
             process_sampler.stop()
             process_sampler = None
         enrich_round_metrics(out, cross_mbps=cross_mbps)
-        if gateway_factory == DEFAULT_STUB_FACTORY:
+        if stub_run:
             summary_path = out / "gateway_summary.json"
             summary = json.loads(summary_path.read_text(encoding="utf-8"))
             accepted = sum(int(row.get("accepted_data", 0)) for row in summary)
@@ -387,7 +440,16 @@ def run_experiment(*, n: int, scenario: str, seed: int, rounds: int, beta: float
                        if config else None),
             "compute_window_s": float(compute_window_s), "duration_ns": int(duration_ns),
             "started_mono_ns": started, "ended_mono_ns": time.monotonic_ns(),
-            "gateway_factory": gateway_factory, "trace_dir": str(trace_dir),
+            "gateway_factory": None if is_baseline(policy) else gateway_factory,
+            "gateway_entry_point": " ".join(entry_points(policy)[0][1:]),
+            "client_entry_point": " ".join(entry_points(policy)[1][1:]),
+            "value_bank": ({"path": str(value_bank), "sha256": _sha256(Path(value_bank))}
+                           if value_bank else None),
+            "profile_source": "value_bank" if value_bank else "synthetic",
+            "models_dir": str(models_dir),
+            "model_sha256": {name: _sha256(Path(models_dir) / name)
+                             for name in POLICY_MODEL_FILES.get(policy, ())},
+            "trace_dir": str(trace_dir),
             "trace_files": sorted(trace_hashes), "trace_sha256": trace_hashes,
             "trace_source": (trace_root.joinpath("SOURCE").read_text(encoding="utf-8")
                              if trace_root.joinpath("SOURCE").is_file() else None),
@@ -462,7 +524,8 @@ def run_experiment(*, n: int, scenario: str, seed: int, rounds: int, beta: float
 
 _DEFAULTS = {"clients": 3, "scenario": "L2", "seed": 0, "rounds": 1, "beta": 0.10, "cross_mbps": 0.0,
              "trace_dir": "data/traces", "gateway_factory": DEFAULT_STUB_FACTORY, "compute_window_s": 1.0,
-             "experiment_id": None, "policy": None, "output": None, "profile_gateway": False}
+             "experiment_id": None, "policy": None, "output": None, "profile_gateway": False,
+             "value_bank": None, "models_dir": DEFAULT_MODELS_DIR}
 
 
 def resolve_cli(argv: list[str] | None = None) -> dict:
@@ -481,6 +544,9 @@ def resolve_cli(argv: list[str] | None = None) -> dict:
     parser.add_argument("--experiment-id", dest="experiment_id")
     parser.add_argument("--policy")
     parser.add_argument("--compute-window-s", dest="compute_window_s", type=float)
+    parser.add_argument("--value-bank", dest="value_bank",
+                        help=f"FULL value bank .npz (default for M1/M2: {DEFAULT_VALUE_BANK})")
+    parser.add_argument("--models-dir", dest="models_dir")
     parser.add_argument("--profile-gateway", dest="profile_gateway", action="store_true", default=None,
                         help="collect gateway process CPU/RSS and scheduler-latency samples")
     args = vars(parser.parse_args(argv))
@@ -508,7 +574,8 @@ def main(argv: list[str] | None = None) -> None:
                           gateway_factory=s["gateway_factory"], profile_gateway=bool(s["profile_gateway"]),
                           experiment_id=s["experiment_id"],
                           policy=s["policy"], compute_window_s=float(s["compute_window_s"]),
-                          config=s if "config_path" in s else None)
+                          config=s if "config_path" in s else None, value_bank=s["value_bank"],
+                          models_dir=s["models_dir"])
     print(path)
 
 

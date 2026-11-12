@@ -11,7 +11,7 @@ help:
 	  'test-pure     Run unit tests that do not require PyTorch' \
 	  'test-ml       Run the PyTorch FEMNIST and simulator integration tests' \
 	  'test-mininet  Run root-required Mininet integration tests' \
-	  'trace-fetch   Copy existing licensed Mahimahi traces (offline)' \
+	  'trace-fetch   Copy licensed Mahimahi traces (offline; skips if present, FORCE=1 replaces)' \
 	  'trace-bin     Bin raw .up traces into CSVs' \
 	  'data          Prepare trace CSV splits from local raw traces' \
 	  'mininet-smoke Run one three-client Mininet round (requires root)' \
@@ -47,8 +47,12 @@ mininet-run:
 	@test -n "$(CONFIG)" || (echo 'Set CONFIG=<yaml> (e.g. configs/grids/mn_m1.yaml) and SEED=<s>' >&2; exit 2)
 	sudo $(PYTHON) -m fedgrant.mininet.run_mininet --config $(CONFIG) --seed $(or $(SEED),0) $(ARGS)
 
+# get_traces.sh writes SOURCE last, so its presence means a completed copy.
+# Re-running `make data` keeps those traces; FORCE=1 replaces them.
 trace-fetch:
-	bash scripts/get_traces.sh
+	@if [ -f data/traces/SOURCE ] && [ -z "$(FORCE)" ]; then \
+	  echo 'data/traces/SOURCE exists; keeping traces (make trace-fetch FORCE=1 to replace)'; \
+	else bash scripts/get_traces.sh $(if $(FORCE),--force); fi
 
 trace-bin:
 	$(PYTHON) scripts/bin_traces.py
