@@ -36,6 +36,7 @@ from fedgrant.common.wire import WireProtocolError, decode_message, encode_messa
 from fedgrant.core.estimators import RateWindow, rtt_update
 from fedgrant.core.state import ClientState
 from fedgrant.encoder.blocks import values as block_values
+from fedgrant.encoder.ef import bitmap_from_indices, indices_from_bitmap
 from fedgrant.policy.constants import C as DEFAULT_C
 from fedgrant.policy.constants import L as L_DEFAULT
 from fedgrant.policy.plan import (
@@ -48,6 +49,7 @@ from fedgrant.policy.plan import (
 
 log = logging.getLogger(__name__)
 _NANOSECONDS_PER_SECOND = 1_000_000_000
+ROUND_END_GRACE_NS = 200_000_000  # Section 9: ROUND_END fallback after D
 # The spec defines the EWMA weight but no prior; keep an unobserved client conservative.
 B3_DELIVERY_RATIO_INIT = 0.1
 
@@ -165,6 +167,9 @@ class B3GatewayCore:
         self.budget: int | None = None
         self.median_rtt_ns: float | None = None
         self.rtt_samples_ns: dict[int, int] = {}
+        # (send_pos, arrival_ns) of the first accepted DATA that produced each
+        # client's rtt_samples_ns entry; kept for raw logs, value unchanged.
+        self.rtt_first_data: dict[int, tuple[int, int]] = {}
         self.plan_srtt_ns: dict[int, int] = {}
         self.transmission_start_ns: dict[int, int] = {}
         self._plan_computed = False
@@ -325,6 +330,7 @@ class B3GatewayCore:
             sample = received_ns - self.plans[cid].sent_ns
             rtt_update(self.states[cid], sample)
             self.rtt_samples_ns[cid] = sample
+            self.rtt_first_data[cid] = (int(send_pos), int(received_ns))
         self._advance_rate_window(cid, received_ns, backlogged=None)
         self.windows[cid].add_delivery(
             received_ns,
@@ -462,9 +468,22 @@ class B3UdpGateway(asyncio.DatagramProtocol):
             raise B3PlanError("endpoint client_id is not registered")
         self.endpoints[client_id] = _endpoint(endpoint)
 
-    def start_round(self, round_id: int) -> B3GatewayCore:
+    def start_round(self, round_id: int, *, rho_us: Mapping[int, int] | None = None) -> B3GatewayCore:
+        """Send ROUND_START (mode PLAN) to every client and schedule t_plan and D.
+
+        ``rho_us`` gives each client's readiness delay (Section 3.1); the
+        default 0 keeps the previous behaviour.
+        """
         if self.transport is None:
             raise B3PlanError("B3 gateway is not bound")
+        rho_by_client = {cid: 0 for cid in self.endpoints}
+        if rho_us is not None:
+            if set(rho_us) != set(self.endpoints):
+                raise B3PlanError("rho_us must contain exactly the configured clients")
+            for cid, value in rho_us.items():
+                if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 0xFFFFFFFF:
+                    raise B3PlanError("rho_us values must be u32 integers")
+            rho_by_client = dict(rho_us)
         if self.core is not None and not self.core._finished:
             raise B3PlanError("previous B3 round has not finished")
         if self.core is not None and round_id <= self.core.round_id:
@@ -501,7 +520,7 @@ class B3UdpGateway(asyncio.DatagramProtocol):
                     "deadline_ns": deadline_ns,
                     "K": self.core.K,
                     "L": self.L,
-                    "rho_us": 0,
+                    "rho_us": rho_by_client[cid],
                     "mode": int(TransferMode.PLAN),
                 },
             )
@@ -543,6 +562,24 @@ class B3UdpGateway(asyncio.DatagramProtocol):
     def connection_lost(self, exc: Exception | None) -> None:
         self.transport = None
         self._closed_event.set()
+
+    def send_round_end(self, result: B3RoundResult) -> None:
+        """Send ROUND_END with each client's delivered-block bitmap (Section 8)."""
+        core = self.core
+        if core is None or result.round_id != core.round_id:
+            raise B3PlanError("ROUND_END must match the current B3 round")
+        for cid in self.endpoints:
+            delivered = result.round_result.client_results[cid].delivered_indices
+            self._send_message(
+                MessageType.ROUND_END,
+                client_id=cid,
+                t_send_ns=self.clock_ns(),
+                body={
+                    "K": core.K,
+                    "n_delivered": len(delivered),
+                    "bitmap": bitmap_from_indices(delivered, core.K),
+                },
+            )
 
     async def wait(self) -> B3RoundResult:
         if self.core is None or self._deadline_task is None:
@@ -667,6 +704,13 @@ class B3UdpClient(asyncio.DatagramProtocol):
         self.last_transfer: B2ClientTransfer | None = None
         self.plan_start_ns: int | None = None
         self.rejected_datagrams = 0
+        self._ready_handle: asyncio.TimerHandle | None = None
+        self._round_end_handle: asyncio.TimerHandle | None = None
+        self._round_end_event = asyncio.Event()
+        self.last_finished_round_id: int | None = None
+        self.last_delivered_indices: tuple[int, ...] = ()
+        self.round_end_timeouts = 0
+        self.ready_sent_ns: int | None = None
 
     @classmethod
     async def bind(
@@ -720,6 +764,8 @@ class B3UdpClient(asyncio.DatagramProtocol):
                 self._handle_round_start(message)
             elif message.message_type is MessageType.PLAN:
                 self._handle_plan(message)
+            elif message.message_type is MessageType.ROUND_END:
+                self._handle_round_end(message)
             else:
                 raise B3PlanError("unexpected B3 gateway message type")
         except (B3PlanError, WireProtocolError, B2TransferError, ValueError, TypeError):
@@ -758,7 +804,19 @@ class B3UdpClient(asyncio.DatagramProtocol):
             raise B3PlanError("ROUND_START event completed without a round ID")
         return self._round_id
 
+    async def wait_for_round_end(self, timeout: float | None = None) -> int:
+        """Wait until ROUND_END (or the 200 ms post-deadline fallback) finishes a round."""
+        await asyncio.wait_for(self._round_end_event.wait(), timeout=timeout)
+        self._round_end_event.clear()
+        if self.last_finished_round_id is None:
+            raise B3PlanError("round-end event completed without a finished round")
+        return self.last_finished_round_id
+
     async def close(self) -> None:
+        for handle in (self._ready_handle, self._round_end_handle):
+            if handle is not None:
+                handle.cancel()
+        self._ready_handle = self._round_end_handle = None
         if self._plan_task is not None and not self._plan_task.done():
             self._plan_task.cancel()
             await asyncio.gather(self._plan_task, return_exceptions=True)
@@ -769,6 +827,7 @@ class B3UdpClient(asyncio.DatagramProtocol):
             transport.close()
 
     def _handle_round_start(self, message) -> None:
+        received_ns = self.clock_ns()  # rho_i is measured from ROUND_START receipt
         if self.core.round is not None:
             raise B3PlanError("ROUND_START arrived while a B3 round is active")
         if message.body["mode"] != int(TransferMode.PLAN):
@@ -790,18 +849,75 @@ class B3UdpClient(asyncio.DatagramProtocol):
         self._round_start_event.clear()
         self._round_start_event.set()
         self._plan_event.clear()
+        self._round_end_event.clear()
         self.last_transfer = None
         self.plan_start_ns = None
+        self.ready_sent_ns = None
+        round_id = message.round_id
+        loop = asyncio.get_running_loop()
+        if self._round_end_handle is not None:
+            self._round_end_handle.cancel()
+        # Section 9: without ROUND_END within 200 ms after D, every block is undelivered.
+        fallback_s = max(0.0, (self._deadline_ns + ROUND_END_GRACE_NS - self.clock_ns()) / _NANOSECONDS_PER_SECOND)
+        self._round_end_handle = loop.call_later(fallback_s, self._round_end_timeout, round_id)
+        rho_us = int(message.body["rho_us"])
+        if rho_us == 0:
+            self._send_ready(round_id, energies)
+        else:
+            # Section 2.1: on ROUND_START, wait the readiness delay rho_i, then
+            # READY. Time spent preparing the update counts toward rho_i.
+            remaining_ns = received_ns + rho_us * 1_000 - self.clock_ns()
+            self._ready_handle = loop.call_later(
+                max(0.0, remaining_ns / _NANOSECONDS_PER_SECOND), self._send_ready, round_id, energies
+            )
+
+    def _send_ready(self, round_id: int, energies: tuple[float, ...]) -> None:
+        self._ready_handle = None
+        if self.core.round is None or self.core.round.round_id != round_id:
+            return
+        self.ready_sent_ns = self.clock_ns()
         self._send(
             encode_message(
                 MessageType.READY,
-                round_id=message.round_id,
+                round_id=round_id,
                 client_id=self.core.client_id,
-                t_send_ns=self.clock_ns(),
+                t_send_ns=self.ready_sent_ns,
                 body={"K": len(energies), "energy": energies},
                 block_length=self.core.error_feedback.L,
             )
         )
+
+    def _handle_round_end(self, message) -> None:
+        current = self.core.round
+        if current is None or message.round_id != current.round_id:
+            raise B3PlanError("ROUND_END does not match the active B3 round")
+        if message.body["K"] != current.encoded.K:
+            raise B3PlanError("ROUND_END K does not match the active B3 round")
+        delivered = tuple(int(i) for i in indices_from_bitmap(message.body["bitmap"], current.encoded.K))
+        if len(delivered) != message.body["n_delivered"]:
+            raise B3PlanError("ROUND_END n_delivered disagrees with its bitmap")
+        self._finish_round(message.round_id, delivered)
+
+    def _round_end_timeout(self, round_id: int) -> None:
+        self._round_end_handle = None
+        if self.core.round is not None and self.core.round.round_id == round_id:
+            self.round_end_timeouts += 1
+            self._finish_round(round_id, ())
+
+    def _finish_round(self, round_id: int, delivered: tuple[int, ...]) -> None:
+        if self.core.round is None or self.core.round.round_id != round_id:
+            return  # already finished (e.g. by an out-of-band delivery result)
+        for handle in (self._ready_handle, self._round_end_handle):
+            if handle is not None:
+                handle.cancel()
+        self._ready_handle = self._round_end_handle = None
+        task = self._plan_task
+        if task is not None and task.done() and not task.cancelled() and task.exception() is None:
+            self.last_transfer = task.result()  # transfer of this round, for raw logs
+        self.core.finish_round(round_id, delivered)
+        self.last_finished_round_id = round_id
+        self.last_delivered_indices = delivered
+        self._round_end_event.set()
 
     def _handle_plan(self, message) -> None:
         if (
