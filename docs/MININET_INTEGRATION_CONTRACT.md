@@ -96,7 +96,7 @@ Required behaviour of every gateway process:
 - **Logs:** write these files in `--log-dir` using the column tuples in `fedgrant/common/logschema.py`:
   - `round_metrics.csv` (`ROUND_METRIC_COLUMNS`; `wasted_grants` blank for push/plan/tcp, per the summary schema);
   - `packets.csv` (`PACKET_COLUMNS`);
-  - `rtt_samples.csv` (`RTT_COLUMNS`; B3 writes its one PLAN→first-DATA sample per client per round with `rtt_type=plan_first_data`);
+  - `rtt_samples.csv` (`RTT_COLUMNS`; B3 writes its one PLAN→first-DATA sample per client per round with `rtt_type=plan_data`, the type name `raw_metrics.run_row`, `run_grid` and the summary schema use; any other name is rejected by `raw_metrics`);
   - `gateway_summary.json` (a list with one dict per round: `round_id`, `accepted_data`, `rejected_data`, `invalid_events`).
 
   Reusing `LoggingUdpGateway` or its writers is preferred.
@@ -134,3 +134,20 @@ A failed run writes `run_failure.json` and no `meta.json`. For M1/M2 the runner 
 1. Is the `MininetGatewayContext` field list enough for FG-GRU (Praveen)?
 2. Will baseline processes reuse `gateway_proc`'s round loop, or a shared helper extracted from it? I can extract `run_rounds(core_like, args)` if that helps.
 3. Does M2 (FL over Mininet) need the FL server on `srv`? That is outside this contract; it is Prajin's M2 task.
+
+## Implementation status against this contract (Prajin, 2026-11-13)
+
+Added for review; Tejaswi's sections above are unchanged except the `rtt_type` name in §2.
+
+| Contract item | Implementation | Which side should change |
+|---|---|---|
+| §1 `create_gateway(ctx: MininetGatewayContext)` | `fedgrant.mininet.production:create_gateway` is the `--gateway-factory` for B4, B6 and FG-GRU; verified through `gateway_proc.build_context` + `contract.build_gateway` and the real `serve` path over localhost. `create_b4_gateway` / `create_b6_gateway` / `create_fg_gru_gateway` take a bare client count for direct callers only. | — |
+| §1 weights, seed, ε = 0, no sockets/threads, explicit model errors | Implemented and tested. | — |
+| §2 baseline entry points, CLI, ports, log files, `gateway_summary.json` keys | `fedgrant.mininet.baseline_proc` (`--mode tcp\|push\|plan`, `--value-bank`, …) as specified. B3 PLAN→first-DATA RTT rows use `rtt_type=plan_data`; the producing `send_pos` is in `rounds.csv` (`plan_data_rtt` events) and, for FL over the simulator, in history (`plan_data_rtt_send_pos`). | — |
+| §2 round loop and late drain | Baseline gateways use `round_loop.run_round_loop` (hook-based, asynchronous steps), which publishes the same active → drain → idle round-state phases as `run_rounds` and also clears the active flag if a round fails or is cancelled. | — |
+| §3 payload seed `SeedSequence([seed, r - 1, 2, i])` | Implemented as written; baseline clients use the same bank-backed profile. | — |
+| §3 (not stated) error feedback in network-only runs | Baseline clients run with error feedback disabled so READY energies equal the bank profile, as in the M-sim twins (design decision D-19). `client_proc` still constructs `ClientCore(i)` with error feedback on. | Contract and `client_proc`: state it and construct `ClientCore(i, error_feedback=False)` for M1. |
+| §3 "payload energies pass the gateway's 2% value-integrity check" | The production gateway (like the simulator's) is built without a `ValueIntegrityChecker`, so the check is not active in either. | Decide whether production should enable it (spec Section 9); open. |
+| ρi | `gateway_proc` still sends ρ = 0; `round_loop.readiness_delays_us(seed, r, N, D)` reproduces the simulator's readiness draws and is used by the baseline processes. | Runner: pass `rho_us` from that helper to `on_round_start`. |
+| §5 acceptance / M1 | Not yet run: needs the real `data/bank/femnist_full_s0.npz` and a Mininet host. | — |
+| Open question 3 (M2) | FL over Mininet (model broadcast from `srv`, real FEMNIST updates, aggregation) is not implemented. | Prajin (M2), with Jayadev for FEMNIST data. |

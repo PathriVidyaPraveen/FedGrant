@@ -555,8 +555,14 @@ def run_network_round(
     """Execute one simulated round (Section 6).
 
     ``decision_hook`` receives pre-mutation grant decisions. ``event_hook``
-    reports round start, received READY/DATA, scheduler ticks and deadline;
-    DATA is reported only at gateway arrival, never at link enqueue/drop.
+    reports round start, received READY/DATA, scheduler ticks and deadline,
+    interleaved in order with the same ``grant_decision`` records given to
+    ``decision_hook`` (GatewayCore's record plus the simulator schema fields
+    ``selection_method``, ``selected_client_id``, ``p_pacing``, ``p_target``;
+    pacing-blocked decisions carry ``None`` grant fields). DATA is reported only at gateway arrival, never
+    at link enqueue/drop; late DATA drained after the deadline is reported
+    with ``t_ns > D``. Link/loss/queue internals are never reported. Every
+    record carries round-relative ``t_ns`` and absolute ``abs_t_ns``.
     These diagnostic hooks do not feed back into simulation decisions.
     """
     cfg = policy_config or PolicyConfig(selector="value", predictor="ewma")
