@@ -84,5 +84,23 @@ class GilbertElliottModel:
             return cls(**cls.L3_PARAMS, seed=seed)
         raise ValueError(f"Unknown loss scenario '{scenario}'; must be L1, L2, L3, L4, L5, or X2")
 
+    @classmethod
+    def for_loss_burst(cls, pi: float, mean_burst_length: float, seed: int | None = None) -> GilbertElliottModel:
+        """Build a GE chain from stationary loss rate and mean bad-state run length.
+
+        For stationary loss rate ``pi = p / (p + r)`` and mean burst length
+        ``1 / r``, the corresponding transitions are ``r = 1 / burst`` and
+        ``p = pi * r / (1 - pi)``.
+        """
+        loss = float(pi)
+        burst = float(mean_burst_length)
+        if not np.isfinite(loss) or not 0.0 <= loss < 1.0:
+            raise ValueError("pi must be finite and in [0, 1)")
+        if not np.isfinite(burst) or burst < 1.0:
+            raise ValueError("mean_burst_length must be finite and >= 1")
+        r = 1.0 / burst
+        p = loss * r / (1.0 - loss)
+        return cls(p=p, r=r, seed=seed)
+
 
 __all__ = ["GilbertElliottModel"]

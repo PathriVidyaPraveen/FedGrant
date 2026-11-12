@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -193,26 +194,45 @@ def test_round_seed_matches_fl_server_seedsequence_convention() -> None:
     assert seed != network_round_seed(17, 10)
 
 
-def test_unsupported_modes_are_recorded_blocked_not_as_success(tmp_path: Path) -> None:
+def _write_fl_inputs(root: Path, monkeypatch) -> None:
+    """Valid FEMNIST manifest/provenance and FULL seeds 0-2 under ``root``."""
+    shards = root / "femnist" / "clients"
+    shards.mkdir(parents=True)
+    (shards / "manifest.json").write_text('{"fixture": true}\n')
+    provenance = root / "femnist" / "provenance.json"
+    provenance.write_text('{"fixture": true}\n')
+    full_dir = root / "full"
+    full_dir.mkdir()
+    for seed in range(3):
+        (full_dir / f"femnist_full_s{seed}.json").write_text(json.dumps({
+            "seed": seed, "rounds": 300, "policy": "full", "error_feedback": True, "num_clients": 20,
+            "dataset": {"source": "fixture", "provenance_sha256": hashlib.sha256(provenance.read_bytes()).hexdigest()},
+            "history": [{"round": r, "test_accuracy": 0.8} for r in range(5, 301, 5)],
+        }))
+    monkeypatch.setattr(run_grid_module, "FEMNIST_SHARD_ROOT", shards)
+    monkeypatch.setattr(run_grid_module, "FULL_REFERENCE_DIR", full_dir)
+    monkeypatch.setattr(run_grid_module, "FL_RECORD_DIR", full_dir)
+
+
+def test_unsupported_modes_are_recorded_blocked_not_as_missing(tmp_path: Path) -> None:
     job = next(job for job in expand_grid(["M1"]) if job["policy"] == "B4")
 
     def must_not_run(**kwargs):
         raise AssertionError("blocked mode reached the simulator")
 
-    row = execute_job(job, tmp_path, simulation_runner=must_not_run)
-    assert row["status"] == "missing"
+    record = execute_job(job, tmp_path, simulation_runner=must_not_run)
+    assert record["status"] == "blocked" and record["availability"] == "blocked"
+    assert record["run_id"] == job["run_id"] and record["config_id"] == job["config_id"]
+    assert json.loads(record["reasons_json"]) == record["block_reasons"]
+    assert record["recorded_at_utc"]
     run_dir = tmp_path / job["experiment_id"] / job["run_id"]
     meta = json.loads((run_dir / "meta.json").read_text())
-    assert meta["execution_state"] == "blocked"
+    assert meta["execution_state"] == "blocked" and meta["status"] == "blocked"
+    assert "summary_row" not in meta
     assert "client" in meta["block_reasons"][0]
     assert "N" in meta and "n_clients" not in meta
-    assert set(name for name in (
-        "round_metrics.csv", "packets.csv", "queues.csv", "rtt_samples.csv",
-        "scheduler_samples.csv", "processes.csv",
-    ) if (run_dir / name).is_file()) == {
-        "round_metrics.csv", "packets.csv", "queues.csv", "rtt_samples.csv",
-        "scheduler_samples.csv", "processes.csv",
-    }
+    # Blocked jobs get no fabricated (header-only) result logs.
+    assert not any((run_dir / name).exists() for name in ("run.csv", "round_metrics.csv", "packets.csv"))
 
 
 def test_unsupported_baseline_jobs_are_recorded_blocked_not_as_grant_runs(tmp_path: Path) -> None:
@@ -224,21 +244,24 @@ def test_unsupported_baseline_jobs_are_recorded_blocked_not_as_grant_runs(tmp_pa
     ]
     for job in selected:
         row = execute_job(job, tmp_path, simulation_runner=lambda **kwargs: pytest.fail("blocked adapter executed"))
-        assert row["status"] == "missing"
+        assert row["status"] == "blocked"
         meta = json.loads((tmp_path / job["experiment_id"] / job["run_id"] / "meta.json").read_text())
         assert meta["execution_state"] == "blocked"
         assert meta["block_reasons"]
+    m2_reasons = _adapter_block_reasons(selected[2], tmp_path)
+    assert any("not substitutes" in reason for reason in m2_reasons)
 
 
 def test_fl_jobs_stay_on_the_fl_entrypoint(tmp_path: Path, monkeypatch) -> None:
+    _write_fl_inputs(tmp_path / "inputs", monkeypatch)
     job = next(
         job for job in expand_grid(["F-main"])
-        if job["policy"] == "FG-GRU" and job["seed"] == 0
+        if job["policy"] == "FG-GRU" and job["seed"] == 0 and job["scenario"] == "L2"
     )
     called = []
 
-    def fake_fl_job(received_job, raw_dir, *, trace_dir):
-        called.append((received_job, raw_dir, trace_dir))
+    def fake_fl_job(received_job, raw_dir, *, trace_dir, tc_s):
+        called.append((received_job, raw_dir, trace_dir, tc_s))
         return {"execution": "fl"}
 
     monkeypatch.setattr(run_grid_module, "_execute_fl_job", fake_fl_job)
@@ -248,28 +271,94 @@ def test_fl_jobs_stay_on_the_fl_entrypoint(tmp_path: Path, monkeypatch) -> None:
         simulation_runner=lambda **kwargs: pytest.fail("FL job reached simulator"),
     )
     assert result == {"execution": "fl"}
-    assert called == [(job, tmp_path, Path("data/traces"))]
+    assert called == [(job, tmp_path, Path("data/traces"), 1.0)]
 
 
-def test_fl_baseline_jobs_are_blocked_without_simulator_telemetry(tmp_path: Path) -> None:
+@pytest.mark.parametrize("policy", ["B2", "B3"])
+def test_f_main_baselines_are_available_through_fl_transport_adapters(policy, tmp_path: Path, monkeypatch) -> None:
     job = next(
         job for job in expand_grid(["F-main"])
-        if job["policy"] == "B2" and job["seed"] == 0
+        if job["policy"] == policy and job["seed"] == 0 and job["scenario"] == "L2"
     )
-    reasons = _adapter_block_reasons(job, tmp_path)
-    assert any("B2 FL transport adapter" in reason for reason in reasons)
+    # Without FEMNIST shards / FULL references the job is blocked, not missing.
+    monkeypatch.setattr(run_grid_module, "FEMNIST_SHARD_ROOT", tmp_path / "absent")
+    monkeypatch.setattr(run_grid_module, "FULL_REFERENCE_DIR", tmp_path / "absent")
+    blocked = execute_job(job, tmp_path / "raw", simulation_runner=lambda **kwargs: pytest.fail("reached simulator"))
+    assert blocked["status"] == "blocked"
+    assert any("FEMNIST client shards" in reason for reason in blocked["block_reasons"])
+    assert not any("transport adapter" in reason for reason in blocked["block_reasons"])
 
-    row = execute_job(
-        job,
-        tmp_path,
-        simulation_runner=lambda **kwargs: pytest.fail("FL baseline reached simulator"),
-    )
-    assert row["status"] == "missing"
-    run_dir = tmp_path / job["experiment_id"] / job["run_id"]
-    metadata = json.loads((run_dir / "meta.json").read_text())
-    assert metadata["execution_state"] == "blocked"
-    assert any("B2 FL transport adapter" in reason for reason in metadata["block_reasons"])
-    assert not (run_dir / "packets.csv").exists()
+    _write_fl_inputs(tmp_path / "inputs", monkeypatch)
+    assert _adapter_block_reasons(job, tmp_path) == []
+    calls = []
+    monkeypatch.setattr(run_grid_module, "_execute_fl_job", lambda j, *_a, **_k: calls.append(j) or {"execution": "fl"})
+    assert execute_job(job, tmp_path / "raw") == {"execution": "fl"}
+    assert calls == [job]
+
+
+def test_fl_transport_adapter_unavailability_is_reported(monkeypatch) -> None:
+    from fedgrant.fl import server as fl_server
+
+    run_grid_module._fl_adapter_reasons.cache_clear()
+    monkeypatch.delattr(fl_server, "run_baseline_round")
+    try:
+        reasons = run_grid_module._fl_adapter_reasons("B3")
+    finally:
+        run_grid_module._fl_adapter_reasons.cache_clear()
+    assert reasons == ("B3 FL transport adapter is unavailable in fedgrant.fl.server",)
+
+
+def test_dry_run_and_dispatch_report_identical_availability(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(run_grid_module, "VALUE_BANK_PATH", tmp_path / "no-bank.npz")
+    monkeypatch.setattr(run_grid_module, "FEMNIST_SHARD_ROOT", tmp_path / "absent")
+    monkeypatch.setattr(run_grid_module, "FULL_REFERENCE_DIR", tmp_path / "absent")
+    jobs = [
+        next(job for job in expand_grid(["N-main"]) if job["policy"] == "B4"),
+        next(job for job in expand_grid(["N-main"]) if job["policy"] == "B3"),
+        next(job for job in expand_grid(["F-main"]) if job["policy"] == "B2"),
+        next(job for job in expand_grid(["F-ref"])),
+        next(job for job in expand_grid(["M2"])),
+    ]
+    planned = run_grid_module.plan_availability(jobs, tmp_path)
+    for job, reasons in planned:
+        assert reasons, job["run_id"]
+        record = execute_job(job, tmp_path / "raw", trace_dir=tmp_path)
+        assert record["status"] == "blocked"
+        assert record["block_reasons"] == reasons
+    assert any("value bank" in reason for reason in planned[0][1])
+    assert any("value bank" in reason for reason in planned[1][1])
+
+
+def test_blocked_tracker_upserts_and_clears_and_main_keeps_blocked_out_of_runs_csv(
+    tmp_path: Path, monkeypatch, capsys,
+) -> None:
+    out = tmp_path / "summary" / "runs.csv"
+    monkeypatch.setattr("sys.argv", [
+        "run_grid.py", "--exp", "M2", "--max-runs", "2", "--run",
+        "--raw-dir", str(tmp_path / "raw"), "--output-csv", str(out),
+    ])
+    run_grid_module.main()
+    blocked_csv = out.with_name("blocked_jobs.csv")
+    assert not out.exists()
+    with blocked_csv.open(newline="") as stream:
+        rows = list(csv.DictReader(stream))
+    assert len(rows) == 2 and {row["availability"] for row in rows} == {"blocked"}
+    assert all(row["experiment_id"] == "M2" and json.loads(row["reasons_json"]) for row in rows)
+    assert "2 blocked (not completed)" in capsys.readouterr().out
+
+    # Re-recording replaces, clearing removes; other entries are preserved.
+    first = json.loads(json.dumps(rows[0]))
+    first["reasons_json"] = json.dumps(["changed"])
+    run_grid_module.record_blocked_job(first, blocked_csv)
+    with blocked_csv.open(newline="") as stream:
+        updated = list(csv.DictReader(stream))
+    assert len(updated) == 2
+    assert next(row for row in updated if row["run_id"] == first["run_id"])["reasons_json"] == '["changed"]'
+    run_grid_module.clear_blocked_job(first["run_id"], blocked_csv)
+    with blocked_csv.open(newline="") as stream:
+        assert [row["run_id"] for row in csv.DictReader(stream)] == [rows[1]["run_id"]]
+    with pytest.raises(GridError, match="only blocked"):
+        run_grid_module.record_blocked_job({**first, "availability": "available"}, blocked_csv)
 
 
 def test_baseline_protocol_metrics_and_typed_rtt_reach_run_outputs(tmp_path: Path) -> None:
