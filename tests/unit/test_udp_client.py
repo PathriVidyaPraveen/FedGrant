@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import dataclass, field
 
 import numpy as np
+import pytest
 
 from fedgrant.common.constants import MessageType, TransferMode
 from fedgrant.common.wire import decode_message, encode_message
@@ -211,3 +213,194 @@ def test_round_end_timeout_uses_all_blocks_undelivered(monkeypatch) -> None:
         await client.close()
 
     asyncio.run(scenario())
+
+
+# -- READY timer origin: rho_i runs from ROUND_START receipt (design decision D-20) --
+
+ENCODE_S = 0.050
+UPDATE = np.asarray([1, 2, 3, 4, 5], dtype=np.float32)
+EXPECTED_READY = {"K": 3, "energy": (25.0, 25.0, 5.0)}
+
+
+class _VirtualHandle:
+    def __init__(self, when: float, callback, args) -> None:
+        self._when, self._callback, self._args = when, callback, args
+        self._cancelled = False
+
+    def when(self) -> float:
+        return self._when
+
+    def cancel(self) -> None:
+        self._cancelled = True
+
+    def cancelled(self) -> bool:
+        return self._cancelled
+
+
+class VirtualLoop:
+    """Deterministic stand-in for the running loop's timer API.
+
+    Due handles fire in ``when`` order. As in asyncio, a handle whose time has
+    already passed runs on the next iteration, at the current time.
+    """
+
+    def __init__(self, now: float = 100.0) -> None:
+        self.now = now
+        self.handles: list[_VirtualHandle] = []
+
+    def time(self) -> float:
+        return self.now
+
+    def call_at(self, when: float, callback, *args) -> _VirtualHandle:
+        handle = _VirtualHandle(when, callback, args)
+        self.handles.append(handle)
+        return handle
+
+    def call_later(self, delay: float, callback, *args) -> _VirtualHandle:
+        return self.call_at(self.now + delay, callback, *args)
+
+    def run_until(self, t: float) -> None:
+        while True:
+            due = [h for h in self.handles if not h.cancelled() and h.when() <= t]
+            if not due:
+                break
+            handle = min(due, key=_VirtualHandle.when)
+            self.handles.remove(handle)
+            self.now = max(self.now, handle.when())
+            handle._callback(*handle._args)
+        self.now = max(self.now, t)
+
+    def run_once(self) -> None:
+        """One loop iteration: run everything already due, without advancing time."""
+        self.run_until(self.now)
+
+
+def _virtual_client(monkeypatch, rho_s: float):
+    loop = VirtualLoop()
+    monkeypatch.setattr(udp_client.asyncio, "get_running_loop", lambda: loop)
+    trace: dict[str, float] = {}
+    sends: list[tuple[MessageType, float]] = []
+
+    def slow_provider(round_id: int) -> np.ndarray:
+        trace["encode_start"] = loop.time()
+        loop.now += ENCODE_S  # deliberately slow update preparation
+        trace["encode_end"] = loop.time()
+        return UPDATE
+
+    def observe(data: bytes, now_ns: int) -> None:
+        sends.append((decode_message(data).message_type, now_ns / 1e9))
+
+    client = UdpClient(
+        ClientCore(3, d=5, L=2),
+        gateway_addr=("127.0.0.1", 9000),
+        update_provider=slow_provider,
+        clock_ns=lambda: round(loop.time() * 1e9),
+        packet_observer=observe,
+    )
+    transport = FakeTransport()
+    client.connection_made(transport)  # type: ignore[arg-type]
+    received_at = loop.time()
+    client.datagram_received(
+        packet(
+            MessageType.ROUND_START,
+            body={
+                "deadline_ns": round((received_at + 5.0) * 1e9),
+                "K": 3,
+                "L": 2,
+                "rho_us": round(rho_s * 1e6),
+                "mode": TransferMode.GRANT,
+            },
+        ),
+        ("127.0.0.1", 9000),
+    )
+    return loop, client, transport, trace, sends, received_at
+
+
+def test_ready_deadline_is_receipt_plus_rho_when_encoding_finishes_first(monkeypatch) -> None:
+    rho_s = 0.080
+    loop, client, transport, trace, sends, received_at = _virtual_client(monkeypatch, rho_s)
+
+    # The timer origin is taken before preparation starts, and encoding time
+    # does not move the READY deadline.
+    assert trace["encode_start"] == received_at
+    assert trace["encode_end"] == pytest.approx(received_at + ENCODE_S)
+    assert client._ready_handle.when() == pytest.approx(received_at + rho_s)
+    assert transport.sent == []
+
+    loop.run_until(received_at + rho_s - 1e-6)
+    assert transport.sent == []
+    loop.run_until(received_at + rho_s)
+    assert len(transport.sent) == 1
+    ready = decode_message(transport.sent[0][0])
+    assert ready.message_type is MessageType.READY and ready.body == EXPECTED_READY
+    kind, sent_at = sends[0]
+    assert kind is MessageType.READY
+    assert sent_at - received_at == pytest.approx(rho_s, abs=1e-9)  # not rho + encoding
+    assert sent_at >= trace["encode_end"]
+
+
+def test_ready_is_sent_as_soon_as_overrunning_encoding_completes(monkeypatch) -> None:
+    rho_s = 0.020  # shorter than the 50 ms preparation
+    loop, client, transport, trace, sends, received_at = _virtual_client(monkeypatch, rho_s)
+
+    assert trace["encode_start"] == received_at
+    assert client._ready_handle.when() == pytest.approx(received_at + rho_s)
+    # Never sent from inside preparation or before it completes.
+    assert transport.sent == []
+    assert loop.time() == pytest.approx(trace["encode_end"])
+
+    loop.run_once()  # the next loop iteration, with no time elapsed
+    assert len(transport.sent) == 1
+    assert decode_message(transport.sent[0][0]).body == EXPECTED_READY
+    _, sent_at = sends[0]
+    assert sent_at == pytest.approx(trace["encode_end"], abs=1e-9)
+    assert sent_at - received_at == pytest.approx(ENCODE_S, abs=1e-9)  # not rho + encoding
+
+
+@pytest.mark.parametrize("rho_s", [0.100, 0.020])
+def test_real_loop_ready_gap_excludes_encoding_time(rho_s: float) -> None:
+    async def scenario() -> tuple[int, int, int]:
+        ready_sent = asyncio.Event()
+        marks: dict[str, int] = {}
+
+        def slow_provider(round_id: int) -> np.ndarray:
+            time.sleep(ENCODE_S)  # blocking, like real encoding work
+            marks["encode_end"] = time.monotonic_ns()
+            return UPDATE
+
+        def observe(data: bytes, now_ns: int) -> None:
+            if decode_message(data).message_type is MessageType.READY:
+                marks["ready"] = now_ns
+                ready_sent.set()
+
+        client = UdpClient(
+            ClientCore(3, d=5, L=2),
+            gateway_addr=("127.0.0.1", 9000),
+            update_provider=slow_provider,
+            packet_observer=observe,
+        )
+        client.connection_made(FakeTransport())  # type: ignore[arg-type]
+        received_ns = time.monotonic_ns()
+        client.datagram_received(
+            packet(
+                MessageType.ROUND_START,
+                body={
+                    "deadline_ns": received_ns + 5_000_000_000,
+                    "K": 3,
+                    "L": 2,
+                    "rho_us": round(rho_s * 1e6),
+                    "mode": TransferMode.GRANT,
+                },
+            ),
+            ("127.0.0.1", 9000),
+        )
+        await asyncio.wait_for(ready_sent.wait(), 2.0)
+        await client.close()
+        return received_ns, marks["encode_end"], marks["ready"]
+
+    received_ns, encode_end_ns, ready_ns = asyncio.run(scenario())
+    gap_s = (ready_ns - received_ns) / 1e9
+    assert ready_ns >= encode_end_ns  # never before the update is ready
+    # Expected gap max(rho, encoding); the old origin gave at least rho + encoding.
+    assert gap_s >= max(rho_s, ENCODE_S) - 0.001
+    assert gap_s < rho_s + ENCODE_S

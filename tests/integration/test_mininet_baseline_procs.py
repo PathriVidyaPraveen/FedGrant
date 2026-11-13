@@ -128,6 +128,14 @@ def test_baseline_processes_complete_rounds_over_real_sockets(policy, tmp_path) 
                     and p["result"] == "accepted" and p["packet_type"] in {"DATA", "B1_BLOCK"}]
         assert len(accepted) == delivered_total
         assert all(int(p["t_mono_ns"]) <= record["deadline_ns"] for p in accepted)
+        # Raw packets, summary and metrics reconcile: accepted_data counts DATA
+        # only (never READY), and goodput is the padded 2L-byte payload of each
+        # accepted DATA (1400 bytes at L = 700) over D.
+        summary_row = summary_rounds[r - 1]
+        assert summary_row["round_id"] == r and summary_row["accepted_data"] == delivered_total
+        assert all(int(p["payload_bytes"]) == 2 * L for p in accepted)
+        payload_bytes = sum(int(p["payload_bytes"]) for p in accepted)
+        assert float(row["goodput_bps"]) == pytest.approx(payload_bytes * 8 / (D / 1e9))
         assert row["eta"] == "" and row["grants_issued"] == "" and row["grant_rtt_samples"] == ""
         sent_controls = {p["packet_type"] for p in packets if int(p["round_id"]) == r and p["direction"] == "sent"}
         assert {"ROUND_START", "ROUND_END"} <= sent_controls
@@ -141,6 +149,9 @@ def test_baseline_processes_complete_rounds_over_real_sockets(policy, tmp_path) 
             # ROUND_END told the client exactly what the gateway accepted.
             assert client_rounds[r]["delivered"] == record["delivered"][str(cid)]
             assert client_rounds[r]["status"] == "round_end"
+            # Every baseline logs per-block energies (by block index) for the eta join (D-09).
+            energies = client_rounds[r]["block_energies"]
+            assert len(energies) == K and all(isinstance(x, float) and x >= 0 for x in energies)
             if policy in {"B2", "B3"}:
                 sent_blocks = {int(p["block_idx"]) for p in sent if int(p["round_id"]) == r}
                 assert set(record["delivered"][str(cid)]) <= sent_blocks
@@ -350,3 +361,33 @@ def test_cli_follows_runner_contract_modes_and_bank_rules(tmp_path, monkeypatch)
     assert (cfg.udp_port, cfg.tcp_port) == (9000, 9100)
     assert cfg.client_endpoints[1] == ("10.0.0.2", 9001)
     assert captured["provider"].client_id == 1 and captured["provider"].master_seed == 2
+
+
+def test_b3_gateway_counts_only_data_in_data_counters(tmp_path) -> None:
+    # READY is part of the B3 exchange but is not DATA: it must not inflate
+    # accepted_data / rejected_data / late_after_deadline in gateway_summary.json.
+    gateway = baseline_proc.BaselineGateway(_config("B3", rounds=1), np.asarray([0.2, 0.3, 0.5]), tmp_path)
+    book = baseline_proc._RoundBook(round_id=2, start_ns=0, deadline_ns=1_000, rho_us={})
+    gateway.current = gateway.books[2] = book
+    ready = encode_message(MessageType.READY, round_id=2, client_id=0, t_send_ns=0,
+                           body={"K": K, "energy": tuple([1.0] * K)})
+    data = encode_data_packet(2, 0, 3, L, np.zeros(L, dtype=np.float16), send_pos=1)
+    stale = encode_data_packet(1, 0, 3, L, np.zeros(L, dtype=np.float16), send_pos=1)
+
+    gateway._log_b3_datagram(ready, 10, accepted=True)
+    gateway._log_b3_datagram(ready, 20, accepted=False)  # duplicate READY
+    gateway._log_b3_datagram(ready, 2_000, accepted=False)  # READY after D is not late DATA
+    gateway._log_b3_datagram(data, 30, accepted=True)
+    gateway._log_b3_datagram(data, 40, accepted=False)  # duplicate DATA
+    gateway._log_b3_datagram(data, 1_500, accepted=False)  # same-round DATA in the drain
+    gateway._log_b3_datagram(stale, 1_600, accepted=False)  # previous-round DATA: rejected, not late
+    gateway.logs.close()
+
+    assert (book.accepted, book.rejected, book.late_after_deadline, book.invalid) == (1, 2, 1, 0)
+    rows = _csv(tmp_path / "packets.csv")
+    assert [(r["packet_type"], r["result"]) for r in rows] == [
+        ("READY", "accepted"), ("READY", "rejected"), ("READY", "rejected"),
+        ("DATA", "accepted"), ("DATA", "rejected"), ("DATA", "late_after_deadline"), ("DATA", "rejected"),
+    ]
+    assert [int(r["payload_bytes"]) for r in rows] == [0, 0, 0, 2 * L, 2 * L, 2 * L, 2 * L]
+    assert [r["round_id"] for r in rows][-1] == "1"  # stale DATA keeps its own round id

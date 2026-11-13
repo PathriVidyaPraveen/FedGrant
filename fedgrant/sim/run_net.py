@@ -824,7 +824,9 @@ def run_network_round(
         max_rho_ns = int(0.10 * D_ns)
         rho_ns = int(rng_readiness.integers(0, max_rho_ns + 1)) if max_rho_ns > 0 else 0
         delta_ns = access_links[cid].prop_delay_ns
-        ready_arrival_ns = rho_ns + delta_ns + 5_000_000
+        round_start_downlink_ns = delta_ns + 5_000_000
+        ready_uplink_ns = delta_ns + 5_000_000
+        ready_arrival_ns = round_start_downlink_ns + rho_ns + ready_uplink_ns
 
         engine.schedule(
             delay_ns=ready_arrival_ns,

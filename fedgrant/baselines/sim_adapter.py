@@ -71,6 +71,14 @@ class _Transfer:
         )
 
 
+BOTTLENECK_PROP_NS = 5_000_000
+
+
+def control_leg_ns(access_prop_delay_ns: int) -> int:
+    """One-way gateway<->client control delay: access delta_i + bottleneck 5 ms (sim/run_net.py)."""
+    return int(access_prop_delay_ns) + BOTTLENECK_PROP_NS
+
+
 def run_baseline_network_round(
     *,
     round_id: int,
@@ -147,7 +155,7 @@ def run_baseline_network_round(
 
     engine = SimulationEngine()
     engine.now_ns = round_start_abs_ns
-    bottleneck = BottleneckLink(engine=engine, capacity_bps=C, prop_delay_ns=5_000_000, max_queue_frames=64)
+    bottleneck = BottleneckLink(engine=engine, capacity_bps=C, prop_delay_ns=BOTTLENECK_PROP_NS, max_queue_frames=64)
     trace_scenario = "X2" if scenario.upper() == "X2" else scenario
     traces = TraceManager(
         num_clients=num_clients,
@@ -326,7 +334,10 @@ def run_baseline_network_round(
         for cid in range(num_clients):
             tracker = transfers[cid]
             pace_bps = mean_access_rate_bps(cid)
-            first_send_ns = round_start_abs_ns + rho_by_client[cid]
+            # rho_i starts when the client receives ROUND_START (CHANGELOG 2026-11-13),
+            # i.e. one control leg after the round start, as in baseline_proc.
+            first_send_ns = (round_start_abs_ns + control_leg_ns(access_links[cid].prop_delay_ns)
+                             + rho_by_client[cid])
             for position in range(1, K + 1):
                 send_ns = first_send_ns + (position - 1) * math.ceil(
                     (data_size_bytes * 8 * 1_000_000_000) / pace_bps
@@ -360,18 +371,19 @@ def run_baseline_network_round(
                 raise RuntimeError("ROUND_START encoding produced an empty datagram")
             start_message = decode_message(start_packet, block_length=L)
             rho_us = start_message.body["rho_us"]
+            # Same READY timing as sim/run_net.py: ROUND_START downlink, then rho_i
+            # from its receipt, then the READY uplink (CHANGELOG 2026-11-13).
+            leg_ns = control_leg_ns(access_links[cid].prop_delay_ns)
+            ready_send_ns = round_start_abs_ns + leg_ns + rho_us * 1_000
             ready_packet = encode_message(
                 MessageType.READY,
                 round_id=round_id,
                 client_id=cid,
-                t_send_ns=round_start_abs_ns + rho_us * 1_000,
+                t_send_ns=ready_send_ns,
                 body={"K": K, "energy": tuple(float(value) for value in energy_rows[cid])},
                 block_length=L,
             )
-            ready_ns = (
-                round_start_abs_ns + rho_us * 1_000
-                + access_links[cid].prop_delay_ns + 5_000_000
-            )
+            ready_ns = ready_send_ns + leg_ns
 
             def on_ready(_event, client=cid, packet=ready_packet) -> None:
                 try:
@@ -429,7 +441,7 @@ def run_baseline_network_round(
                     "client_id": cid,
                     "detail": f"blocks={pending_plan.blocks};rate_bps={pending_plan.rate_bps}",
                 })
-                return_delay_ns = access_links[cid].prop_delay_ns + 5_000_000
+                return_delay_ns = control_leg_ns(access_links[cid].prop_delay_ns)
                 transfer = transfers[cid]
                 transfer.expected_packets = plan.blocks
 

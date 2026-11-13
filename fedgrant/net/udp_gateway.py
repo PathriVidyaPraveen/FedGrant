@@ -103,6 +103,10 @@ class UdpGateway(asyncio.DatagramProtocol):
         self._aggregate_tasks: set[asyncio.Task[None]] = set()
         self._closing = False
         self._tick_active = False
+        # Grid time the scheduler loop was waiting for when it last called
+        # _run_tick (monotonic ns). Read-only observability for profiling; the
+        # loop never reads it back.
+        self.scheduled_tick_ns: int | None = None
         self.stats = UdpGatewayStats()
 
     @classmethod
@@ -236,6 +240,7 @@ class UdpGateway(asyncio.DatagramProtocol):
                     await self._sleep(delay_ns / _NANOSECONDS_PER_SECOND)
                 if self._closing:
                     break
+                self.scheduled_tick_ns = next_tick_ns
                 self._run_tick()
                 next_tick_ns += self.tick_interval_ns
                 now_ns = self.clock_ns()

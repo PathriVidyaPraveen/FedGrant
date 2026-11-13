@@ -223,6 +223,64 @@ def plot_replay(rows: list[dict], lags: dict[str, np.ndarray], path: Path, *, mi
     return True
 
 
+# --- READY amendment validation (CHANGELOG 2026-11-13) ---------------------------------
+
+READY_RUNS = (("scale-L2-N20", "section7"), ("ready-lossless-L2-N20", "ready_lossless"))
+
+
+def ready_validation(runs_root: Path, changelog: Path) -> tuple[list[dict], list[dict], dict] | None:
+    """Before/after evidence for the READY-lossless uplink, from the raw run directories."""
+    runs, rounds_out, configs = [], [], {}
+    for name, layout in READY_RUNS:
+        root = runs_root / name
+        if not (root / "packets.csv").is_file() or not (root / "meta.json").is_file():
+            print(f"skip: {root} not found", file=sys.stderr)
+            continue
+        meta = json.loads((root / "meta.json").read_text(encoding="utf-8"))
+        n = int(meta["N"])
+        ready_sent, ready_recv, data_sent, data_recv = {}, {}, {}, {}
+        with (root / "packets.csv").open(newline="", encoding="utf-8") as stream:
+            for r in csv.DictReader(stream):
+                rid = int(r["round_id"] or 0)
+                if r["packet_type"] == "READY":
+                    (ready_sent if r["direction"] == "sent" else ready_recv).setdefault(rid, set()).add(int(r["client_id"]))
+                elif r["packet_type"] == "DATA":
+                    target = data_sent if r["direction"] == "sent" else data_recv
+                    target[rid] = target.get(rid, 0) + 1
+        with (root / "round_metrics.csv").open(newline="", encoding="utf-8") as stream:
+            metrics = {int(r["round_id"]): r for r in csv.DictReader(stream)}
+        summary = json.loads((root / "gateway_summary.json").read_text(encoding="utf-8"))
+        for rid in sorted(metrics):
+            rounds_out.append({"run": name, "layout": layout, "round_id": rid,
+                               "ready_sent": len(ready_sent.get(rid, ())), "ready_received": len(ready_recv.get(rid, ())),
+                               "all_clients_registered": "yes" if len(ready_recv.get(rid, ())) == n else "no",
+                               "eta": metrics[rid].get("eta", ""), "data_sent": data_sent.get(rid, 0),
+                               "data_received": data_recv.get(rid, 0)})
+        sent_total = sum(len(v) for v in ready_sent.values())
+        lost = sent_total - sum(len(ready_recv.get(rid, set()) & v) for rid, v in ready_sent.items())
+        ds, dr = sum(data_sent.values()), sum(data_recv.values())
+        runs.append({"run": name, "layout": layout, "scenario": meta["scenario"], "clients": n,
+                     "rounds": len(metrics), "ready_sent": sent_total, "ready_lost": lost,
+                     "rounds_all_registered": sum(len(ready_recv.get(rid, ())) == n for rid in metrics),
+                     "eta_rounds": sum(bool(str(metrics[rid].get("eta", "")).strip()) for rid in metrics),
+                     "data_sent": ds, "data_received": dr, "data_uplink_loss_pct": f"{100 * (ds - dr) / ds:.2f}" if ds else "",
+                     "ge_target_loss_pct": f"{100 * meta['effective_queue_settings']['ge_target_loss_rate']:.1f}",
+                     "invalid_events": sum(int(x.get("invalid_events", 0)) for x in summary)})
+        configs[name] = {
+            "layout": layout, "ready_lossless": meta.get("ready_lossless"), "platform": "Fedora 44 Mininet testbed",
+            **{k: meta.get(k) for k in ("experiment_id", "policy", "scenario", "seed", "N", "rounds", "beta",
+                                       "duration_ns", "compute_window_s", "cross_mbps", "gateway_factory")},
+            "ge_target_loss_rate": meta["effective_queue_settings"]["ge_target_loss_rate"],
+            "ge_target_mean_burst": meta["effective_queue_settings"]["ge_target_mean_burst"],
+            "tc_readback": meta["effective_queue_settings"]["tc_readback"],
+        }
+    if not runs:
+        return None
+    amendment = [line for line in changelog.read_text(encoding="utf-8").splitlines()
+                 if "Client uplink loss scope" in line] if changelog.is_file() else []
+    return runs, rounds_out, {"runs": configs, "changelog_amendment": amendment}
+
+
 # --- LaTeX tables ----------------------------------------------------------------------------------
 
 def latex_tables(ge: list[dict], traces: list[dict], replay: list[dict]) -> str:
@@ -277,6 +335,13 @@ def main(argv: list[str] | None = None) -> None:
     if replay:
         _write_csv(summary / "testbed_replay_lag.csv", list(replay[0]), replay)
         plot_replay(replay, lags, figures / "testbed_replay_lag.pdf")
+    ready = ready_validation(Path(args.runs_root), Path("CHANGELOG.md"))
+    if ready:
+        runs, rounds, evidence = ready
+        _write_csv(summary / "testbed_ready_validation.csv", list(runs[0]), runs)
+        _write_csv(summary / "testbed_ready_rounds.csv", list(rounds[0]), rounds)
+        (summary / "testbed_ready_validation.json").write_text(
+            json.dumps(evidence, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     (summary / "testbed_tables.tex").write_text(latex_tables(ge, traces, replay), encoding="utf-8")
     print(f"GE scenarios: {len(ge)}, trace segments: {len(traces)}, replay runs: {len(replay)}")
 
