@@ -1,0 +1,7 @@
+run,scenario,clients,applier,rate_changes,lag_p50_ms,lag_p99_ms,lag_max_ms,late_over_10ms
+prepush-L4-20261102-221731,L4,3,runner-thread,12,3.951,5.238,5.247,0
+scale-L4-N20,L4,20,runner-thread,2000,8.967,15.421,19.916,760
+scale-L4-N20-agent,L4,20,tc,2000,11.529,25.346,37.441,1297
+scale-L4-N20-netlink,L4,20,netlink,1920,3.618,13.294,17.960,49
+scale-L4-N20-ready,L4,20,netlink,2000,3.538,12.325,16.982,40
+verify-qdisc-L4,L4,3,runner-thread,12,4.530,8.785,8.848,0

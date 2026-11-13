@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import json
+import math
+import shutil
+import signal
 import subprocess
 import time
+from pathlib import Path
 from typing import Any
 
 
@@ -62,6 +66,56 @@ class CrossTraffic:
         self.stop()
 
 
+class CrossCapture:
+    """Capture cross-traffic datagrams at the gateway for per-flow drop attribution.
+
+    ``tcpdump`` writes only the first 96 bytes of each iperf3 datagram (UDP
+    destination port ``port``), enough for the sequence/timestamp header.
+    ``realtime_minus_mono_ns`` converts its CLOCK_REALTIME stamps to the
+    monotonic clock used by every other log.
+    """
+
+    def __init__(self, host: Any, iface: str, path: str | Path, *, port: int = 9999):
+        self.host, self.iface, self.path, self.port = host, iface, Path(path), int(port)
+        self.proc: subprocess.Popen | None = None
+        self.realtime_minus_mono_ns: int | None = None
+
+    def start(self) -> "CrossCapture":
+        if shutil.which("tcpdump") is None:
+            raise RuntimeError("tcpdump is required to attribute cross-traffic drops (dnf install tcpdump)")
+        self.proc = self.host.popen(
+            ["tcpdump", "-i", self.iface, "-n", "-U", "-s", "96", "--time-stamp-precision=nano",
+             "-w", str(self.path), "udp", "and", "dst", "port", str(self.port)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+        )
+        self.realtime_minus_mono_ns = time.time_ns() - time.monotonic_ns()
+        time.sleep(0.3)  # let tcpdump open the interface before traffic starts
+        if self.proc.poll() is not None:
+            err = self.proc.stderr.read().decode(errors="replace") if self.proc.stderr else ""
+            self.proc = None
+            raise RuntimeError(f"tcpdump failed to start: {err}")
+        return self
+
+    def stop(self) -> None:
+        """Stop with SIGINT so tcpdump flushes the capture file; idempotent."""
+        proc, self.proc = self.proc, None
+        if proc is None or proc.poll() is not None:
+            return
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=2)
+
+
+def cross_duration_s(rounds: int, duration_ns: int, compute_window_s: float, *,
+                     start_delay_s: float = 0.4, late_drain_s: float = 0.1, margin_s: float = 3.0) -> int:
+    """iperf3 duration covering every round of a run (whole seconds)."""
+    per_round = compute_window_s + duration_ns / 1e9 + late_drain_s
+    return int(math.ceil(start_delay_s + rounds * per_round + margin_s))
+
+
 def udp_payload_bps(result: dict[str, Any]) -> float:
     """Return receiver application bit/s from iperf3 JSON output."""
     try:
@@ -70,4 +124,4 @@ def udp_payload_bps(result: dict[str, Any]) -> float:
         raise ValueError("iperf3 JSON has no end.sum.bits_per_second") from exc
 
 
-__all__ = ["CrossTraffic", "udp_payload_bps"]
+__all__ = ["CrossCapture", "CrossTraffic", "cross_duration_s", "udp_payload_bps"]

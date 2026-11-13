@@ -2,10 +2,10 @@ PYTHON ?= python3
 PYTEST ?= $(PYTHON) -m pytest
 RUNS ?= results/summary/runs.csv
 
-.PHONY: help install install-ml test test-pure test-ml test-mininet trace-fetch trace-bin data mininet-smoke mininet mininet-run metrics calibrate plots grid-net grid-fl docker-build
+.PHONY: help install install-ml test test-pure test-ml test-mininet trace-fetch trace-bin data mininet-smoke mininet mininet-run metrics calibrate plots grid-net grid-fl docker-build docker-test testbed-report
 
 help:
-	@printf '%s\n' 'install       Install Python dependencies from requirements.lock' \
+	@printf '%s\n' 'install       Install Python dependencies from docker/requirements.lock' \
 	  'install-ml    Install the optional PyTorch ML dependencies' \
 	  'test          Run non-ML tests (Mininet tests skip when host support is absent)' \
 	  'test-pure     Run unit tests that do not require PyTorch' \
@@ -22,10 +22,12 @@ help:
 	  'metrics       Build summary CSV rows from run directories (RUN_DIRS=...)' \
 	  'calibrate     Compare paired M1 and M-sim rows' \
 	  'plots         Generate analysis plots from RUNS' \
-	  'docker-build  Build the reproducibility image'
+	  'testbed-report Regenerate testbed/trace tables and figures from raw artifacts' \
+	  'docker-build  Build the reproducibility image (docker or podman)' \
+	  'docker-test   Build the image and run the unit suite inside it'
 
 install:
-	$(PYTHON) -m pip install -r requirements.lock
+	$(PYTHON) -m pip install -r docker/requirements.lock
 	$(PYTHON) -m pip install --no-deps -e .
 
 install-ml:
@@ -79,8 +81,19 @@ metrics:
 calibrate:
 	$(PYTHON) -m fedgrant.analysis.calibrate --runs $(RUNS)
 
+testbed-report:
+	$(PYTHON) scripts/testbed_report.py
+
 plots:
 	$(PYTHON) -m fedgrant.analysis.plots --runs $(RUNS)
 
+# docker or podman (Fedora ships podman); both read docker/Dockerfile and .dockerignore.
+CONTAINER ?= $(shell command -v docker 2>/dev/null || command -v podman 2>/dev/null)
+IMAGE ?= fedgrant-testbed
+
 docker-build:
-	docker build -f docker/Dockerfile -t fedgrant-testbed .
+	@test -n "$(CONTAINER)" || (echo 'Install docker or podman' >&2; exit 2)
+	$(CONTAINER) build -f docker/Dockerfile -t $(IMAGE) .
+
+docker-test: docker-build
+	$(CONTAINER) run --rm $(IMAGE)

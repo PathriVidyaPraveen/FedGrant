@@ -11,7 +11,7 @@ from fedgrant.mininet.contract import (
     policy_config_for, uniform_weights,
 )
 from fedgrant.mininet.logging_tap import LoggingUdpGateway
-from fedgrant.mininet.round_loop import RoundTiming, RoundWindow, run_rounds
+from fedgrant.mininet.round_loop import RoundTiming, RoundWindow, readiness_delays_us, run_rounds
 from fedgrant.mininet.round_state import RoundStateFile
 
 
@@ -30,9 +30,9 @@ def build_context(args: argparse.Namespace) -> MininetGatewayContext:
 class GrantRoundProtocol:
     """GatewayCore (grant mode) steps for the shared round loop."""
 
-    def __init__(self, core, gateway, *, num_clients: int, K: int, L: int):
+    def __init__(self, core, gateway, *, num_clients: int, K: int, L: int, seed: int = 0):
         self.core, self.gateway = core, gateway
-        self.num_clients, self.K, self.L = num_clients, K, L
+        self.num_clients, self.K, self.L, self.seed = num_clients, K, L, seed
         self._before: dict[str, int] = {}
         self._deadline_completion = 0.0
 
@@ -40,8 +40,12 @@ class GrantRoundProtocol:
         stats = self.core.stats
         self._before = {name: getattr(stats, name) for name in (
             "late_after_timeout", "late_after_deadline", "accepted_data", "rejected_data", "invalid_events")}
+        # Per-client readiness rho_i ~ U(0, 0.1 D) from the simulator's seeded
+        # stream (Section 3.1), the same draws as the M-sim twin and the B1-B3
+        # processes; each client waits rho_i after ROUND_START before READY.
+        rho_us = readiness_delays_us(self.seed, round_id, self.num_clients, duration_ns)
         self._actions = self.core.on_round_start(now_ns, round_id=round_id, duration_ns=duration_ns,
-                                                 K=self.K, L=self.L)
+                                                 K=self.K, L=self.L, rho_us=rho_us)
         return RoundWindow(round_id, self.core.round.start_ns, self.core.round.deadline_ns)
 
     def send_round_start(self, window: RoundWindow) -> None:
@@ -95,7 +99,8 @@ async def serve(args: argparse.Namespace) -> None:
                                            profile_scheduler=args.profile_gateway)
     try:
         await run_rounds(
-            GrantRoundProtocol(core, gateway, num_clients=args.clients, K=args.blocks, L=args.block_length),
+            GrantRoundProtocol(core, gateway, num_clients=args.clients, K=args.blocks, L=args.block_length,
+                               seed=args.seed),
             timing_from_args(args), round_state=RoundStateFile(args.round_state), log_dir=args.log_dir)
     finally:
         await gateway.close()

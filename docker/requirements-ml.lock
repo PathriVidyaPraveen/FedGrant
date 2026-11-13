@@ -1,0 +1,5 @@
+# PyTorch for the FL/ML code and tests inside the reproducibility image (CPU build;
+# spec Section 4.4: no GPU required). Kept separate from requirements.lock so the
+# testbed host install stays light. Pinned to the version used for the checkpoints.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.15.0+cpu
