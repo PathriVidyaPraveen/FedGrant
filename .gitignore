@@ -2,6 +2,8 @@ __pycache__/
 *.pyc
 .pytest_cache/
 /data/
+/models/
+mldata.zip
 *.egg-info/
 fedgrant.egg-info/
 results/mininet/

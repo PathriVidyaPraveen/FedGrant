@@ -60,7 +60,12 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
     ap.add_argument("--device", default="auto")
     ap.add_argument("--max-epochs", type=int, default=None, help="override (testing only)")
     ap.add_argument("--resume", action="store_true", help="skip (model, seed) pairs already trained")
+    ap.add_argument("--allow-stale-policy", action="store_true",
+                    help="train on data from an older grant-policy revision (pipeline tests only)")
     a = ap.parse_args(argv)
+    if not a.allow_stale_policy:
+        from fedgrant.ml.sequences import check_policy_revision
+        check_policy_revision(a.data)          # fail before launching ten training processes
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
     failed: list[str] = []
@@ -74,6 +79,8 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
                    "--data", a.data, "--out", str(out), "--threads", str(a.threads), "--device", a.device]
             if a.max_epochs is not None:
                 cmd += ["--max-epochs", str(a.max_epochs)]
+            if a.allow_stale_policy:
+                cmd.append("--allow-stale-policy")
             print(f"== {m} seed {k}: {' '.join(cmd)}", flush=True)
             r = subprocess.run(cmd)
             if r.returncode != 0:

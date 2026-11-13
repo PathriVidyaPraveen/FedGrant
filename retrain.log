@@ -1,0 +1,21 @@
+nohup: ignoring input
+== gru seed 0: /home/vidya/miniconda3/envs/fedgrant/bin/python -m fedgrant.ml.train --model gru --seed 0 --data data/mldata --out models --threads 8 --device auto
+loading data/mldata ...
+[gru seed 0] epoch  1  train 0.42443  val 0.40769    81.8s  *
+[gru seed 0] epoch  2  train 0.39950  val 0.40227    77.4s  *
+[gru seed 0] epoch  3  train 0.39398  val 0.39743    83.8s  *
+[gru seed 0] epoch  4  train 0.39113  val 0.39601    76.7s  *
+[gru seed 0] epoch  5  train 0.38914  val 0.39675   108.3s
+[gru seed 0] epoch  6  train 0.38759  val 0.39379   124.1s  *
+[gru seed 0] epoch  7  train 0.38629  val 0.39395   128.8s
+[gru seed 0] epoch  8  train 0.38520  val 0.39236   133.6s  *
+[gru seed 0] epoch  9  train 0.38439  val 0.39205   130.3s  *
+[gru seed 0] epoch 10  train 0.38366  val 0.39176   133.4s  *
+[gru seed 0] epoch 11  train 0.38308  val 0.39224   128.2s
+[gru seed 0] epoch 12  train 0.38258  val 0.39111    92.7s  *
+[gru seed 0] epoch 13  train 0.38198  val 0.39124    77.2s
+[gru seed 0] epoch 14  train 0.38159  val 0.39008    77.2s  *
+[gru seed 0] epoch 15  train 0.38116  val 0.39053    72.9s
+[gru seed 0] epoch 16  train 0.38087  val 0.39048    73.4s
+[gru seed 0] epoch 17  train 0.38043  val 0.39102    77.3s
+[gru seed 0] epoch 18  train 0.38007  val 0.39084    90.0s

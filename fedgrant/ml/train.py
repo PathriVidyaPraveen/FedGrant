@@ -37,6 +37,7 @@ from fedgrant.ml.sequences import (
     MLPData,
     NormStats,
     compute_norm_stats,
+    check_policy_revision,
     resolve_split_path,
     save_norm_stats,
 )
@@ -286,9 +287,13 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
     ap.add_argument("--batch", type=int, default=BATCH)
     ap.add_argument("--threads", type=int, default=THREADS)
     ap.add_argument("--device", default="auto", help="auto | cpu | cuda")
+    ap.add_argument("--allow-stale-policy", action="store_true",
+                    help="train on data from an older grant-policy revision (pipeline tests only)")
     a = ap.parse_args(argv)
     if a.seed < 0:
         ap.error("--seed must be >= 0")
+    if not a.allow_stale_policy:
+        check_policy_revision(a.data)
     print(f"loading {a.data} ...", flush=True)
     train = load_split(resolve_split_path(a.data, "train"))
     val = load_split(resolve_split_path(a.data, "val"))

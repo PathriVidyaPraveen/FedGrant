@@ -19,6 +19,7 @@ from typing import Any
 import numpy as np
 
 from fedgrant.ml.schema import SCHEMA_VERSION, SPLITS, SplitRecorder, load_split, meta
+from fedgrant.policy.constants import POLICY_REVISION
 from fedgrant.policy.types import PolicyConfig
 from fedgrant.sim.run_net import compute_deadline_ns, run_network_round
 from fedgrant.sim.traces import ID_TRACE_NAMES, OOD_TRACE_NAMES
@@ -241,7 +242,7 @@ def generate_split(
         for name in trace_names
     }
     generator = (
-        f"fedgrant.ml.datagen/v2;conditions=balanced-grid;split={split};"
+        f"fedgrant.ml.datagen/v3;policy={POLICY_REVISION};conditions=balanced-grid;split={split};"
         f"clients={n_clients};rounds={n_rounds};energy_bank_sha256={energy_bank_sha256};"
         "weights=full-bank;round_seed=SeedSequence(master_seed,round_id-1)"
     )
@@ -269,7 +270,10 @@ def generate_split(
             "fit_split": "train",
             "statistics": "fit by downstream model training from train only",
         },
-        "policy": {"selector": "value", "predictor": "ewma", "explore_eps": 0.1},
+        "policy": {
+            "selector": "value", "predictor": "ewma", "explore_eps": 0.1,
+            "revision": POLICY_REVISION,
+        },
         "beta_values": list(BETA_VALUES),
         "loss_and_burst_values": (
             {"pi": list(OOD_PI_VALUES), "mean_burst": list(OOD_BURST_VALUES)}

@@ -23,6 +23,13 @@ Q: int = 64                       # bottleneck buffer, frames
 THETA: float = 0.05               # eligibility threshold, rule (v)
 TAU_Q_NS: int = 5_000_000         # tau_q = 5 ms, Eq. (12)
 
+# Revision of the grant policy's behaviour (pacing, window, eligibility). Any
+# change that alters which grants are issued changes the ML data distribution;
+# ml/datagen.py writes this into every manifest and ml/train.py refuses data
+# generated under another revision. Bump it with every such CHANGELOG amendment.
+#   2026-11-13: rule (v) bounded probe (<= 1 grant per round for a client failing only (v)).
+POLICY_REVISION: str = "2026-11-13-probe"
+
 # --- Estimator initial values (Table 2) --------------------------------------
 SRTT0_NS: int = 100_000_000       # 100 ms
 RTTVAR0_NS: int = 50_000_000      # 50 ms
