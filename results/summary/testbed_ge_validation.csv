@@ -1,0 +1,4 @@
+scenario,packets,lost,bursts,target_loss,loss,loss_ci_low,loss_ci_high,target_burst,burst,burst_ci_low,burst_ci_high,target_in_both_ci,loss_ci_method,burst_ci_method
+L1,100000,4949,4699,0.0500,0.04949,0.04824,0.05079,1.0526,1.0532,1.0468,1.0604,yes,circular_moving_block,complete_bad_run_resampling
+L2,100000,5342,663,0.0500,0.05342,0.04828,0.05881,8.0000,8.0573,7.5094,8.5988,yes,circular_moving_block,complete_bad_run_resampling
+L3,100000,4377,153,0.0500,0.04377,0.03501,0.05227,32.0000,28.6078,24.4310,32.2904,yes,circular_moving_block,complete_bad_run_resampling

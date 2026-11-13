@@ -14,22 +14,130 @@ import threading
 import time
 from pathlib import Path
 
+from fedgrant.analysis.runs_schema import make_config_id
 from fedgrant.common.logschema import PACKET_COLUMNS, QUEUE_COLUMNS
-from fedgrant.mininet.crosstraffic import CrossTraffic, udp_payload_bps
+from fedgrant.mininet.contract import (
+    BASELINE_MODES, DEFAULT_MODELS_DIR, DEFAULT_VALUE_BANK, GRANT_POLICIES, POLICY_MODEL_FILES, STUB_POLICY,
+    check_entry_points_available, entry_points, is_baseline,
+)
+from fedgrant.mininet.cross_drops import write_cross_drops
+from fedgrant.mininet.crosstraffic import CrossCapture, CrossTraffic, cross_duration_s, udp_payload_bps
 from fedgrant.mininet.profile_update import profile_bank
-from fedgrant.mininet.replay import RateReplay
 from fedgrant.mininet.teardown import teardown
 from fedgrant.mininet.telemetry import ProcessSampler, sample_qdisc
 from fedgrant.mininet.round_state import RoundStateFile
-from fedgrant.mininet.round_summary import enrich_round_metrics
+from fedgrant.mininet.round_summary import enrich_round_metrics, fill_baseline_eta
 from fedgrant.mininet.topo import SCENARIO_LOSS, build, client_parameters, verify_tc
 from fedgrant.mininet.telemetry import summarize_gateway_profile
-from fedgrant.mininet.tcsetup import tbf_change
-from fedgrant.traces.client_trace import client_trace
 from fedgrant.sim.run_net import compute_deadline_ns
 from fedgrant.policy.constants import C, Q, S
 
 DEFAULT_STUB_FACTORY = "fedgrant.mininet.stub_policy:create_gateway"
+STUB_EXPERIMENT_ID = "smoke-stub"
+MININET_EXPERIMENTS = frozenset({"M1", "M2"})
+SCENARIOS = ("L1", "L2", "L3", "L4", "L5")
+
+# Run settings a --config YAML may provide. Scenario files use
+# cross_traffic_mbps; grid files use clients/policies/seeds/scenario lists.
+_CONFIG_ALIASES = {
+    "clients": "clients", "N": "clients", "n_clients": "clients",
+    "scenario": "scenario", "seed": "seed", "seeds": "seed",
+    "rounds": "rounds", "n_rounds": "rounds", "beta": "beta",
+    "cross_traffic_mbps": "cross_mbps", "cross_mbps": "cross_mbps",
+    "trace_dir": "trace_dir", "output": "output",
+    "gateway_factory": "gateway_factory", "policy": "policy", "policies": "policy",
+    "experiment_id": "experiment_id", "compute_window_s": "compute_window_s",
+    "value_bank": "value_bank", "models_dir": "models_dir",
+}
+# Scenario-file keys that describe the scenario itself; they are checked
+# against the code's scenario table rather than used as run settings.
+_SCENARIO_DESCRIPTIVE_KEYS = frozenset({
+    "loss_probability", "mean_loss_burst_packets", "access_rate_profile", "trace_split", "platform",
+})
+
+
+def _pick(name: str, value, override):
+    """Resolve a config value (scalar or grid list) against an optional CLI override."""
+    if isinstance(value, list):
+        if override is None:
+            if len(value) != 1:
+                raise ValueError(f"config gives several values for {name} {value}; select one with --{name.replace('_', '-')}")
+            return value[0]
+        if override not in value and str(override) not in [str(v) for v in value]:
+            raise ValueError(f"--{name.replace('_', '-')} {override!r} is not in the config's {name} list {value}")
+        return override
+    return value if override is None else override
+
+
+def load_run_config(path: str | Path, overrides: dict | None = None) -> dict:
+    """Load a scenario or grid YAML and resolve it to one run's settings.
+
+    Values given on the command line (``overrides`` entries that are not
+    None) win over the file; for grid files a command-line value must be one
+    of the listed values. Returns a dict with keys from ``_CONFIG_ALIASES``.
+    """
+    try:
+        import yaml
+    except ImportError as exc:  # pragma: no cover - pyyaml is in the testbed extra
+        raise RuntimeError("--config needs PyYAML (pip install pyyaml)") from exc
+    config_path = Path(path)
+    data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    if not isinstance(data, dict):
+        raise ValueError(f"{config_path}: top level must be a mapping")
+    overrides = {k: v for k, v in (overrides or {}).items() if v is not None}
+    unknown = sorted(set(data) - set(_CONFIG_ALIASES) - _SCENARIO_DESCRIPTIVE_KEYS)
+    if unknown:
+        raise ValueError(f"{config_path}: unknown keys {unknown}")
+    if data.get("platform") not in (None, "mininet"):
+        raise ValueError(f"{config_path}: platform {data['platform']!r} is not a Mininet config")
+    resolved: dict = {}
+    for key, value in data.items():
+        if key in _SCENARIO_DESCRIPTIVE_KEYS:
+            continue
+        name = _CONFIG_ALIASES[key]
+        resolved[name] = _pick(name, value, overrides.get(name))
+    for name, value in overrides.items():
+        resolved.setdefault(name, value)
+    if "scenario" in resolved:
+        resolved["scenario"] = str(resolved["scenario"]).upper()
+        if resolved["scenario"] == "X2":
+            # The X2 scenario file is L2 loss/capacity plus 3 Mbit/s cross traffic.
+            resolved["scenario"] = "L2"
+        _check_scenario_loss(config_path, data, resolved["scenario"])
+    resolved["config_path"] = str(config_path)
+    resolved["config_sha256"] = hashlib.sha256(config_path.read_bytes()).hexdigest()
+    return resolved
+
+
+def _check_scenario_loss(config_path: Path, data: dict, scenario: str) -> None:
+    if scenario not in SCENARIO_LOSS:
+        raise ValueError(f"{config_path}: unknown scenario {scenario!r}")
+    loss, burst = SCENARIO_LOSS[scenario]
+    if "loss_probability" in data and abs(float(data["loss_probability"]) - loss) > 1e-12:
+        raise ValueError(f"{config_path}: loss_probability {data['loss_probability']} != {loss} for {scenario}")
+    if "mean_loss_burst_packets" in data and abs(float(data["mean_loss_burst_packets"]) - burst) > 1e-9:
+        raise ValueError(f"{config_path}: mean_loss_burst_packets {data['mean_loss_burst_packets']} != {burst} for {scenario}")
+
+
+def run_identity(experiment_id: str | None, policy: str | None, gateway_factory: str) -> tuple[str, str]:
+    """Return (experiment_id, policy) for meta.json, refusing to label stub output as M1/M2.
+
+    B1/B2/B3 run their own gateway/client processes, so --gateway-factory
+    does not apply to them.
+    """
+    if policy in BASELINE_MODES:
+        return str(experiment_id or STUB_EXPERIMENT_ID), str(policy)
+    is_stub = gateway_factory == DEFAULT_STUB_FACTORY
+    experiment_id = experiment_id or (STUB_EXPERIMENT_ID if is_stub else None)
+    policy = policy or (STUB_POLICY if is_stub else None)
+    if experiment_id is None or policy is None:
+        raise ValueError("a non-stub gateway factory needs --experiment-id and --policy")
+    if is_stub and (experiment_id in MININET_EXPERIMENTS or policy != STUB_POLICY):
+        raise ValueError(
+            f"the first-eligible stub gateway cannot produce {experiment_id}/{policy} results; "
+            "pass the production --gateway-factory for M1/M2 runs"
+        )
+    return str(experiment_id), str(policy)
 
 
 class _QueueSampler:
@@ -119,29 +227,154 @@ def smoke_duration_ns(beta: float, n: int, gateway_factory: str) -> int:
     return duration_ns
 
 
+def process_commands(*, python: str, policy: str, n: int, rounds: int, seed: int, duration_ns: int,
+                     compute_window_s: float, out: Path, round_state_path: Path,
+                     gateway_factory: str, value_bank: str | None, models_dir: str,
+                     profile_gateway: bool, late_drain_s: float = 0.1,
+                     round_timeout_s: float = 5.0) -> tuple[list[str], list[list[str]]]:
+    """Return the gateway command and one command per client (contract Section 2)."""
+    gw_prefix, client_prefix = entry_points(policy)
+    gw_cmd = [python, *gw_prefix, "--clients", str(n), "--rounds", str(rounds), "--seed", str(seed),
+              "--duration-ns", str(duration_ns), "--compute-window-s", repr(float(compute_window_s)),
+              "--late-drain-s", repr(float(late_drain_s)),
+              "--log-dir", str(out), "--round-state", str(round_state_path)]
+    if not is_baseline(policy):
+        gw_cmd += ["--gateway-factory", gateway_factory, "--policy", policy, "--models-dir", str(models_dir)]
+    if value_bank:
+        gw_cmd += ["--value-bank", str(value_bank)]
+    if profile_gateway:
+        gw_cmd.append("--profile-gateway")
+    client_cmds = []
+    for i in range(n):
+        cmd = [python, *client_prefix, "--client-id", str(i), "--rounds", str(rounds), "--seed", str(seed),
+               "--round-timeout-s", repr(float(round_timeout_s)), "--log-file", str(out / f"client_{i}.json")]
+        if value_bank:
+            cmd += ["--clients", str(n), "--value-bank", str(value_bank)]
+        client_cmds.append(cmd)
+    return gw_cmd, client_cmds
+
+
+def replay_agent_command(*, python: str, client_id: int, scenario: str, seed: int, trace_dir: str | Path,
+                         round_state_path: Path, out: Path, ready_lossless: bool = True) -> list[str] | None:
+    """Command for one client's trace-replay agent, or None when the scenario has constant rates."""
+    if scenario not in {"L4", "L5"}:
+        return None
+    return [python, "-m", "fedgrant.mininet.replay_agent", "--client-id", str(client_id),
+            "--split", "ood" if scenario == "L5" else "test", "--seed", str(seed),
+            "--trace-dir", str(trace_dir), "--iface", f"c{client_id}-eth0",
+            "--round-state", str(round_state_path), "--log", str(out / f"trace_replay_client_{client_id}.csv"),
+            "--tbf-parent", "2:1" if ready_lossless else "1:1"]
+
+
+def wait_for_replay_agents(agents: list, log_paths: list[Path], *, timeout_s: float = 30.0,
+                           poll_s: float = 0.05) -> None:
+    """Block until every agent logged its ready line; fail if one exits or times out.
+
+    Starting 20 agents next to 20 clients can take longer than the gateway's
+    start-up delay; without this wait every agent missed round 1.
+    """
+    from fedgrant.mininet.replay_agent import READY_MARKER
+
+    deadline = time.monotonic() + timeout_s
+    pending = set(range(len(agents)))
+    while pending:
+        for i in sorted(pending):
+            if log_paths[i].is_file() and READY_MARKER in log_paths[i].read_text(encoding="utf-8", errors="replace"):
+                pending.discard(i)
+            elif agents[i].poll() is not None:
+                raise RuntimeError(f"replay agent {i} exited {agents[i].returncode} before ready; see {log_paths[i]}")
+        if pending and time.monotonic() > deadline:
+            raise RuntimeError(f"replay agents {sorted(pending)} not ready after {timeout_s:.0f} s")
+        if pending:
+            time.sleep(poll_s)
+
+
+def stop_replay_agents(agents: list) -> list[str]:
+    """SIGTERM every agent, wait, and return a failure line per agent that did not exit 0."""
+    for proc in agents:
+        if proc.poll() is None:
+            proc.terminate()
+    failures = []
+    for proc in agents:
+        try:
+            code = proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            code = proc.wait(timeout=2)
+        if code not in (0, -15):
+            failures.append(f"replay agent pid={proc.pid} exited {code}")
+    return failures
+
+
+def _fallback_total(summary_path: Path) -> int | None:
+    """Sum of per-round predictor fallbacks (Section 9); None when not recorded (stub, B1-B3)."""
+    if not summary_path.is_file():
+        return None
+    counts = [r.get("predictor_fallbacks") for r in json.loads(summary_path.read_text(encoding="utf-8"))]
+    counts = [int(c) for c in counts if c is not None]
+    return sum(counts) if counts else None
+
+
+def _sha256(path: Path) -> str | None:
+    return hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
+
+
 def run_experiment(*, n: int, scenario: str, seed: int, rounds: int, beta: float,
                    trace_dir: str | Path, output_dir: str | Path, cross_mbps: float = 0.0,
                    gateway_factory: str = DEFAULT_STUB_FACTORY,
-                   profile_gateway: bool = False) -> Path:
-    """Run a real UDP smoke round with local stub policy providers."""
+                   profile_gateway: bool = False, experiment_id: str | None = None,
+                   policy: str | None = None, compute_window_s: float = 1.0,
+                   config: dict | None = None, value_bank: str | None = None,
+                   models_dir: str = DEFAULT_MODELS_DIR, ready_lossless: bool = True) -> Path:
+    """Run Mininet UDP rounds; the default stub factory is a protocol smoke test only.
+
+    Every exit path stops samplers, replay threads, cross traffic, child
+    processes and the Mininet network. A failed run leaves ``run_failure.json``
+    (not ``meta.json``), so the analysis never mistakes it for a complete run.
+    """
     if not isinstance(profile_gateway, bool):
         raise TypeError("profile_gateway must be a bool")
+    scenario = str(scenario).upper()
+    if scenario not in SCENARIOS:
+        raise ValueError(f"unknown scenario {scenario!r}")
+    if not compute_window_s >= 0:
+        raise ValueError("compute_window_s must be non-negative")
+    experiment_id, policy = run_identity(experiment_id, policy, gateway_factory)
+    stub_run = policy == STUB_POLICY
+    if not stub_run and policy not in GRANT_POLICIES and policy not in BASELINE_MODES:
+        raise ValueError(f"policy {policy!r} has no Mininet implementation; "
+                         f"expected one of {sorted(GRANT_POLICIES | set(BASELINE_MODES))}")
+    if experiment_id in MININET_EXPERIMENTS:
+        # Spec Section 5.2/12: real runs use the FULL value bank and always
+        # record gateway CPU/RSS (sampling is otherwise opt-in).
+        value_bank = value_bank or DEFAULT_VALUE_BANK
+        profile_gateway = True
+    if value_bank is not None and not Path(value_bank).is_file():
+        raise FileNotFoundError(f"value bank not found: {value_bank} (get it from the FULL seed-0 run)")
+    if not stub_run:
+        check_entry_points_available(policy)
     out = Path(output_dir)
     if out.exists() and any(out.iterdir()):
         raise FileExistsError(f"output directory is not empty: {out}")
     out.mkdir(parents=True, exist_ok=True)
+    identity = {"experiment_id": experiment_id, "policy": policy, "scenario": scenario,
+                "seed": int(seed), "N": int(n), "beta": float(beta), "cross_mbps": float(cross_mbps),
+                "n_rounds": int(rounds), "platform": "mininet"}
     started = time.monotonic_ns()
     roles = cpu_roles()
     net = None
     processes = []
     log_handles = []
-    replayers = []
+    replay_agents = []
+    agent_logs: list[Path] = []
     cross = None
     cross_result = None
+    capture = None
+    cross_drop_count = None
     sampler = None
     process_sampler = None
     try:
-        net = build(n=n, scenario=scenario, seed=seed)
+        net = build(n=n, scenario=scenario, seed=seed, ready_lossless=ready_lossless)
         verify_tc(net, net._fedgrant_expected_tc)
         round_state_path = out / ".round_state.json"
         RoundStateFile(round_state_path).write(round_id=0, active=False)
@@ -149,23 +382,38 @@ def run_experiment(*, n: int, scenario: str, seed: int, rounds: int, beta: float
         project_root = str(Path(__file__).resolve().parents[2])
         env["PYTHONPATH"] = project_root + os.pathsep + env.get("PYTHONPATH", "")
         py = sys.executable
-        duration_ns = smoke_duration_ns(beta, n, gateway_factory)
+        duration_ns = smoke_duration_ns(beta, n, DEFAULT_STUB_FACTORY if stub_run else policy)
+        gw_cmd, client_cmds = process_commands(
+            python=py, policy=policy, n=n, rounds=rounds, seed=seed, duration_ns=duration_ns,
+            compute_window_s=compute_window_s, out=out, round_state_path=round_state_path,
+            gateway_factory=gateway_factory, value_bank=value_bank, models_dir=models_dir,
+            profile_gateway=profile_gateway)
+        # Trace replay (L4/L5): one agent per client inside its own namespace,
+        # started before the gateway so it is waiting when round 1 begins.
+        for i in range(n):
+            agent_cmd = replay_agent_command(python=py, client_id=i, scenario=scenario, seed=seed,
+                                             trace_dir=trace_dir, round_state_path=round_state_path, out=out,
+                                             ready_lossless=ready_lossless)
+            if agent_cmd is None:
+                break
+            if roles["pinning_enabled"] and roles["clients"]:
+                agent_cmd = ["taskset", "-c", str(roles["clients"][i % len(roles["clients"])]), *agent_cmd]
+            agent_log = (out / f"replay_agent_{i}.log").open("w", encoding="utf-8")
+            log_handles.append(agent_log)
+            agent_logs.append(out / f"replay_agent_{i}.log")
+            replay_agents.append(net.get(f"c{i}").popen(agent_cmd, stdout=agent_log,
+                                                         stderr=subprocess.STDOUT, env=env))
+        if replay_agents:
+            wait_for_replay_agents(replay_agents, agent_logs)
         gateway_log = (out / "gateway.log").open("w", encoding="utf-8")
         log_handles.append(gateway_log)
-        gw_cmd = [py, "-m", "fedgrant.mininet.gateway_proc", "--clients", str(n), "--rounds", str(rounds),
-                  "--duration-ns", str(duration_ns),
-                  "--gateway-factory", gateway_factory, "--log-dir", str(out),
-                  "--round-state", str(round_state_path)]
-        if profile_gateway:
-            gw_cmd.append("--profile-gateway")
         if roles["pinning_enabled"] and roles["gateway"] is not None:
             gw_cmd = ["taskset", "-c", str(roles["gateway"]), *gw_cmd]
         processes.append(net.get("gw").popen(gw_cmd, stdout=gateway_log, stderr=subprocess.STDOUT, env=env))
         for i in range(n):
             client_log = (out / f"client_{i}.log").open("w", encoding="utf-8")
             log_handles.append(client_log)
-            cmd = [py, "-m", "fedgrant.mininet.client_proc", "--client-id", str(i), "--rounds", str(rounds),
-                   "--seed", str(seed), "--log-file", str(out / f"client_{i}.json")]
+            cmd = client_cmds[i]
             if roles["pinning_enabled"] and roles["clients"]:
                 cmd = ["taskset", "-c", str(roles["clients"][i % len(roles["clients"])]), *cmd]
             processes.append(net.get(f"c{i}").popen(cmd, stdout=client_log, stderr=subprocess.STDOUT, env=env))
@@ -174,31 +422,12 @@ def run_experiment(*, n: int, scenario: str, seed: int, rounds: int, beta: float
                                              cpu_id=roles["telemetry"],
                                              round_state_path=round_state_path).start()
 
-        if scenario.upper() in {"L4", "L5"}:
-            split = "ood" if scenario.upper() == "L5" else "test"
-            for i in range(n):
-                rates = client_trace(i, split, seed, data_dir=trace_dir)
-                host, iface = net.get(f"c{i}"), f"c{i}-eth0"
-                replay_log = out / f"trace_replay_client_{i}.csv"
-
-                def log_rate_change(actual_ns: int, replay_round: int, bin_index: int,
-                                    rate_bps: int, scheduled_ns: int, *, path=replay_log) -> None:
-                    exists = path.exists()
-                    with path.open("a", newline="", encoding="utf-8") as stream:
-                        writer = csv.writer(stream)
-                        if not exists:
-                            writer.writerow(("t_mono_ns", "round_id", "bin_index", "rate_bps",
-                                             "scheduled_mono_ns", "lag_ns"))
-                        writer.writerow((actual_ns, replay_round, bin_index, rate_bps,
-                                         scheduled_ns, actual_ns - scheduled_ns))
-
-                replayer = RateReplay(rates, lambda rate, h=host, dev=iface: h.cmd(tbf_change(dev, rate)),
-                                      repeat=True, round_state_path=round_state_path,
-                                      on_change=log_rate_change)
-                replayers.append(replayer.start())
         if cross_mbps > 0:
+            # Capture first: every cross datagram is numbered, so the gaps seen
+            # at the gateway are exactly its bottleneck drops (cross_drops.py).
+            capture = CrossCapture(net.get("gw"), "gw-eth0", out / "cross_capture.pcap").start()
             cross = CrossTraffic(net.get("gw"), net.get("xt"))
-            cross.start(cross_mbps, duration_s=max(2, int(rounds * 2)))
+            cross.start(cross_mbps, duration_s=cross_duration_s(rounds, duration_ns, compute_window_s))
 
         # The specification requires tc -s sampling every 10 ms at the shared
         # bottleneck. Access-link queues are not part of the reported bottleneck
@@ -217,6 +446,8 @@ def run_experiment(*, n: int, scenario: str, seed: int, rounds: int, beta: float
                 continue
             if code != 0:
                 failures.append(f"process pid={proc.pid} exited {code}")
+        failures += stop_replay_agents(replay_agents)
+        replay_agents = []
         if failures:
             raise RuntimeError("Mininet run failed: " + "; ".join(failures))
         # Combine sender-side client packets (which include DATA lost on the
@@ -234,7 +465,12 @@ def run_experiment(*, n: int, scenario: str, seed: int, rounds: int, beta: float
             writer.writeheader()
             writer.writerows(packet_rows)
         if cross is not None:
-            cross_result = cross.wait(timeout=max(5.0, rounds * 2.0 + 3.0))
+            cross_result = cross.wait(
+                timeout=cross_duration_s(rounds, duration_ns, compute_window_s) + 10.0)
+        if capture is not None:
+            capture.stop()
+            cross_drop_count = write_cross_drops(out / "cross_capture.pcap", out / "cross_drops.csv",
+                                                 capture.realtime_minus_mono_ns)
         if sampler is not None:
             sampler.stop()
             sampler = None
@@ -242,7 +478,8 @@ def run_experiment(*, n: int, scenario: str, seed: int, rounds: int, beta: float
             process_sampler.stop()
             process_sampler = None
         enrich_round_metrics(out, cross_mbps=cross_mbps)
-        if gateway_factory == DEFAULT_STUB_FACTORY:
+        baseline_eta_rounds = (fill_baseline_eta(out, n) if policy in {"B1", "B2"} else None)
+        if stub_run:
             summary_path = out / "gateway_summary.json"
             summary = json.loads(summary_path.read_text(encoding="utf-8"))
             accepted = sum(int(row.get("accepted_data", 0)) for row in summary)
@@ -264,11 +501,27 @@ def run_experiment(*, n: int, scenario: str, seed: int, rounds: int, beta: float
                                 "effective": host.cmd(f"tc -d qdisc show dev {iface}").strip()})
         loss_target, burst_target = SCENARIO_LOSS[scenario.upper()]
         meta = {
-            "experiment_id": "smoke-stub", "platform": "mininet", "scenario": scenario.upper(),
-            "seed": int(seed), "N": int(n), "beta": float(beta), "cross_mbps": float(cross_mbps),
-            "rounds": int(rounds), "compute_window_s": 1.0, "duration_ns": int(duration_ns),
+            **identity, "status": "ok", "rounds": int(rounds),
+            "config_id": (make_config_id(scenario, beta, n, cross_mbps)
+                          if experiment_id in MININET_EXPERIMENTS else None),
+            "config": ({k: config[k] for k in ("config_path", "config_sha256") if k in config}
+                       if config else None),
+            "compute_window_s": float(compute_window_s), "duration_ns": int(duration_ns),
             "started_mono_ns": started, "ended_mono_ns": time.monotonic_ns(),
-            "gateway_factory": gateway_factory, "trace_dir": str(trace_dir),
+            "gateway_factory": None if is_baseline(policy) else gateway_factory,
+            "gateway_entry_point": " ".join(entry_points(policy)[0][1:]),
+            "client_entry_point": " ".join(entry_points(policy)[1][1:]),
+            "value_bank": ({"path": str(value_bank), "sha256": _sha256(Path(value_bank))}
+                           if value_bank else None),
+            "profile_source": "value_bank" if value_bank else "synthetic",
+            # CHANGELOG amendment 2026-11-13: READY bypasses uplink GE loss (delay only).
+            "ready_lossless": bool(ready_lossless),
+            "baseline_eta_rounds_filled": baseline_eta_rounds,
+            "predictor_fallbacks_total": _fallback_total(out / "gateway_summary.json"),
+            "models_dir": str(models_dir),
+            "model_sha256": {name: _sha256(Path(models_dir) / name)
+                             for name in POLICY_MODEL_FILES.get(policy, ())},
+            "trace_dir": str(trace_dir),
             "trace_files": sorted(trace_hashes), "trace_sha256": trace_hashes,
             "trace_source": (trace_root.joinpath("SOURCE").read_text(encoding="utf-8")
                              if trace_root.joinpath("SOURCE").is_file() else None),
@@ -285,7 +538,9 @@ def run_experiment(*, n: int, scenario: str, seed: int, rounds: int, beta: float
                 "ge_target_loss_rate": loss_target, "ge_target_mean_burst": burst_target,
                 "tc_readback": tc_readback,
             },
-            "cross_traffic": ({"iperf3": cross_result, "receiver_payload_bps": udp_payload_bps(cross_result)}
+            "cross_traffic": ({"iperf3": cross_result, "receiver_payload_bps": udp_payload_bps(cross_result),
+                               "capture": "cross_capture.pcap", "drops_detected": cross_drop_count,
+                               "realtime_minus_mono_ns": capture.realtime_minus_mono_ns if capture else None}
                               if cross_result is not None else None),
             "gateway_profiling": {
                 "enabled": profile_gateway,
@@ -302,6 +557,16 @@ def run_experiment(*, n: int, scenario: str, seed: int, rounds: int, beta: float
             meta["gateway_profiling"]["summary_file"] = "gateway_profile.json"
         (out / "meta.json").write_text(json.dumps(meta, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         return out
+    except BaseException as exc:
+        try:
+            failure = {**identity, "status": "failed", "error_type": type(exc).__name__, "error": str(exc),
+                       "started_mono_ns": started, "failed_mono_ns": time.monotonic_ns(),
+                       "gateway_factory": gateway_factory}
+            (out / "run_failure.json").write_text(json.dumps(failure, indent=2, sort_keys=True) + "\n",
+                                                  encoding="utf-8")
+        except OSError:
+            pass
+        raise
     finally:
         active_error = sys.exc_info()[0] is not None
         cleanup_errors = []
@@ -310,9 +575,14 @@ def run_experiment(*, n: int, scenario: str, seed: int, rounds: int, beta: float
                 resource.stop()
             except BaseException as exc:
                 cleanup_errors.append(exc)
-        for replayer in replayers:
+        if replay_agents:
             try:
-                replayer.stop()
+                stop_replay_agents(replay_agents)
+            except BaseException as exc:
+                cleanup_errors.append(exc)
+        if capture is not None:
+            try:
+                capture.stop()
             except BaseException as exc:
                 cleanup_errors.append(exc)
         if cross is not None:
@@ -331,24 +601,65 @@ def run_experiment(*, n: int, scenario: str, seed: int, rounds: int, beta: float
             raise RuntimeError("one or more Mininet cleanup steps failed") from cleanup_errors[0]
 
 
-def main() -> None:
+_DEFAULTS = {"clients": 3, "scenario": "L2", "seed": 0, "rounds": 1, "beta": 0.10, "cross_mbps": 0.0,
+             "trace_dir": "data/traces", "gateway_factory": DEFAULT_STUB_FACTORY, "compute_window_s": 1.0,
+             "experiment_id": None, "policy": None, "output": None, "profile_gateway": False,
+             "value_bank": None, "models_dir": DEFAULT_MODELS_DIR, "ready_lossless": True}
+
+
+def resolve_cli(argv: list[str] | None = None) -> dict:
+    """Parse the command line; ``--config <yaml> --seed <s>`` is the specified form (Section 7)."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--clients", type=int, default=3)
-    parser.add_argument("--scenario", choices=("L1", "L2", "L3", "L4", "L5"), default="L2")
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--rounds", type=int, default=1)
-    parser.add_argument("--beta", type=float, default=0.10)
-    parser.add_argument("--cross-mbps", type=float, default=0.0)
-    parser.add_argument("--trace-dir", default="data/traces")
-    parser.add_argument("--output", required=True)
-    parser.add_argument("--gateway-factory", default=DEFAULT_STUB_FACTORY)
-    parser.add_argument("--profile-gateway", action="store_true",
+    parser.add_argument("--config", help="scenario or grid YAML (e.g. configs/grids/mn_m1.yaml)")
+    parser.add_argument("--clients", type=int)
+    parser.add_argument("--scenario", type=str.upper, choices=SCENARIOS)
+    parser.add_argument("--seed", type=int)
+    parser.add_argument("--rounds", type=int)
+    parser.add_argument("--beta", type=float)
+    parser.add_argument("--cross-mbps", dest="cross_mbps", type=float)
+    parser.add_argument("--trace-dir", dest="trace_dir")
+    parser.add_argument("--output", help="new, empty run directory (default: results/mininet/<run id>)")
+    parser.add_argument("--gateway-factory", dest="gateway_factory")
+    parser.add_argument("--experiment-id", dest="experiment_id")
+    parser.add_argument("--policy")
+    parser.add_argument("--compute-window-s", dest="compute_window_s", type=float)
+    parser.add_argument("--value-bank", dest="value_bank",
+                        help=f"FULL value bank .npz (default for M1/M2: {DEFAULT_VALUE_BANK})")
+    parser.add_argument("--models-dir", dest="models_dir")
+    parser.add_argument("--ready-lossy", dest="ready_lossless", action="store_false", default=None,
+                        help="original Section 7 uplink: READY subject to GE loss (comparison runs only)")
+    parser.add_argument("--profile-gateway", dest="profile_gateway", action="store_true", default=None,
                         help="collect gateway process CPU/RSS and scheduler-latency samples")
-    args = parser.parse_args()
-    path = run_experiment(n=args.clients, scenario=args.scenario, seed=args.seed, rounds=args.rounds,
-                          beta=args.beta, trace_dir=args.trace_dir, output_dir=args.output,
-                          cross_mbps=args.cross_mbps, gateway_factory=args.gateway_factory,
-                          profile_gateway=args.profile_gateway)
+    args = vars(parser.parse_args(argv))
+    config_path = args.pop("config")
+    overrides = {k: v for k, v in args.items() if v is not None}
+    try:
+        settings = load_run_config(config_path, overrides) if config_path else dict(overrides)
+    except (OSError, ValueError) as exc:
+        parser.error(str(exc))
+    for key, value in _DEFAULTS.items():
+        settings.setdefault(key, value)
+    if settings["output"] is None:
+        label = "-".join(str(part) for part in (
+            settings["experiment_id"] or STUB_EXPERIMENT_ID, settings["scenario"],
+            settings["policy"] or "stub", f"s{settings['seed']}", time.strftime("%Y%m%d-%H%M%S")))
+        settings["output"] = str(Path("results/mininet") / label)
+    return settings
+
+
+def main(argv: list[str] | None = None) -> None:
+    s = resolve_cli(argv)
+    if hasattr(os, "geteuid") and os.geteuid() != 0:
+        # Check before creating the run directory, so a forgotten sudo leaves nothing behind.
+        raise SystemExit("run_mininet needs root (network namespaces and tc): rerun with sudo")
+    path = run_experiment(n=int(s["clients"]), scenario=s["scenario"], seed=int(s["seed"]),
+                          rounds=int(s["rounds"]), beta=float(s["beta"]), trace_dir=s["trace_dir"],
+                          output_dir=s["output"], cross_mbps=float(s["cross_mbps"]),
+                          gateway_factory=s["gateway_factory"], profile_gateway=bool(s["profile_gateway"]),
+                          experiment_id=s["experiment_id"],
+                          policy=s["policy"], compute_window_s=float(s["compute_window_s"]),
+                          config=s if "config_path" in s else None, value_bank=s["value_bank"],
+                          models_dir=s["models_dir"], ready_lossless=bool(s["ready_lossless"]))
     print(path)
 
 

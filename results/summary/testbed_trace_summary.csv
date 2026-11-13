@@ -1,0 +1,12 @@
+trace,split,bins,duration_s,mean_mbps,p05_mbps,p95_mbps
+ATT-LTE-driving,test,1520,152.0,0.774,0.000,1.560
+ATT-LTE-driving,train,7086,708.6,0.932,0.000,1.560
+ATT-LTE-driving,val,1518,151.8,0.432,0.000,1.440
+TMobile-UMTS-driving,ood,9312,931.2,0.943,0.000,1.440
+Verizon-EVDO-driving,ood,10647,1064.7,0.843,0.000,1.440
+Verizon-LTE-driving,test,2049,204.9,5.650,0.000,16.800
+Verizon-LTE-driving,train,9557,955.7,6.075,0.000,12.360
+Verizon-LTE-driving,val,2047,204.7,7.514,1.800,15.000
+Verizon-LTE-short,test,211,21.1,6.106,1.260,12.420
+Verizon-LTE-short,train,979,97.9,5.250,0.480,11.280
+Verizon-LTE-short,val,210,21.0,9.025,4.494,13.866

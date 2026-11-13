@@ -114,3 +114,21 @@ Finish Parts 1 and 2 first because they are pure and unblock both the topology a
 - Part 4 has a stub-policy UDP runner, replay, cross-traffic process, telemetry, logs, and cleanup. The runner fails closed if it produces no valid grant/DATA exchange; a previous smoke run accepted 14 DATA blocks across three clients with zero invalid events. The required injected-failure teardown test is still absent. The runner also does not yet accept the specification's `--config <yaml> --seed <s>` command or execute the M1 grid.
 - Part 5 has raw-metric and paired calibration code with synthetic-fixture tests, scenario/grid files, a Dockerfile, Makefile, lock file, and report/setup drafts. Non-ML and ML tests passed in the current checkout during the previous verification pass; container clean-machine and Mininet reproduction still need a recorded run. Empirical M1/M-sim results remain pending and calibration requires production M1 rows plus matching Jayadev M-sim rows.
 - PyTorch-only FL tests are kept behind `make test-ml`; the testbed suite does not require downloading Torch.
+
+## Update 2026-11-12 (local, uncommitted)
+
+- `run_mininet` accepts `--config <yaml> --seed <s>` (scenario or grid YAML; CLI overrides; grid values validated), plus `--experiment-id`, `--policy`, `--compute-window-s`. `meta.json` now records experiment id, policy, `n_rounds`, `config_id` (M1/M2), config path/hash, and the compute window actually passed to the gateway. The stub factory cannot be labelled M1/M2.
+- Round state is initialised before the gateway starts (removes the start-up race). Failed runs write `run_failure.json` and no `meta.json`.
+- `tests/unit/test_mininet_teardown.py` adds the injected-failure teardown tests (build failure, `verify_tc` failure, client crash with a hung gateway, spawn failure) and teardown idempotency/kill tests, all without root.
+- `validate_ge measure` passes PYTHONPATH to its child processes.
+- Added `configs/grids/mn_m2.yaml`, `make mininet-run`, and a proposed Fedora platform amendment in `CHANGELOG.md`.
+- Still open: a production gateway factory and production client process for M1 (B1/B2/B3 adapters, B4/B6/FG-GRU providers), the M1 runs themselves, accepted M-sim rows, calibration, and the Docker clean-machine reproduction.
+
+## Update 2026-11-13 (local, uncommitted)
+
+- Cross-traffic drop split implemented (`fedgrant/mininet/cross_drops.py`): gateway capture of numbered iperf3 datagrams; per-round `queue_drops_cross` / `queue_drops_fg` in `round_metrics.csv` and `runs.csv`. Needs a root X2 run to confirm on real traffic.
+- Container reproduction: `.dockerignore` (no local data in the image), lock files moved to `docker/` (spec Section 15), scipy pinned to a Python 3.11 release, CPU PyTorch in `docker/requirements-ml.lock`, `make docker-test` (docker or podman). Result: 843 passed, 1 skipped inside the image.
+- Report generator `make testbed-report` (byte-stable tables in `results/summary/testbed_*`, figures in `results/figures/testbed_*.pdf`); report draft expanded with replay timing and reproducibility notes.
+- Pending: N=20 stub scale runs (L2, L4, X2) on the Fedora host; production M1 runs after Prajin's gateway/baseline processes.
+- N = 20 stub scale runs on the Fedora host (L2, L4, X2, 25 rounds each) completed with 0 invalid events and ±2 ms round timing. Trace replay moved to per-client rtnetlink agents (median lag 3.5 ms vs 9.0 ms before) with a ready handshake before round 1. Cross-drop attribution validated under 12 Mbit/s overload (capture 8,330 vs iperf3 8,432 drops).
+- **Open, needs a team decision:** READY is lost on the lossy uplink in 13–16% of client-rounds at N = 20 (Section 7 applies loss to all client egress; the simulator delivers READY without loss), so eta is blank in most rounds. Options: exempt READY from netem loss on the testbed (Section 7 amendment), or retransmit READY in the client.

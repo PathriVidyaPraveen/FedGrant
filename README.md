@@ -9,7 +9,7 @@ The project requires Python 3.11 or newer. The simulator and analysis use NumPy 
 ```sh
 python3 -m venv --system-site-packages .venv
 . .venv/bin/activate
-python -m pip install -r requirements.lock
+python -m pip install -r docker/requirements.lock
 python -m pip install --no-deps -e .
 ```
 
@@ -22,6 +22,45 @@ make test-mininet            # sudo, Open vSwitch, sch_netem and sch_tbf
 ```
 
 `make test` excludes the two ML integration modules; `make test-ml` runs them. The third command checks the root-required N=3/L2 topology, RTT, client access shaping, and shared bottleneck. It is a topology acceptance test, not an M1 experiment.
+
+## FEMNIST data
+
+The project specification uses LEAF commit `09ec454a5675e32e1f0546b456b77857fdece018` and these preprocessing settings:
+
+```bash
+./preprocess.sh -s niid -sf 0.1 -k 100 -t sample --smplseed 1549786595 --spltseed 1549786796
+```
+
+From the repository root, prepare a reproducible copy with:
+
+```bash
+bash scripts/get_femnist.sh
+```
+
+The script writes to `data/femnist/reproduced/` and refuses to overwrite that path. Pass another output path as its first argument to prepare a separate copy. The output contains the LEAF train/test JSON files, memory-mappable per-client NumPy shards, a client manifest, and `provenance.json` with the exact commit and settings. It selects the first 200 sorted writer IDs and groups 10 consecutive writers into each of 20 clients. Images are 28×28 grayscale values in `[0,1]`, with no augmentation. The source `data/femnist/clients/` and any existing runs are left untouched.
+
+To run a full-participation reference experiment on that generated dataset, pass its paths explicitly, for example:
+
+```bash
+.venv/bin/python -m fedgrant.fl.run_fl --seed 0 \
+  --data-root data/femnist/reproduced/leaf/data \
+  --shard-root data/femnist/reproduced/clients \
+  --bank data/bank/femnist_full_s0.npz
+```
+
+The FL runner defaults to those same `reproduced/` paths and refuses datasets without embedded provenance unless `--allow-unverified-data` is explicitly passed. Every run record stores the preprocessing version, the provenance document and its SHA-256, the client-manifest hash, and the per-shard hashes. Value banks store the same dataset metadata. Existing runs and banks created from `data/femnist/clients/` remain unverified; their data source cannot be recovered from the artifacts alone.
+
+## Simulator ML splits
+
+Generate the four event/feature datasets from the discrete-event simulator:
+
+```bash
+.venv/bin/python -m fedgrant.ml.datagen
+```
+
+By default this uses every seed in the split ranges from `fedgrant.ml.schema.SPLITS`, runs 50 rounds per seed, and writes bounded shards under `data/mldata/{train,val,test_id,test_ood}/`. In-distribution splits use the required `*_train.csv`, `*_val.csv`, and `*_test_id.csv` cellular traces; the OOD split uses `*_test_ood.csv` OOD traces. Missing trace files are reported before generation rather than silently replaced by constant-rate links. Use `--runs-per-split 1` for a small smoke run, `--trace-dir` to locate traces, or `--out` to choose a new output directory. The generator will not overwrite existing shards.
+
+The simulator and gateway feature code share `fedgrant.policy.features.features48`. The parity integration test checks that `GatewaySim` imports that exact implementation. This checkout does not contain a separate gateway-daemon implementation, so parity against a deployed daemon still requires running the same test vectors against that external implementation.
 
 ## Trace preparation
 
@@ -45,7 +84,9 @@ sudo .venv/bin/python -m fedgrant.mininet.run_mininet \
   --clients 3 --rounds 1 --scenario L2 --output results/mininet/smoke
 ```
 
-The runner currently uses an explicitly labeled first-eligible stub policy and synthetic client updates. Its output validates transport/topology/logging only; it must not be labeled production M1 data. It records effective `tc` readbacks, 10 ms bottleneck queue samples, 100 ms process samples, per-grant and per-packet logs, round summaries, and trace-replay updates. For cross traffic, `--cross-mbps 3` sends UDP from `xt` to the gateway sink on port 9999. A single TBF qdisc does not reveal which flow caused a drop, so the analyzer reports the foreground/cross-traffic split as unmeasured when both share the queue.
+The specified form is `sudo .venv/bin/python -m fedgrant.mininet.run_mininet --config <yaml> --seed <s>` (or `make mininet-run CONFIG=<yaml> SEED=<s>`). The config may be a scenario file (`configs/scenarios/L3.yaml`) or a grid file (`configs/grids/mn_m1.yaml`); for a grid, pick one value of each listed factor with `--scenario`/`--policy`. Command-line values override the file, and grid values must be in the file's lists. The runner refuses to label stub output as M1/M2: those runs need `--gateway-factory module:function` for the production gateway. A failed run leaves `run_failure.json` instead of `meta.json`, so `make metrics` cannot mistake it for a complete run.
+
+The default gateway is an explicitly labeled first-eligible stub policy with synthetic client updates. Its output validates transport/topology/logging only; it must not be labeled production M1 data. It records effective `tc` readbacks, 10 ms bottleneck queue samples, 100 ms process samples, per-grant and per-packet logs, round summaries, and trace-replay updates. For cross traffic, `--cross-mbps 3` sends UDP from `xt` to the gateway sink on port 9999. A single TBF qdisc does not reveal which flow caused a drop, so the runner also captures the numbered iperf3 datagrams at `gw-eth0` (`tcpdump`). Every missing sequence number is one cross-traffic bottleneck drop, timed from its send timestamp (`cross_drops.csv`), and FedGrant drops are the TBF total minus those (`fedgrant/mininet/cross_drops.py`).
 
 ## Experiment grid and analysis
 

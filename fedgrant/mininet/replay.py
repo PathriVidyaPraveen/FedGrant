@@ -81,15 +81,22 @@ class RateReplay:
                 scheduled_ns = start_ns + index * self.interval_ns
                 if scheduled_ns >= deadline_ns:
                     break
+                aborted = False
                 while not self._stop.is_set():
-                    now = self.clock_ns()
-                    remaining = scheduled_ns - now
+                    remaining = scheduled_ns - self.clock_ns()
                     if remaining <= 0:
                         break
-                    self._stop.wait(min(remaining / 1e9, 0.001))
+                    if remaining <= 5_000_000:
+                        # Final approach: sleep to the boundary without file I/O.
+                        self._stop.wait(remaining / 1e9)
+                        continue
+                    self._stop.wait(0.005)
                     current = self.round_state.read()
                     if not current.get("active") or int(current["round_id"]) != round_id:
+                        aborted = True
                         break
+                if aborted:
+                    break
                 if self._stop.is_set():
                     return
                 current = self.round_state.read()

@@ -16,6 +16,11 @@ Re-running an analysis must rewrite the whole file from the raw logs (`make plot
 
 A run is identified by **(experiment_id, config_id, policy, seed)**. Duplicates are an error.
 
+The current v2 writer emits every column listed in §2. The reader remains compatible with
+older summaries that omit v2-only baseline and queue-delay columns; omitted optional values
+are treated as unmeasured. Required identity columns, applicable required metrics, and the
+status field must still be present and valid.
+
 ## 2. Columns
 
 Empty cell = not measured (read as NaN). Booleans are `true` / `false`.

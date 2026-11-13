@@ -8,6 +8,7 @@ from pathlib import Path
 import numpy as np
 
 from fedgrant.common.logschema import ROUND_METRIC_COLUMNS
+from fedgrant.mininet.cross_drops import read_cross_drop_times, split_drops
 from fedgrant.policy.constants import C, S
 
 
@@ -28,9 +29,11 @@ def _write(path: Path, columns: tuple[str, ...], rows: list[dict[str, str]]) -> 
 def enrich_round_metrics(run_dir: str | Path, *, cross_mbps: float, capacity_bps: int = C) -> None:
     """Add measured queue, utilization, and wire-overhead metrics to each round.
 
-    A single shared qdisc cannot split drops by source flow. With no cross
-    traffic all bottleneck drops are foreground; with cross traffic that split
-    remains blank instead of being guessed.
+    A single shared qdisc cannot split drops by source flow. Without cross
+    traffic all bottleneck drops are FedGrant's. With cross traffic, the
+    per-datagram cross drops in ``cross_drops.csv`` (see cross_drops.py) are
+    subtracted from the TBF total; without that file the split stays blank
+    instead of being guessed.
     """
     root = Path(run_dir)
     rounds = _read(root / "round_metrics.csv")
@@ -39,6 +42,7 @@ def enrich_round_metrics(run_dir: str | Path, *, cross_mbps: float, capacity_bps
     queue = [r for r in _read(root / "queues.csv")
              if r.get("interface") == "s1-gw" and r.get("qdisc") == "tbf"]
     packets = _read(root / "packets.csv")
+    cross_times = read_cross_drop_times(root / "cross_drops.csv")
     for current in rounds:
         rid = int(current["round_id"])
         start_ns = int(current.get("round_start_mono_ns") or 0)
@@ -61,9 +65,9 @@ def enrich_round_metrics(run_dir: str | Path, *, cross_mbps: float, capacity_bps
                     packets_out = max(0, int(last.get("packets") or 0) - int(first.get("packets") or 0))
                     drops = max(0, int(last["drops"]) - int(first["drops"]))
                     current["utilization"] = str(packets_out * S * 8 / (capacity_bps * duration_s))
-                    if cross_mbps <= 0:
-                        current["queue_drops_fg"] = str(drops)
-                        current["queue_drops_cross"] = "0"
+                    split = split_drops(drops, cross_times, start_ns, deadline_ns, cross_mbps)
+                    if split is not None:
+                        current["queue_drops_fg"], current["queue_drops_cross"] = map(str, split)
         elif cross_mbps <= 0:
             current["queue_drops_fg"] = "0"
             current["queue_drops_cross"] = "0"
@@ -83,4 +87,29 @@ def enrich_round_metrics(run_dir: str | Path, *, cross_mbps: float, capacity_bps
     _write(root / "round_metrics.csv", ROUND_METRIC_COLUMNS, rounds)
 
 
-__all__ = ["enrich_round_metrics"]
+def fill_baseline_eta(run_dir: str | Path, num_clients: int) -> int:
+    """Fill blank per-round eta for B1/B2 runs from the post-run join (design decision D-09).
+
+    B1/B2 clients send no READY, so the gateway cannot compute Eq. (7) live;
+    ``baseline_metrics.eta_from_run_dir`` joins the gateway's delivered sets
+    with each client's block energies. Rounds where any client's energies are
+    missing stay blank. Returns the number of rounds filled.
+    """
+    from fedgrant.mininet.baseline_metrics import eta_from_run_dir
+
+    root = Path(run_dir)
+    rounds = _read(root / "round_metrics.csv")
+    if not rounds:
+        return 0
+    eta = eta_from_run_dir(root, num_clients)
+    filled = 0
+    for row in rounds:
+        value = eta.get(int(row["round_id"]))
+        if value is not None and not str(row.get("eta", "")).strip():
+            row["eta"] = repr(float(value))
+            filled += 1
+    _write(root / "round_metrics.csv", ROUND_METRIC_COLUMNS, rounds)
+    return filled
+
+
+__all__ = ["enrich_round_metrics", "fill_baseline_eta"]

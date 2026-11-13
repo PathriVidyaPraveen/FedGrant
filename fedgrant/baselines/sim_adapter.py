@@ -84,8 +84,19 @@ def run_baseline_network_round(
     d: int = D_MODEL,
     L: int = L_DEFAULT,
     deadline_ns: int | None = None,
+    client_weights: np.ndarray | None = None,
+    client_energies: np.ndarray | None = None,
+    cross_mbps: float = 0.0,
 ) -> dict[str, Any]:
-    """Run one B2 or B3 round over the shared discrete-event network model."""
+    """Run one B2 or B3 round over the shared discrete-event network model.
+
+    ``client_weights`` and ``client_energies`` take the same frozen value-bank
+    inputs as the grant simulator: one weight per client and one descending
+    energy profile per client in send-position order. Omitted inputs keep the
+    legacy uniform weights and synthetic profile. ``cross_mbps`` configures
+    bottleneck cross traffic; the legacy ``scenario="X2"`` alias still means
+    3 Mbit/s when no explicit rate is given.
+    """
     if policy not in {"B2", "B3"}:
         raise ValueError("policy must be B2 or B3")
     if isinstance(round_id, bool) or not isinstance(round_id, int) or round_id < 1:
@@ -108,7 +119,26 @@ def run_baseline_network_round(
     elif gateway.protocol != policy:
         raise ValueError("persistent baseline state does not match policy")
 
-    weights = np.full(num_clients, 1.0 / num_clients, dtype=np.float64)
+    if isinstance(cross_mbps, bool) or not isinstance(cross_mbps, (int, float, np.floating)) or not math.isfinite(float(cross_mbps)) or cross_mbps < 0:
+        raise ValueError("cross_mbps must be finite and non-negative")
+    if client_weights is None:
+        weights = np.full(num_clients, 1.0 / num_clients, dtype=np.float64)
+    else:
+        weights = np.asarray(client_weights, dtype=np.float64)
+        if weights.shape != (num_clients,) or not np.isfinite(weights).all() or np.any(weights < 0):
+            raise ValueError(f"client_weights must be {num_clients} finite non-negative values")
+        if not np.isclose(float(weights.sum()), 1.0):
+            raise ValueError("client_weights must sum to 1")
+    if client_energies is None:
+        energy_rows = np.tile(np.linspace(1.0, 0.01, K, dtype=np.float32), (num_clients, 1))
+    else:
+        energy_rows = np.asarray(client_energies, dtype=np.float32)
+        if energy_rows.shape != (num_clients, K):
+            raise ValueError(f"client_energies must have shape ({num_clients}, {K})")
+        if not np.isfinite(energy_rows).all() or np.any(energy_rows < 0):
+            raise ValueError("client_energies must be finite and non-negative")
+        if np.any(np.diff(energy_rows, axis=1) > 0):
+            raise ValueError("client_energies must be sorted descending in send-position order")
     seed_streams = np.random.SeedSequence(seed).spawn(6)
     rng_trace = np.random.default_rng(seed_streams[0])
     rng_ge = np.random.default_rng(seed_streams[1])
@@ -144,11 +174,12 @@ def run_baseline_network_round(
         access_links.append(link)
 
     cross_traffic: CrossTrafficGenerator | None = None
-    if trace_scenario == "X2":
+    effective_cross_mbps = 3.0 if trace_scenario == "X2" and cross_mbps == 0 else float(cross_mbps)
+    if effective_cross_mbps > 0:
         cross_traffic = CrossTrafficGenerator(
             engine=engine,
             bottleneck=bottleneck,
-            rate_bps=3_000_000.0,
+            rate_bps=effective_cross_mbps * 1_000_000.0,
             frame_size_bytes=S,
             rng=rng_cross,
         )
@@ -178,7 +209,6 @@ def run_baseline_network_round(
             }),
         )
 
-    energies = np.linspace(1.0, 0.01, K, dtype=np.float32)
     coords = np.full(K, L, dtype=np.int64)
     coords[-1] = d - (K - 1) * L
     data_size_bytes = data_frame_size_bytes(L)
@@ -335,7 +365,7 @@ def run_baseline_network_round(
                 round_id=round_id,
                 client_id=cid,
                 t_send_ns=round_start_abs_ns + rho_us * 1_000,
-                body={"K": K, "energy": tuple(float(value) for value in energies)},
+                body={"K": K, "energy": tuple(float(value) for value in energy_rows[cid])},
                 block_length=L,
             )
             ready_ns = (
@@ -444,9 +474,9 @@ def run_baseline_network_round(
 
     engine.run_until(deadline_abs_ns)
     frames_sent_at_deadline = bottleneck.frames_sent
-    data_queue_drops_at_deadline = (
-        sum(link.drops_queue for link in access_links) + bottleneck.drops_queue_client
-    )
+    access_queue_drops_at_deadline = sum(link.drops_queue for link in access_links)
+    bottleneck_data_drops_at_deadline = bottleneck.drops_queue_client
+    data_queue_drops_at_deadline = access_queue_drops_at_deadline + bottleneck_data_drops_at_deadline
     cross_queue_drops_at_deadline = bottleneck.drops_queue_cross
     if cross_traffic is not None:
         cross_traffic.stop()
@@ -513,18 +543,18 @@ def run_baseline_network_round(
 
     engine.run_all()
 
-    total_energy = float(np.sum((weights[:, None] ** 2) * energies[None, :]))
+    total_energy = float(np.sum((weights[:, None] ** 2) * energy_rows.astype(np.float64)))
     delivered_energy = sum(
-        float(weights[cid] ** 2) * float(energies[block_idx])
+        float(weights[cid] ** 2) * float(energy_rows[cid, block_idx])
         for cid, indices in delivered_by_client.items()
         for block_idx in indices
     )
     eta = delivered_energy / total_energy if total_energy > 0 else 0.0
-    delivered_payload_bytes = sum(
-        int(round_result.client_results[cid].n_coords[block_idx]) * 2
-        for cid, indices in delivered_by_client.items()
-        for block_idx in indices
-    )
+    # Same accounting boundary as the grant simulator (run_net) and the FL
+    # baseline simulator: every DATA carries a fixed L-coordinate fp16 block
+    # (the final block is zero-padded on the wire), so delivered payload bytes
+    # are unique delivered blocks x 2L. n_coords is decoder metadata only.
+    delivered_payload_bytes = sum(len(indices) for indices in delivered_by_client.values()) * 2 * L
     duration_s = duration_ns / 1_000_000_000.0
     queueing_delays_ms = [
         (float(sample["backlog_bits"]) / float(C)) * 1000.0
@@ -542,6 +572,9 @@ def run_baseline_network_round(
         "queueing_delay_mean_ms": float(np.mean(queueing_delays_ms)) if queueing_delays_ms else 0.0,
         "queueing_delay_p99_ms": float(np.percentile(queueing_delays_ms, 99)) if queueing_delays_ms else 0.0,
         "drops_queue_data": data_queue_drops_at_deadline,
+        "drops_queue_access": access_queue_drops_at_deadline,
+        # Spec queue drops: bottleneck drop-tail drops of FedGrant frames.
+        "drops_queue_bn_client": bottleneck_data_drops_at_deadline,
         "drops_queue_cross": cross_queue_drops_at_deadline,
         "wasted_grants_ratio": None,
         "late_after_timeout": None,

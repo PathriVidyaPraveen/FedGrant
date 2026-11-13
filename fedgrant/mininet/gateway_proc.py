@@ -4,109 +4,125 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import importlib
-import csv
-import json
-import time
-from pathlib import Path
 
-from fedgrant.common.logschema import ROUND_METRIC_COLUMNS
 from fedgrant.core.state import Status
+from fedgrant.mininet.contract import (
+    DEFAULT_MODELS_DIR, STUB_POLICY, MininetGatewayContext, build_gateway, load_bank, load_factory,
+    policy_config_for, uniform_weights,
+)
 from fedgrant.mininet.logging_tap import LoggingUdpGateway
+from fedgrant.mininet.round_loop import RoundTiming, RoundWindow, readiness_delays_us, run_rounds
 from fedgrant.mininet.round_state import RoundStateFile
 
 
-def load_factory(spec: str):
-    module_name, separator, attribute = spec.partition(":")
-    if not separator:
-        raise ValueError("gateway factory must use module:function syntax")
-    return getattr(importlib.import_module(module_name), attribute)
+def build_context(args: argparse.Namespace) -> MininetGatewayContext:
+    """Build the factory input; weights come from the value bank when one is given."""
+    weights = (load_bank(args.value_bank, args.clients).client_weights
+               if args.value_bank else uniform_weights(args.clients))
+    return MininetGatewayContext(
+        num_clients=args.clients, policy=args.policy, seed=args.seed,
+        policy_config=policy_config_for(args.policy), client_weights=weights,
+        deadline_ns=args.duration_ns, K=args.blocks, L=args.block_length,
+        models_dir=args.models_dir, log_dir=args.log_dir,
+    )
+
+
+class GrantRoundProtocol:
+    """GatewayCore (grant mode) steps for the shared round loop."""
+
+    def __init__(self, core, gateway, *, num_clients: int, K: int, L: int, seed: int = 0):
+        self.core, self.gateway = core, gateway
+        self.num_clients, self.K, self.L, self.seed = num_clients, K, L, seed
+        self._before: dict[str, int] = {}
+        self._deadline_completion = 0.0
+
+    def begin_round(self, round_id: int, now_ns: int, duration_ns: int) -> RoundWindow:
+        stats = self.core.stats
+        self._before = {name: getattr(stats, name) for name in (
+            "late_after_timeout", "late_after_deadline", "accepted_data", "rejected_data", "invalid_events")}
+        self._fallbacks_before = self._fallbacks()
+        # Per-client readiness rho_i ~ U(0, 0.1 D) from the simulator's seeded
+        # stream (Section 3.1), the same draws as the M-sim twin and the B1-B3
+        # processes; each client waits rho_i after ROUND_START before READY.
+        rho_us = readiness_delays_us(self.seed, round_id, self.num_clients, duration_ns)
+        self._actions = self.core.on_round_start(now_ns, round_id=round_id, duration_ns=duration_ns,
+                                                 K=self.K, L=self.L, rho_us=rho_us)
+        return RoundWindow(round_id, self.core.round.start_ns, self.core.round.deadline_ns)
+
+    def _fallbacks(self) -> int | None:
+        predictor = getattr(self.core, "predictor", None)
+        count = getattr(predictor, "n_fallbacks", None)
+        return None if count is None else int(count)
+
+    def send_round_start(self, window: RoundWindow) -> None:
+        # The round loop has already published the round window, so client
+        # rate replay is relative to the real round origin.
+        self.gateway.dispatch_actions(self._actions)
+        self._actions = []
+
+    def at_deadline(self, window: RoundWindow) -> None:
+        if self.core.phase.name == "ACTIVE":
+            # Snapshot before on_deadline marks pending grants lost.
+            self.gateway.capture_deadline_state()
+            self.gateway.dispatch_actions(self.core.on_deadline(self.core.round.deadline_ns))
+        # The transport scheduler may have invoked on_deadline first; its tick
+        # hook snapshots unresolved grants before cleanup.
+        self._deadline_completion = float(self.gateway.capture_deadline_state() == 0)
+        self.gateway.log_timeouts()
+
+    def finish_round(self, window: RoundWindow) -> tuple[dict, dict]:
+        # Called after the late drain: arrivals after D were counted against this round.
+        core, stats = self.core, self.core.stats
+        states = list(core.clients.values())
+        total_value = sum(float(state.val.sum(dtype="float64")) for state in states)
+        delivered_value = sum(float(state.val[state.status == Status.DELIVERED].sum(dtype="float64"))
+                              for state in states)
+        eta = delivered_value / total_value if total_value > 0 and len(core.energies) == self.num_clients else ""
+        delivered = sum(state.m for state in states)
+        issued = max(0, core.next_grant_id - 1)
+        timed_out = sum(len(ids) for ids in core.timed_out_grants.values())
+        duration_s = (window.deadline_ns - window.start_ns) / 1e9
+        row = {
+            "eta": eta,
+            "delivered_blocks": delivered,
+            "clients_represented": sum(state.m > 0 for state in states),
+            "deadline_completion": self._deadline_completion,
+            "goodput_bps": delivered * 2 * self.L * 8 / duration_s,
+            "wasted_grants": timed_out / issued if issued else 0.0,
+            "late_after_timeout": stats.late_after_timeout - self._before["late_after_timeout"],
+            "late_after_deadline": stats.late_after_deadline - self._before["late_after_deadline"],
+        }
+        record = {name: getattr(stats, name) - self._before[name]
+                  for name in ("accepted_data", "rejected_data", "invalid_events")}
+        # Section 9 fallback: >0 means the configured predictor (e.g. P-GRU) was
+        # replaced by P-EWMA for part of this round; such runs are flagged.
+        now = self._fallbacks()
+        record["predictor_fallbacks"] = None if now is None else now - self._fallbacks_before
+        return row, record
 
 
 async def serve(args: argparse.Namespace) -> None:
-    core = load_factory(args.gateway_factory)(args.clients)
+    core = build_gateway(args.gateway_factory, build_context(args))
     endpoints = {i: (f"10.0.0.{i + 1}", args.client_port) for i in range(args.clients)}
     gateway = await LoggingUdpGateway.bind(core, local_addr=("10.0.0.254", args.port),
                                            endpoints=endpoints, log_dir=args.log_dir,
                                            profile_scheduler=args.profile_gateway)
     try:
-        round_state = RoundStateFile(args.round_state)
-        round_state.write(round_id=0, active=False)
-        await asyncio.sleep(args.start_delay_s)
-        round_metrics_path = Path(args.log_dir, "round_metrics.csv")
-        round_records = []
-        with round_metrics_path.open("w", newline="", encoding="utf-8") as metrics_file:
-            metrics_writer = csv.DictWriter(metrics_file, fieldnames=ROUND_METRIC_COLUMNS, extrasaction="raise")
-            metrics_writer.writeheader()
-            for round_id in range(1, args.rounds + 1):
-                await asyncio.sleep(args.compute_window_s)
-                late_timeout_before = core.stats.late_after_timeout
-                late_deadline_before = core.stats.late_after_deadline
-                accepted_before = core.stats.accepted_data
-                rejected_before = core.stats.rejected_data
-                invalid_before = core.stats.invalid_events
-                start_ns = time.monotonic_ns()
-                actions = core.on_round_start(start_ns, round_id=round_id,
-                                              duration_ns=args.duration_ns,
-                                              K=args.blocks, L=args.block_length)
-                round_start_ns = core.round.start_ns
-                round_deadline_ns = core.round.deadline_ns
-                round_state.write(round_id=round_id, start_ns=round_start_ns,
-                                  deadline_ns=round_deadline_ns, active=True)
-                # Publish the trace/telemetry window before the first UDP
-                # ROUND_START is sent, so every client rate replay is relative
-                # to the actual round origin.
-                gateway.dispatch_actions(actions)
-                await asyncio.sleep(args.duration_ns / 1e9)
-                if core.phase.name == "ACTIVE":
-                    # Snapshot before on_deadline marks pending grants lost.
-                    gateway.capture_deadline_state()
-                    gateway.dispatch_actions(core.on_deadline(core.round.deadline_ns))
-                # The transport scheduler may have invoked on_deadline first;
-                # its tick hook snapshots unresolved grants before cleanup.
-                unresolved_at_deadline = gateway.capture_deadline_state()
-                deadline_completion = float(unresolved_at_deadline == 0)
-                gateway.log_timeouts()
-                round_state.write(round_id=round_id, active=False)
-                # Keep the old round context available while queued DATA
-                # packets drain, so arrivals after D are counted against this
-                # round before the next ROUND_START resets the counters.
-                await asyncio.sleep(args.late_drain_s)
-                states = list(core.clients.values())
-                total_value = sum(float(state.val.sum(dtype="float64")) for state in states)
-                delivered_value = sum(float(state.val[state.status == Status.DELIVERED].sum(dtype="float64")) for state in states)
-                eta = delivered_value / total_value if total_value > 0 and len(core.energies) == args.clients else ""
-                delivered = sum(state.m for state in states)
-                delivered_payload_bytes = delivered * 2 * args.block_length
-                issued = max(0, core.next_grant_id - 1)
-                timed_out = sum(len(ids) for ids in core.timed_out_grants.values())
-                metrics_writer.writerow({
-                    "round_id": round_id,
-                    "round_start_mono_ns": round_start_ns,
-                    "deadline_mono_ns": round_deadline_ns,
-                    "eta": eta,
-                    "delivered_blocks": delivered,
-                    "clients_represented": sum(state.m > 0 for state in states),
-                    "deadline_completion": deadline_completion,
-                    "goodput_bps": delivered_payload_bytes * 8 / (args.duration_ns / 1e9),
-                    "wasted_grants": timed_out / issued if issued else 0.0,
-                    "late_after_timeout": core.stats.late_after_timeout - late_timeout_before,
-                    "late_after_deadline": core.stats.late_after_deadline - late_deadline_before,
-                })
-                metrics_file.flush()
-                round_records.append({"round_id": round_id, "start_mono_ns": round_start_ns,
-                                      "deadline_mono_ns": round_deadline_ns,
-                                      "accepted_data": core.stats.accepted_data - accepted_before,
-                                      "rejected_data": core.stats.rejected_data - rejected_before,
-                                      "invalid_events": core.stats.invalid_events - invalid_before})
-                if round_id < args.rounds:
-                    await asyncio.sleep(args.inter_round_s)
-        Path(args.log_dir, "gateway_summary.json").write_text(json.dumps(round_records, indent=2) + "\n")
+        await run_rounds(
+            GrantRoundProtocol(core, gateway, num_clients=args.clients, K=args.blocks, L=args.block_length,
+                               seed=args.seed),
+            timing_from_args(args), round_state=RoundStateFile(args.round_state), log_dir=args.log_dir)
     finally:
         await gateway.close()
 
 
-def main() -> None:
+def timing_from_args(args: argparse.Namespace) -> RoundTiming:
+    return RoundTiming(rounds=args.rounds, duration_ns=args.duration_ns,
+                       compute_window_s=args.compute_window_s, late_drain_s=args.late_drain_s,
+                       inter_round_s=args.inter_round_s, start_delay_s=args.start_delay_s)
+
+
+def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--clients", type=int, required=True)
     parser.add_argument("--rounds", type=int, default=1)
@@ -123,7 +139,12 @@ def main() -> None:
     parser.add_argument("--log-dir", required=True)
     parser.add_argument("--round-state", required=True)
     parser.add_argument("--profile-gateway", action="store_true")
-    args = parser.parse_args()
+    parser.add_argument("--policy", default=STUB_POLICY)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--value-bank", default=None,
+                        help="FULL value bank (.npz); client weights come from it. Default: uniform 1/N")
+    parser.add_argument("--models-dir", default=DEFAULT_MODELS_DIR)
+    args = parser.parse_args(argv)
     if (args.clients < 1 or args.rounds < 1 or args.duration_ns < 1
             or args.compute_window_s < 0 or args.late_drain_s < 0 or args.inter_round_s < 0):
         parser.error("clients, rounds, and duration must be positive; wait intervals must be non-negative")

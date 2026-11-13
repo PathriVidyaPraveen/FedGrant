@@ -8,13 +8,15 @@ On Fedora 44, install the host tools and the extra modules package matching the 
 
 ```sh
 sudo dnf install -y mininet openvswitch iperf3 iproute iproute-tc ethtool tcpdump \
-  kernel-modules-extra python3 python3-pip python3-devel git make gcc tmux
+  kernel-modules-extra python3 python3-pip python3-devel python3-pyroute2 git make gcc tmux
 sudo systemctl enable --now openvswitch
 systemctl is-active openvswitch
 rpm -q kernel-modules-extra
 sudo modprobe sch_netem sch_tbf
 lsmod | grep -E 'sch_netem|sch_tbf'
 ```
+
+`python3-pyroute2` must be visible to root (the runner is started with `sudo`): trace-replay agents change client TBF rates over rtnetlink and fall back to spawning `tc`, which lags far more at N = 20 (see `docs/TESTBED_TRACES_REPORT.md`). Each run's `replay_agent_<i>.log` records which path was used.
 
 If the module package does not match `uname -r`, install the matching kernel modules and reboot before continuing. Do not run shaping checks against `lo`; use a throwaway veth pair if verifying raw `tc` syntax manually.
 
@@ -25,7 +27,7 @@ Use the system interpreter so it can import Fedora's Mininet package:
 ```sh
 python3 -m venv --system-site-packages .venv
 . .venv/bin/activate
-python -m pip install -r requirements.lock
+python -m pip install -r docker/requirements.lock
 python -m pip install --no-deps -e .
 python -m pytest -q tests/unit
 ```

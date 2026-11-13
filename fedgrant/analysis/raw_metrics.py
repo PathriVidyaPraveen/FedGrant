@@ -12,6 +12,7 @@ from typing import Any
 import numpy as np
 
 from fedgrant.analysis.runs_schema import make_row, write_runs_csv
+from fedgrant.mininet.cross_drops import read_cross_drop_times, split_drops
 from fedgrant.policy.constants import C, S
 
 ROUND_AVERAGES = (
@@ -50,12 +51,13 @@ def _add_queue_metrics(root: Path, round_rows: list[dict[str, str]], metrics: di
     """Derive per-round queue metrics from cumulative 10 ms TBF samples."""
     queue = _records(root / "queues.csv")
     queue = [row for row in queue if row.get("interface") == "s1-gw" and row.get("qdisc") == "tbf"]
+    cross_times = read_cross_drop_times(root / "cross_drops.csv")
     samples_by_round: dict[int, list[dict[str, str]]] = {}
     for row in queue:
         rid = int(row.get("round_id") or 0)
         if rid:
             samples_by_round.setdefault(rid, []).append(row)
-    util, fg_drops, all_delays = [], [], []
+    util, fg_drops, cross_drops, all_delays = [], [], [], []
     for round_row in round_rows:
         rid = int(round_row["round_id"])
         try:
@@ -79,13 +81,15 @@ def _add_queue_metrics(root: Path, round_rows: list[dict[str, str]], metrics: di
                     packets_out = max(0, int(last.get("packets") or 0) - int(first.get("packets") or 0))
                     drops = max(0, int(last["drops"]) - int(first["drops"]))
                     util.append(packets_out * S * 8 / (float(C) * dt_s))
-                    if cross_mbps == 0:
-                        fg_drops.append(float(drops))
+                    split = split_drops(drops, cross_times, start, deadline, cross_mbps)
+                    if split is not None:
+                        fg_drops.append(float(split[0]))
+                        cross_drops.append(float(split[1]))
     if util:
         metrics["utilization"] = float(np.mean(util))
     if fg_drops:
         metrics["queue_drops_fg"] = float(np.mean(fg_drops))
-        metrics["queue_drops_cross"] = 0.0
+        metrics["queue_drops_cross"] = float(np.mean(cross_drops))
     elif cross_mbps == 0:
         metrics["queue_drops_fg"] = 0.0
         metrics["queue_drops_cross"] = 0.0

@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-import heapq
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
@@ -12,12 +11,15 @@ import numpy as np
 
 from fedgrant.core.estimators import (
     RateWindow,
-    compute_cap,
     grant_timeout,
-    rtt_update,
-    update_outcome_stats,
 )
-from fedgrant.core.state import ClientState, OutstandingGrant, values_from_energies
+from fedgrant.core.gateway import (
+    EmitAggregate as CoreEmitAggregate,
+    GatewayCore,
+    SendGrant as CoreSendGrant,
+    SendRoundEnd as CoreSendRoundEnd,
+)
+from fedgrant.core.state import ClientState, OutstandingGrant
 from fedgrant.policy.constants import (
     C,
     D_MODEL,
@@ -32,7 +34,6 @@ from fedgrant.policy.features import (
     build_pred_input,
     context16,
     features48,
-    observation8,
     resolve_event,
 )
 from fedgrant.policy.pacing import InflightTracker, p_target, pacing_p
@@ -40,13 +41,13 @@ from fedgrant.policy.selectors import (
     RoundRobinSelector,
     SRPTSelector,
     ValueSelector,
-    heap_key,
     value_key,
 )
 from fedgrant.policy.types import CandidateView, PolicyConfig, Selector
 from fedgrant.predictors.base import PredInput, Predictor, RoundCtx
 from fedgrant.predictors.ewma import PEWMA
 from fedgrant.predictors.factory import make_predictor
+from fedgrant.predictors.fallback import FallbackPredictor
 from fedgrant.predictors.hmm import PHMM
 from fedgrant.predictors.oracle import OraclePredictor
 from fedgrant.sim.crosstraffic import CrossTrafficGenerator
@@ -104,8 +105,31 @@ def energies_by_block(
     return mapped
 
 
-class GatewaySim:
-    """Gateway simulation controller executing Algorithm 1 inside the network simulator."""
+def _policy_config_signature(config: PolicyConfig) -> tuple[tuple[str, Any], ...]:
+    """Snapshot every validated PolicyConfig field for safe gateway reuse."""
+    return tuple((field.name, getattr(config, field.name)) for field in fields(PolicyConfig))
+
+
+def _policy_config_mismatches(
+    expected: tuple[tuple[str, Any], ...], config: PolicyConfig
+) -> list[str]:
+    actual = dict(_policy_config_signature(config))
+    return [name for name, value in expected if actual.get(name) != value]
+
+
+def _normalize_decision_event(event: dict[str, Any], round_start_abs_ns: int) -> dict[str, Any]:
+    """Copy a decision record into the public relative/absolute time convention."""
+    forwarded = dict(event)
+    event_t_ns = int(event["t_ns"])
+    if event.get("abs_t_ns") == round_start_abs_ns + event_t_ns:
+        return forwarded  # Already normalized; do not convert twice.
+    forwarded["abs_t_ns"] = event_t_ns
+    forwarded["t_ns"] = event_t_ns - round_start_abs_ns
+    return forwarded
+
+
+class _GatewaySimState:
+    """State/configuration holder retained as the GatewayCore simulator adapter base."""
 
     def __init__(
         self,
@@ -128,476 +152,369 @@ class GatewaySim:
         self.weights = np.ascontiguousarray(client_weights, dtype=np.float32)
         if len(self.weights) != self.N:
             raise ValueError(f"weights length ({len(self.weights)}) != num_clients ({self.N})")
-
         self.predictor = predictor
-        self.cfg = policy_config or PolicyConfig(
-            selector="value" if isinstance(selector, str) else "custom",
-            predictor="ewma",
-        )
-
+        configured = policy_config or PolicyConfig(selector="value", predictor="ewma")
+        # Keep an internal validated copy: callers may mutate their dataclass
+        # after construction, but that must not silently change this gateway.
+        self.cfg = PolicyConfig.from_dict(dict(_policy_config_signature(configured)))
+        self._policy_config_signature = _policy_config_signature(self.cfg)
         if isinstance(selector, str):
-            s_name = selector.lower()
-            if s_name == "value":
-                self.selector: Selector = ValueSelector()
-            elif s_name == "rr":
-                self.selector = RoundRobinSelector()
-            elif s_name == "srpt":
-                self.selector = SRPTSelector()
-            else:
-                raise ValueError(f"Unknown selector '{selector}'")
+            selectors: dict[str, Selector] = {
+                "value": ValueSelector(), "rr": RoundRobinSelector(), "srpt": SRPTSelector(),
+            }
+            try:
+                self.selector = selectors[selector.lower()]
+            except KeyError:
+                raise ValueError(f"Unknown selector '{selector}'") from None
         else:
             self.selector = selector
-
-        self.D_ns = int(D_ns)
-        self.K = int(K)
-        self.L = int(L)
-        self.d_model = int(d_model)
+        self.D_ns, self.K, self.L, self.d_model = int(D_ns), int(K), int(L), int(d_model)
         self.rng = rng or np.random.default_rng()
         self.sample_hook = sample_hook
         self.decision_hook = decision_hook
-        self.shadow_oracle = shadow_oracle
-        self.shadow_hmm = shadow_hmm
-
-        # Persistent estimator state across rounds (Table 2)
+        self.shadow_oracle, self.shadow_hmm = shadow_oracle, shadow_hmm
         self.client_states = [ClientState(client_id=i, w=float(self.weights[i]), K=self.K) for i in range(self.N)]
         self.rate_windows = [RateWindow(t_start_ns=0, outstanding=0) for _ in range(self.N)]
-
-        # Network trackers
         self.inflight = InflightTracker()
         self.arrivals = ArrivalLog()
         self.pewma = PEWMA()
+        self.round_id = 1
+        self.round_start_abs_ns = 0
+        self.next_gid = 1
+        self.rr_pointer = 0
+        self.grants_issued = self.grants_delivered = self.grants_timed_out = 0
+        self.duplicate_packets = self.late_after_timeout = self.late_after_deadline = 0
+        self.p_hat: dict[int, float] = {}
+        self._core_stats_baseline = (0, 0, 0)
 
-        # Per-round state
-        self.round_id: int = 1
-        self.round_start_abs_ns: int = 0
-        self.next_gid: int = 1
-        self.heap: list[tuple[tuple[float, int], int]] = []
-        self.delivered_payloads: list[dict[int, np.ndarray]] = [{} for _ in range(self.N)]
-        self.rr_pointer: int = 0
+class _CoreEligibility:
+    def __init__(self, sim: "GatewaySim") -> None:
+        self.sim = sim
 
-        # Diagnostics / logging
-        self.grants_issued: int = 0
-        self.grants_delivered: int = 0
-        self.grants_timed_out: int = 0
-        self.duplicate_packets: int = 0
-        self.late_after_timeout: int = 0
-        self.late_after_deadline: int = 0
+    def candidates(self, clients, now_ns: int, deadline_ns: int, retransmit: bool) -> CandidateView:
+        sim = self.sim
+        sim._set_view_time(now_ns)
+        ids: list[int] = []
+        values: list[float] = []
+        remaining: list[int] = []
+        relative_t = now_ns - sim.round_start_abs_ns
+        for cid, state in clients.items():
+            if not state.ready:
+                continue
+            p_hat = sim.core._predict_probability(cid, now_ns)
+            if not is_eligible(state, relative_t, sim.D_ns, p_hat, sim.cfg)[0]:
+                continue
+            ids.append(cid)
+            values.append(value_key(state, retransmit))
+            remaining.append(sim.K - state.m - len(state.outstanding))
+        return CandidateView(
+            client_id=np.asarray(ids, dtype=np.int32),
+            next_value=np.asarray(values, dtype=np.float64),
+            undelivered=np.asarray(remaining, dtype=np.int32),
+            rr_pointer=sim.rr_pointer,
+        )
+
+
+class _CoreSelector:
+    def __init__(self, sim: "GatewaySim") -> None:
+        self.sim = sim
+
+    def select(self, candidates: CandidateView) -> int:
+        sim = self.sim
+        if sim.cfg.explore_eps > 0 and sim.rng.random() < sim.cfg.explore_eps:
+            return int(sim.rng.choice(candidates.client_id))
+        return int(sim.selector.select(candidates))
+
+
+class _CorePacing:
+    def __init__(self, sim: "GatewaySim") -> None:
+        self.sim = sim
+
+    def allow(self, client_id: int, p_hat: float, now_ns: int, deadline_ns: int) -> bool:
+        self.sim._set_view_time(now_ns)
+        return self.sim.inflight.can_issue(pacing_p(p_hat, self.sim.cfg), self.sim.view.P_target)
+
+    def issue_probability(self, client_id: int, p_hat: float) -> float:
+        return pacing_p(p_hat, self.sim.cfg)
+
+
+class _CoreTimeout:
+    def __init__(self, sim: "GatewaySim") -> None:
+        self.sim = sim
+
+    def timeout_ns(self, client_id: int, issue_ns: int) -> int:
+        relative_issue = issue_ns - self.sim.round_start_abs_ns
+        return self.sim.round_start_abs_ns + grant_timeout(
+            relative_issue, self.sim.client_states[client_id], self.sim.D_ns
+        )
+
+
+class _CoreEstimator:
+    """Translate GatewayCore estimator callbacks into the shared feature path."""
+
+    def __init__(self, sim: "GatewaySim") -> None:
+        self.sim = sim
+
+    def reset_round(self, ctx: RoundCtx) -> None:
+        self.sim.reset_round(ctx)
+
+    def grant_issued(self, client_id: int, grant: OutstandingGrant, t_ns: int) -> None:
+        self.sim.grant_issued(client_id, grant, t_ns)
+
+    def data_arrival(self, client_id: int, t_ns: int) -> None:
+        self.sim.data_arrival(client_id, t_ns)
+
+    def resolve(self, client_id: int, grant: OutstandingGrant, delivered: bool, t_ns: int) -> None:
+        self.sim.resolve(client_id, grant, delivered, t_ns)
+
+    def on_tick(self, t_ns: int) -> None:
+        self.sim.estimator_on_tick(t_ns)
+
+    def on_deadline(self, t_ns: int) -> None:
+        self.sim.estimator_on_deadline(t_ns)
+
+
+class GatewaySim(_GatewaySimState):
+    """Network adapter around the shared GatewayCore event and state machine.
+
+    The core owns READY/GRANT/DATA/timeout/deadline ordering. This adapter supplies
+    simulator-specific scheduling providers and translates network-relative time.
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.view = GatewayView(t_ns=0, D_ns=self.D_ns, P_target=p_target([s.srtt_ns for s in self.client_states]))
+        self.core = GatewayCore(
+            clients={state.client_id: state for state in self.client_states},
+            selector=_CoreSelector(self),
+            eligibility=_CoreEligibility(self),
+            pacing=_CorePacing(self),
+            timeout=_CoreTimeout(self),
+            predictor=self.predictor,
+            estimator=_CoreEstimator(self),
+            aggregate=self,
+            view=self.view,
+            decision_hook=self._decision_hook,
+            retransmit=self.cfg.retransmit,
+        )
+        self.client_states = [self.core.clients[i] for i in range(self.N)]
+        self._snapshot_core_stats()
+        if self.shadow_oracle is not None:
+            self.shadow_oracle.client_states = self.client_states
+
+    @property
+    def inflight(self) -> InflightTracker:
+        return self.view.inflight if hasattr(self, "view") else self._legacy_inflight
+
+    @inflight.setter
+    def inflight(self, tracker: InflightTracker) -> None:
+        self._legacy_inflight = tracker
+
+    @property
+    def arrivals(self) -> ArrivalLog:
+        return self.view.arrivals if hasattr(self, "view") else self._legacy_arrivals
+
+    @arrivals.setter
+    def arrivals(self, log: ArrivalLog) -> None:
+        self._legacy_arrivals = log
 
     @property
     def Phi(self) -> float:
         return self.inflight.phi
 
     def get_p_target(self) -> float:
-        ready = [st.srtt_ns for st in self.client_states if st.ready]
-        if ready:
-            return float(p_target(ready))
-        return float(p_target([st.srtt_ns for st in self.client_states]))
+        ready = [state.srtt_ns for state in self.client_states if state.ready]
+        return float(p_target(ready or [state.srtt_ns for state in self.client_states]))
 
     def get_view(self, t_ns: int) -> GatewayView:
-        return GatewayView(
-            t_ns=t_ns,
-            D_ns=self.D_ns,
-            P_target=self.get_p_target(),
-            inflight=self.inflight,
-            arrivals=self.arrivals,
-        )
+        self._set_view_time(self.round_start_abs_ns + int(t_ns))
+        return self.view
+
+    def _set_view_time(self, absolute_ns: int) -> None:
+        self.view.t_ns = int(absolute_ns) - self.round_start_abs_ns
+        self.view.D_ns = self.D_ns
+        self.view.P_target = self.get_p_target()
 
     def on_round_start(self, round_id: int, t_ns: int = 0, round_start_abs_ns: int | None = None) -> None:
-        """Procedure RoundStart(t): reset per-round state; Phi <- 0; next_gid <- 1."""
         self.round_id = int(round_id)
         if round_start_abs_ns is not None:
             self.round_start_abs_ns = int(round_start_abs_ns)
-        self.inflight.clear()
-        self.arrivals.reset()
-        self.next_gid = 1
-        self.heap.clear()
-        self.delivered_payloads = [{} for _ in range(self.N)]
-        self.grants_issued = 0
-        self.grants_delivered = 0
-        self.grants_timed_out = 0
-        self.duplicate_packets = 0
-        self.late_after_timeout = 0
-        self.late_after_deadline = 0
+        self.core.on_round_start(
+            self.round_start_abs_ns + int(t_ns),
+            round_id=self.round_id,
+            deadline_ns=self.round_start_abs_ns + int(t_ns) + self.D_ns,
+            K=self.K,
+            L=self.L,
+        )
 
-        ctx = RoundCtx(round_id=self.round_id, D_ns=self.D_ns, N=self.N, K=self.K)
-        self.predictor.reset_round(ctx)
+    def on_ready(self, client_id: int, energies: np.ndarray, t_ns: int) -> list[SendGrant]:
+        return self._send_grants(self.core.on_ready(client_id, energies, self.round_start_abs_ns + int(t_ns)))
+
+    def on_data(self, client_id: int, grant_id: int, pos: int, block_idx: int,
+                payload: np.ndarray, t_ns: int) -> list[SendGrant]:
+        actions = self.core.on_data(
+            client_id, grant_id, pos, block_idx, payload,
+            self.round_start_abs_ns + int(t_ns), n_coords=min(self.L, self.d_model - block_idx * self.L),
+        )
+        self._sync_core_stats()
+        return self._send_grants(actions)
+
+    def _send_grants(self, actions) -> list[SendGrant]:
+        return [SendGrant(action.client_id, action.grant_id, action.send_pos)
+                for action in actions if isinstance(action, CoreSendGrant)]
+
+    def reset_round(self, ctx: RoundCtx) -> None:
+        self._snapshot_core_stats()
+        self.p_hat.clear()
+        self.grants_issued = self.grants_delivered = self.grants_timed_out = 0
+        self.duplicate_packets = self.late_after_timeout = self.late_after_deadline = 0
+        for window in self.rate_windows:
+            window.start(0, 0)
         self.pewma.reset_round(ctx)
         if self.shadow_hmm is not None:
             self.shadow_hmm.reset_round(ctx)
         if self.shadow_oracle is not None:
             self.shadow_oracle.reset_round(ctx)
 
-        for st in self.client_states:
-            st.reset_round(K=self.K, round_start_ns=self.round_start_abs_ns + t_ns)
-
-        for rw in self.rate_windows:
-            rw.start(t_start_ns=t_ns, outstanding=0)
-
-    def on_ready(self, client_id: int, energies: np.ndarray, t_ns: int) -> list[SendGrant]:
-        """Procedure OnReady(i, eps, t): register sorted energies, mark ready, push to heap, pump."""
-        st = self.client_states[client_id]
-        st.set_ready(values_from_energies(energies, st.w))
-
-        v_tilde = value_key(st, self.cfg.retransmit)
-        heapq.heappush(self.heap, (heap_key(v_tilde, client_id), client_id))
-
-        return self.pump(t_ns)
-
-    def pump(self, t_ns: int) -> list[SendGrant]:
-        """Procedure Pump(t): select eligible clients, check pacing, issue grants."""
-        ready_srtts = [st.srtt_ns for st in self.client_states if st.ready]
-        if not ready_srtts:
-            return []
-
-        P_targ = self.get_p_target()
-        grants: list[SendGrant] = []
-
-        while True:
-            # 1. Pop heap entries until the top client is valid and eligible (rules i-v)
-            top_client: int | None = None
-            while self.heap:
-                h_key, cid = self.heap[0]
-                st = self.client_states[cid]
-
-                # Check if position is pending
-                if not st.has_pending(self.cfg.retransmit):
-                    heapq.heappop(self.heap)
-                    continue
-
-                # Query predictor for client
-                p_hat = self._predict_one(cid, t_ns)
-                eligible, _reason = is_eligible(st, t_ns, self.D_ns, p_hat, self.cfg)
-
-                if not eligible:
-                    heapq.heappop(self.heap)
-                    continue
-
-                # Verify current key matches heap key
-                cur_v = value_key(st, self.cfg.retransmit)
-                if heap_key(cur_v, cid) != h_key:
-                    heapq.heappop(self.heap)
-                    heapq.heappush(self.heap, (heap_key(cur_v, cid), cid))
-                    continue
-
-                top_client = cid
-                break
-
-            if top_client is None:
-                break
-
-            # 2. Select client (exploration or configured selector)
-            candidate_ids: tuple[int, ...] | None = None
-            if self.cfg.explore_eps > 0.0 and self.rng.random() < self.cfg.explore_eps:
-                eligible_cids = self._get_eligible_clients(t_ns)
-                if not eligible_cids:
-                    break
-                candidate_ids = tuple(int(cid) for cid in eligible_cids)
-                sel_cid = int(self.rng.choice(eligible_cids))
-            elif isinstance(self.selector, ValueSelector):
-                sel_cid = top_client
-            else:
-                cand_view = self._build_candidate_view(t_ns)
-                if len(cand_view) == 0:
-                    break
-                candidate_ids = tuple(int(cid) for cid in cand_view.client_id)
-                sel_cid = self.selector.select(cand_view)
-
-            st_sel = self.client_states[sel_cid]
-            view = self.get_view(t_ns)
-            x48 = features48(st_sel, view)
-            inp_sel = PredInput.from_x48(np.array([sel_cid], dtype=np.int32), x48[None, :], t_ns)
-
-            p_hat_sel = float(self.predictor.predict(inp_sel)[0])
-            p_pacing = pacing_p(p_hat_sel, self.cfg)
-
-            # 3. Pacing check: Phi + p_pacing <= P_target
-            if not self.inflight.can_issue(p_pacing, P_targ):
-                if self.decision_hook is not None:
-                    self.decision_hook({
-                        "event": "grant_decision",
-                        "round_id": self.round_id,
-                        "t_ns": t_ns,
-                        "abs_t_ns": self.round_start_abs_ns + t_ns,
-                        "selection_method": self.cfg.selector,
-                        "candidate_client_ids": candidate_ids,
-                        "selected_client_id": sel_cid,
-                        "send_pos": st_sel.next_pos(self.cfg.retransmit),
-                        "grant_id": None,
-                        "p_hat": p_hat_sel,
-                        "p_pacing": p_pacing,
-                        "p_target": P_targ,
-                        "outcome": "pacing_blocked",
-                    })
-                break
-
-            # Shadow predictions for ML logging
-            p_ewma_val = float(self.pewma.predict(inp_sel)[0])
-            p_oracle_val = (
-                float(self.shadow_oracle.predict(inp_sel)[0])
-                if self.shadow_oracle is not None
-                else p_hat_sel
-            )
-            p_hmm_val = (
-                float(self.shadow_hmm.predict(inp_sel)[0])
-                if self.shadow_hmm is not None
-                else p_hat_sel
-            )
-
-            # 5. Take send position s
-            s_next = st_sel.next_pos(self.cfg.retransmit)
-
-            # 6. Issue grant g
-            g_id = self.next_gid
-            tau_g = grant_timeout(t_ns, st_sel, self.D_ns)
-
-            if self.decision_hook is not None:
-                self.decision_hook({
-                    "event": "grant_decision",
-                    "round_id": self.round_id,
-                    "t_ns": t_ns,
-                    "abs_t_ns": self.round_start_abs_ns + t_ns,
-                    "selection_method": self.cfg.selector,
-                    "candidate_client_ids": candidate_ids,
-                    "selected_client_id": sel_cid,
-                    "send_pos": s_next,
-                    "grant_id": g_id,
-                    "p_hat": p_hat_sel,
-                    "p_pacing": p_pacing,
-                    "p_target": P_targ,
-                    "timeout_ns": tau_g,
-                    "outcome": "grant_issued",
-                })
-
-            # Commit the decision only after the observer has seen its
-            # pre-mutation candidate and client state.
-            if top_client == sel_cid and self.heap:
-                heapq.heappop(self.heap)
-            st_sel.take_position(s_next, self.cfg.retransmit)
-            self.next_gid += 1
-
-            st_sel.outstanding[g_id] = OutstandingGrant(
-                pos=s_next,
-                t_issue_ns=t_ns,
-                p_issue=p_pacing,
-                timeout_ns=tau_g,
-            )
-            self.inflight.add(g_id, p_pacing)
-            self.grants_issued += 1
-            if isinstance(self.selector, RoundRobinSelector):
-                self.rr_pointer = (sel_cid + 1) % self.N
-
-            # Update rate window tracker
-            self.rate_windows[sel_cid].set_outstanding(t_ns, len(st_sel.outstanding))
-
-            # Push back if still pending
-            if st_sel.has_pending(self.cfg.retransmit):
-                v_cur = value_key(st_sel, self.cfg.retransmit)
-                heapq.heappush(self.heap, (heap_key(v_cur, sel_cid), sel_cid))
-
-            grant_action = SendGrant(client_id=sel_cid, grant_id=g_id, pos=s_next)
-            grants.append(grant_action)
-
-            # Record ML training sample hook if enabled
-            if self.sample_hook is not None:
-                self.sample_hook({
-                    "event": "grant_issued",
-                    "client_id": sel_cid,
-                    "grant_id": g_id,
-                    "pos": s_next,
-                    "t_ns": t_ns,
-                    "abs_t_ns": self.round_start_abs_ns + t_ns,
-                    "tau_ns": tau_g,
-                    "p_hat": p_hat_sel,
-                    "p_ewma": p_ewma_val,
-                    "p_hmm": p_hmm_val,
-                    "p_oracle": p_oracle_val,
-                    "x48": x48,
-                    "ctx": context16(x48),
-                })
-
-        return grants
-
-    def on_data(
-        self,
-        client_id: int,
-        grant_id: int,
-        pos: int,
-        block_idx: int,
-        payload: np.ndarray,
-        t_ns: int,
-    ) -> list[SendGrant]:
-        """Procedure OnData(i, g, s, j, payload, t): record arrival, resolve grant, update state."""
-        if t_ns > self.D_ns:
-            self.late_after_deadline += 1
-            return []
-        self.arrivals.record(t_ns, 8 * S)
-
-        st = self.client_states[client_id]
-
-        # 1. Store delivered block
-        self.rate_windows[client_id].advance(st, t_ns)
-        self.rate_windows[client_id].add_delivery(t_ns, 8 * S)
-        first_delivery = st.mark_delivered(pos)
-        if first_delivery:
-            self.delivered_payloads[client_id][block_idx] = payload
-        else:
-            self.duplicate_packets += 1
-
-        # 2. Resolve grant
-        if grant_id in st.outstanding:
-            self._resolve(client_id, grant_id, y=1, t_ns=t_ns)
-            self.grants_delivered += 1
-        else:
-            self.late_after_timeout += 1
-
-        return self.pump(t_ns)
-
-    def on_tick(self, t_ns: int) -> list[SendGrant]:
-        """Procedure OnTick(t): check timeouts, periodic p_hat & rate updates, pump."""
-        for cid, st in enumerate(self.client_states):
-            self.rate_windows[cid].advance(st, t_ns)
-
-            # Check timeouts for outstanding grants
-            expired_gids = [
-                gid for gid, og in st.outstanding.items() if og.timeout_ns <= t_ns
-            ]
-            for gid in expired_gids:
-                og = st.outstanding.get(gid)
-                if og is None:
-                    continue
-                pos = og.pos
-                self._resolve(cid, gid, y=0, t_ns=t_ns)
-                st.mark_timeout(pos)
-                self.grants_timed_out += 1
-
-                if st.has_pending(self.cfg.retransmit):
-                    v_cur = value_key(st, self.cfg.retransmit)
-                    heapq.heappush(self.heap, (heap_key(v_cur, cid), cid))
-
-        if t_ns % 5_000_000 == 0:
-            self._rebuild_heap(t_ns)
-
-        if t_ns % 100_000_000 == 0:
-            for st in self.client_states:
-                st.cap = compute_cap(st)
-
-        return self.pump(t_ns)
-
-    def on_deadline(self, t_ns: int) -> tuple[list[SendRoundEnd], EmitAggregate]:
-        """Procedure OnDeadline(D): resolve outstanding grants with y=0, aggregate updates."""
-        for cid, st in enumerate(self.client_states):
-            for gid in list(st.outstanding.keys()):
-                og = st.outstanding.get(gid)
-                if og is None:
-                    continue
-                pos = og.pos
-                self._resolve(cid, gid, y=0, t_ns=t_ns)
-                st.mark_timeout(pos)
-                self.grants_timed_out += 1
-
-        round_ends: list[SendRoundEnd] = []
-        decoded_updates: list[np.ndarray] = []
-
-        for cid, st in enumerate(self.client_states):
-            st.update_starve()
-            deliv_map = self.delivered_payloads[cid]
-            deliv_indices = sorted(deliv_map.keys())
-
-            n_bytes = int(math.ceil(self.K / 8.0))
-            bitmap = np.zeros(n_bytes, dtype=np.uint8)
-            for j in deliv_indices:
-                bitmap[j // 8] |= (1 << (j % 8))
-
-            round_ends.append(SendRoundEnd(client_id=cid, bitmap=bitmap, delivered_indices=deliv_indices))
-
-            u_hat = np.zeros(self.d_model, dtype=np.float32)
-            for j, block_payload in deliv_map.items():
-                start = j * self.L
-                end = min(start + self.L, self.d_model)
-                n_coords = end - start
-                u_hat[start:end] = block_payload[:n_coords].astype(np.float32)
-
-            decoded_updates.append(u_hat)
-
-        G_hat = np.zeros(self.d_model, dtype=np.float32)
-        for w, u_hat in zip(self.weights, decoded_updates, strict=True):
-            G_hat += float(w) * u_hat
-
-        return round_ends, EmitAggregate(G=G_hat)
-
-    def _resolve(self, client_id: int, grant_id: int, y: int, t_ns: int) -> None:
-        """Procedure Resolve(i, g, y, t): update RFC 6298 estimators, EWMA, and observe."""
-        st = self.client_states[client_id]
-        if grant_id not in st.outstanding or grant_id not in self.inflight:
-            return
-
-        og = st.outstanding[grant_id]
-        rtt_sample = (t_ns - og.t_issue_ns) if y == 1 else None
-
-        view = self.get_view(t_ns)
-        obs = resolve_event(st, view, grant_id, y, t_ns, rtt_sample)
-
-        self.rate_windows[client_id].set_outstanding(t_ns, len(st.outstanding))
-
-        self.predictor.observe(client_id, y, t_ns, obs)
-        self.pewma.observe(client_id, y, t_ns, obs)
-        if self.shadow_hmm is not None:
-            self.shadow_hmm.observe(client_id, y, t_ns, obs)
-        if self.shadow_oracle is not None:
-            self.shadow_oracle.observe(client_id, y, t_ns, obs)
-
-        if self.sample_hook is not None:
-            self.sample_hook({
-                "event": "grant_resolved",
-                "client_id": client_id,
-                "grant_id": grant_id,
-                "y": y,
-                "t_ns": t_ns,
-                "abs_t_ns": self.round_start_abs_ns + t_ns,
-                "obs": obs,
-                "rtt_ns": rtt_sample,
-            })
-
-    def _predict_one(self, client_id: int, t_ns: int) -> float:
-        view = self.get_view(t_ns)
-        inp = build_pred_input([self.client_states[client_id]], view)
-        return float(self.predictor.predict(inp)[0])
-
-    def _get_eligible_clients(self, t_ns: int) -> list[int]:
-        eligible: list[int] = []
-        for cid, st in enumerate(self.client_states):
-            p = self._predict_one(cid, t_ns)
-            if is_eligible(st, t_ns, self.D_ns, p, self.cfg)[0]:
-                eligible.append(cid)
-        return eligible
-
-    def _build_candidate_view(self, t_ns: int) -> CandidateView:
-        cids: list[int] = []
-        vals: list[float] = []
-        undeliv: list[int] = []
-
-        for cid, st in enumerate(self.client_states):
-            p = self._predict_one(cid, t_ns)
-            if is_eligible(st, t_ns, self.D_ns, p, self.cfg)[0]:
-                cids.append(cid)
-                vals.append(value_key(st, self.cfg.retransmit))
-                undeliv.append(self.K - st.m - len(st.outstanding))
-
-        return CandidateView(
-            client_id=np.array(cids, dtype=np.int32),
-            next_value=np.array(vals, dtype=np.float64),
-            undelivered=np.array(undeliv, dtype=np.int32),
-            rr_pointer=self.rr_pointer,
+    def _snapshot_core_stats(self) -> None:
+        stats = self.core.stats
+        self._core_stats_baseline = (
+            stats.duplicate_data,
+            stats.late_after_timeout,
+            stats.late_after_deadline,
         )
 
-    def _rebuild_heap(self, t_ns: int) -> None:
-        new_heap: list[tuple[tuple[float, int], int]] = []
-        for cid, st in enumerate(self.client_states):
-            if st.has_pending(self.cfg.retransmit):
-                v_cur = value_key(st, self.cfg.retransmit)
-                new_heap.append((heap_key(v_cur, cid), cid))
-        heapq.heapify(new_heap)
-        self.heap = new_heap
+    def _sync_core_stats(self) -> None:
+        duplicate_base, timeout_base, deadline_base = self._core_stats_baseline
+        stats = self.core.stats
+        self.duplicate_packets = stats.duplicate_data - duplicate_base
+        self.late_after_timeout = stats.late_after_timeout - timeout_base
+        self.late_after_deadline = stats.late_after_deadline - deadline_base
+
+    def grant_issued(self, client_id: int, grant: OutstandingGrant, t_ns: int) -> None:
+        relative_t = t_ns - self.round_start_abs_ns
+        self.rate_windows[client_id].advance(self.client_states[client_id], relative_t)
+        self.rate_windows[client_id].set_outstanding(relative_t, len(self.client_states[client_id].outstanding))
+        self.grants_issued += 1
+        if isinstance(self.selector, RoundRobinSelector):
+            self.rr_pointer = (client_id + 1) % self.N
+
+    def data_arrival(self, client_id: int, t_ns: int) -> None:
+        relative_t = t_ns - self.round_start_abs_ns
+        state = self.client_states[client_id]
+        window = self.rate_windows[client_id]
+        window.advance(state, relative_t)
+        window.add_delivery(relative_t, 8 * S)
+
+    def resolve(self, client_id: int, grant: OutstandingGrant, delivered: bool, t_ns: int) -> None:
+        state = self.client_states[client_id]
+        grant_id = next((gid for gid, value in state.outstanding.items() if value is grant), None)
+        if grant_id is None:
+            raise KeyError("GatewayCore estimator callback ran after grant removal")
+        relative_t = t_ns - self.round_start_abs_ns
+        self._set_view_time(t_ns)
+        window = self.rate_windows[client_id]
+        window.advance(state, relative_t)
+        rtt_ns = t_ns - grant.t_issue_ns if delivered else None
+        obs = resolve_event(state, self.view, grant_id, int(delivered), relative_t, rtt_ns)
+        window.set_outstanding(relative_t, len(state.outstanding))
+        # GatewayCore wraps the configured model with FallbackPredictor. Route
+        # outcomes through that wrapper so its P-EWMA shadow stays warm and
+        # receives every resolution even after the primary trips fallback.
+        self.core.predictor.observe(client_id, int(delivered), relative_t, obs)
+        self.pewma.observe(client_id, int(delivered), relative_t, obs)
+        if self.shadow_hmm is not None:
+            self.shadow_hmm.observe(client_id, int(delivered), relative_t, obs)
+        if self.shadow_oracle is not None:
+            self.shadow_oracle.observe(client_id, int(delivered), relative_t, obs)
+        self.p_hat.pop(client_id, None)
+        if delivered:
+            self.grants_delivered += 1
+        else:
+            self.grants_timed_out += 1
+        if self.sample_hook is not None:
+            self.sample_hook({
+                "event": "grant_resolved", "client_id": client_id, "grant_id": grant_id,
+                "y": int(delivered), "t_ns": relative_t,
+                "abs_t_ns": self.round_start_abs_ns + relative_t, "obs": obs,
+                "rtt_ns": rtt_ns,
+            })
+
+    def estimator_on_tick(self, t_ns: int) -> None:
+        relative_t = t_ns - self.round_start_abs_ns
+        for cid, state in enumerate(self.client_states):
+            self.rate_windows[cid].advance(state, relative_t)
+        self._set_view_time(t_ns)
+
+    def estimator_on_deadline(self, t_ns: int) -> None:
+        relative_t = t_ns - self.round_start_abs_ns
+        for cid, state in enumerate(self.client_states):
+            self.rate_windows[cid].advance(state, relative_t)
+
+    def aggregate(self, clients) -> np.ndarray:
+        result = np.zeros(self.d_model, dtype=np.float32)
+        for cid, state in clients.items():
+            update = np.zeros(self.d_model, dtype=np.float32)
+            for block_idx, payload in state.delivered_payloads.items():
+                start = block_idx * self.L
+                end = min(start + self.L, self.d_model)
+                update[start:end] = np.asarray(payload[: end - start], dtype=np.float32)
+            result += float(self.weights[cid]) * update
+        return result
+
+    def _decision_hook(self, event: dict[str, Any]) -> None:
+        if self.decision_hook is not None:
+            record = dict(event)
+            # Keep the simulator's public decision schema: GatewayCore names the
+            # chosen client ``client_id``; pacing has just set view.P_target.
+            record.setdefault("selection_method", self.cfg.selector)
+            record.setdefault("selected_client_id", record.get("client_id"))
+            record.setdefault("p_pacing", float(pacing_p(record["p_hat"], self.cfg)))
+            record.setdefault("p_target", float(self.view.P_target))
+            for key in ("grant_id", "send_pos", "timeout_ns"):
+                record.setdefault(key, None)  # pacing-blocked decisions issue no grant
+            self.decision_hook(record)
+        if event.get("outcome") != "grant_issued":
+            return
+        client_id = int(event["client_id"])
+        t_ns = int(event["t_ns"])
+        self._set_view_time(t_ns)
+        state = self.client_states[client_id]
+        x48 = features48(state, self.view)
+        inp = PredInput.from_x48(np.asarray([client_id], dtype=np.int32), x48[None, :], t_ns - self.round_start_abs_ns)
+        p_hat = float(event["p_hat"])
+        if self.sample_hook is not None:
+            self.sample_hook({
+                "event": "grant_issued", "client_id": client_id,
+                "grant_id": int(event["grant_id"]), "pos": int(event["send_pos"]),
+                "t_ns": t_ns - self.round_start_abs_ns,
+                "abs_t_ns": t_ns, "tau_ns": int(event["timeout_ns"]),
+                "p_hat": p_hat, "p_ewma": float(self.pewma.predict(inp)[0]),
+                "p_hmm": float(self.shadow_hmm.predict(inp)[0]) if self.shadow_hmm else p_hat,
+                "p_oracle": float(self.shadow_oracle.predict(inp)[0]) if self.shadow_oracle else p_hat,
+                "x48": x48, "ctx": context16(x48),
+            })
+
+    def on_tick(self, t_ns: int) -> list[SendGrant]:
+        relative_t = int(t_ns)
+        for cid, state in enumerate(self.client_states):
+            self.rate_windows[cid].advance(state, relative_t)
+        self._set_view_time(self.round_start_abs_ns + relative_t)
+        return self._send_grants(self.core.on_tick(self.round_start_abs_ns + relative_t))
+
+    def on_deadline(self, t_ns: int) -> tuple[list[SendRoundEnd], EmitAggregate]:
+        actions = self.core.on_deadline(self.round_start_abs_ns + int(t_ns))
+        ends: list[SendRoundEnd] = []
+        aggregate = np.zeros(self.d_model, dtype=np.float32)
+        for action in actions:
+            if isinstance(action, CoreSendRoundEnd):
+                delivered = sorted(self.core.delivered_blocks.get(action.client_id, ()))
+                ends.append(SendRoundEnd(
+                    action.client_id, np.frombuffer(action.bitmap, dtype=np.uint8).copy(), delivered
+                ))
+            elif isinstance(action, CoreEmitAggregate):
+                aggregate = np.asarray(action.aggregate, dtype=np.float32)
+        return ends, EmitAggregate(G=aggregate)
 
 
 def compute_deadline_ns(beta: float = 0.10, num_clients: int = 20, K: int = K_DEFAULT) -> int:
@@ -631,26 +548,50 @@ def run_network_round(
     round_start_abs_ns: int = 0,
     decision_hook: Callable[[dict[str, Any]], None] | None = None,
     event_hook: Callable[[dict[str, Any]], None] | None = None,
+    loss_rate: float | None = None,
+    mean_burst_length: float | None = None,
+    cross_mbps: float = 0.0,
 ) -> dict[str, Any]:
     """Execute one simulated round (Section 6).
 
     ``decision_hook`` receives pre-mutation grant decisions. ``event_hook``
-    reports round start, received READY/DATA, scheduler ticks and deadline;
-    DATA is reported only at gateway arrival, never at link enqueue/drop.
+    reports round start, received READY/DATA, scheduler ticks and deadline,
+    interleaved in order with the same ``grant_decision`` records given to
+    ``decision_hook`` (GatewayCore's record plus the simulator schema fields
+    ``selection_method``, ``selected_client_id``, ``p_pacing``, ``p_target``;
+    pacing-blocked decisions carry ``None`` grant fields). DATA is reported only at gateway arrival, never
+    at link enqueue/drop; late DATA drained after the deadline is reported
+    with ``t_ns > D``. Link/loss/queue internals are never reported. Every
+    record carries round-relative ``t_ns`` and absolute ``abs_t_ns``.
     These diagnostic hooks do not feed back into simulation decisions.
     """
     cfg = policy_config or PolicyConfig(selector="value", predictor="ewma")
+    if gateway is not None:
+        mismatches = _policy_config_mismatches(gateway._policy_config_signature, cfg)
+        if mismatches:
+            changed = ", ".join(mismatches)
+            raise ValueError(
+                "cannot reuse GatewaySim with a different PolicyConfig; "
+                f"changed field(s): {changed}"
+            )
+    if (loss_rate is None) != (mean_burst_length is None):
+        raise ValueError("loss_rate and mean_burst_length must be provided together")
+    if not np.isfinite(cross_mbps) or cross_mbps < 0:
+        raise ValueError("cross_mbps must be finite and non-negative")
     K = K_DEFAULT
     L = L_DEFAULT
     D_ns = compute_deadline_ns(beta, num_clients, K)
 
     def _record_decision(record: dict[str, Any]) -> None:
+        # GatewayCore decision timestamps are absolute. Normalize a copy at
+        # this adapter boundary; its internal event and API remain unchanged.
+        forwarded = _normalize_decision_event(record, round_start_abs_ns)
         if decision_hook is not None:
-            decision_hook(record)
+            decision_hook(dict(forwarded))
         # A single ordered observation stream lets test/replay tooling
         # interleave scheduler decisions with READY/DATA/tick inputs.
         if event_hook is not None:
-            event_hook(record)
+            event_hook(dict(forwarded))
 
     if round_start_abs_ns == 0 and round_id > 1:
         round_start_abs_ns = int((round_id - 1) * (1_000_000_000 + D_ns))
@@ -682,7 +623,11 @@ def run_network_round(
     access_links: list[AccessLink] = []
     for cid in range(num_clients):
         ge_seed = int(rng_ge.integers(0, 2**31))
-        ge_model = GilbertElliottModel.for_scenario(scenario, seed=ge_seed)
+        ge_model = (
+            GilbertElliottModel.for_scenario(scenario, seed=ge_seed)
+            if loss_rate is None
+            else GilbertElliottModel.for_loss_burst(loss_rate, mean_burst_length, seed=ge_seed)
+        )
         delta_ns = access_delay_ns(cid)
         initial_rate = trace_mgr.get_client_rate(cid, 0)
 
@@ -705,14 +650,8 @@ def run_network_round(
         if predictor is None:
             if cfg.predictor == "oracle":
                 pred: Predictor = shadow_oracle
-            elif cfg.predictor == "hmm":
-                pred = shadow_hmm
-            elif cfg.predictor == "ewma":
-                pred = PEWMA()
-            elif cfg.predictor in {"mlp", "gru"}:
-                pred = make_predictor(cfg.predictor, models_dir="models")
             else:
-                raise ValueError(f"Unsupported simulator predictor {cfg.predictor!r}")
+                pred = make_predictor(cfg.predictor, "models/")
         else:
             pred = predictor
 
@@ -734,8 +673,9 @@ def run_network_round(
         )
         shadow_oracle.client_states = gateway.client_states
     else:
+        previous_predictor_name = gateway.cfg.predictor
         gateway.D_ns = D_ns
-        gateway.cfg = cfg
+        gateway.rng = rng_explore
         gateway.sample_hook = sample_hook
         gateway.decision_hook = _record_decision if (decision_hook is not None or event_hook is not None) else None
         if predictor is not None:
@@ -744,23 +684,26 @@ def run_network_round(
         shadow_oracle.client_states = gateway.client_states
         if gateway.shadow_hmm is None:
             gateway.shadow_hmm = shadow_hmm
-        if predictor is None:
-            if cfg.predictor == "oracle":
-                gateway.predictor = shadow_oracle
-            elif cfg.predictor == "hmm":
-                gateway.predictor = gateway.shadow_hmm
-            elif cfg.predictor == "ewma":
-                gateway.predictor = PEWMA()
-            elif cfg.predictor in {"mlp", "gru"}:
-                gateway.predictor = make_predictor(cfg.predictor, models_dir="models")
+        if predictor is None and (cfg.predictor != previous_predictor_name or cfg.predictor == "oracle"):
+            gateway.predictor = (
+                shadow_oracle if cfg.predictor == "oracle" else make_predictor(cfg.predictor, "models/")
+            )
+        gateway.core.predictor = (
+            gateway.predictor
+            if isinstance(gateway.predictor, FallbackPredictor)
+            else FallbackPredictor(gateway.predictor)
+        )
+        gateway.core.retransmit = cfg.retransmit
+        gateway.core._p_hat.clear()
 
-    # 4. Cross-traffic (Scenario X2 only)
+    # 4. Cross traffic is a configuration input (N-X2), independent of capacity.
     crosstraffic: CrossTrafficGenerator | None = None
-    if scenario.upper() == "X2":
+    effective_cross_mbps = 3.0 if scenario.upper() == "X2" and cross_mbps == 0 else cross_mbps
+    if effective_cross_mbps > 0:
         crosstraffic = CrossTrafficGenerator(
             engine=engine,
             bottleneck=bottleneck,
-            rate_bps=3_000_000.0,
+            rate_bps=effective_cross_mbps * 1_000_000.0,
             frame_size_bytes=S,
             rng=rng_crosstraffic,
         )
@@ -847,9 +790,17 @@ def run_network_round(
                     "abs_t_ns": round_start_abs_ns + engine.now_ns,
                 })
 
+            absolute_arrival_ns = round_start_abs_ns + engine.now_ns
             if gid in gateway.client_states[cid].outstanding:
                 og = gateway.client_states[cid].outstanding[gid]
-                rtt_samples.append(engine.now_ns - og.t_issue_ns)
+                # A late DATA may reach the gateway before the next scheduler
+                # tick has removed its grant. Match GatewayCore's strict
+                # timeout rule: arrivals after tau resolve as loss, not RTT.
+                if absolute_arrival_ns <= og.timeout_ns:
+                    rtt_ns = absolute_arrival_ns - og.t_issue_ns
+                    if rtt_ns < 0:
+                        raise RuntimeError("simulated DATA arrival precedes its absolute grant issue time")
+                    rtt_samples.append(rtt_ns)
 
             new_grants = gateway.on_data(
                 client_id=cid,
@@ -873,7 +824,9 @@ def run_network_round(
         max_rho_ns = int(0.10 * D_ns)
         rho_ns = int(rng_readiness.integers(0, max_rho_ns + 1)) if max_rho_ns > 0 else 0
         delta_ns = access_links[cid].prop_delay_ns
-        ready_arrival_ns = rho_ns + delta_ns + 5_000_000
+        round_start_downlink_ns = delta_ns + 5_000_000
+        ready_uplink_ns = delta_ns + 5_000_000
+        ready_arrival_ns = round_start_downlink_ns + rho_ns + ready_uplink_ns
 
         engine.schedule(
             delay_ns=ready_arrival_ns,
@@ -1010,6 +963,7 @@ def run_network_round(
     # Continue only to observe late packet arrivals. These events must not
     # change the round's aggregate or any metric snapshot taken at D.
     engine.run_all()
+    gateway._sync_core_stats()
     late_metrics = {"late_after_deadline": gateway.late_after_deadline}
 
     return {

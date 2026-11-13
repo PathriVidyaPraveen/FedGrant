@@ -616,7 +616,9 @@ class B1TcpGateway:
         return str(host), int(port)
 
     async def wait(self) -> B1RoundResult:
-        if self.server is None:
+        # The server is released at D, so "started" is tracked by the deadline
+        # task: waiting after the deadline must return the result, not fail.
+        if self._deadline_task is None:
             raise B1TransferError("B1 gateway is not started")
         await self._deadline_event.wait()
         await asyncio.gather(*tuple(self._handlers), return_exceptions=True)

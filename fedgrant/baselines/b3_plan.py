@@ -8,7 +8,7 @@ import math
 import statistics
 import time
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Awaitable, cast
 
 import numpy as np
@@ -36,6 +36,7 @@ from fedgrant.common.wire import WireProtocolError, decode_message, encode_messa
 from fedgrant.core.estimators import RateWindow, rtt_update
 from fedgrant.core.state import ClientState
 from fedgrant.encoder.blocks import values as block_values
+from fedgrant.encoder.ef import bitmap_from_indices, indices_from_bitmap
 from fedgrant.policy.constants import C as DEFAULT_C
 from fedgrant.policy.constants import L as L_DEFAULT
 from fedgrant.policy.plan import (
@@ -48,6 +49,7 @@ from fedgrant.policy.plan import (
 
 log = logging.getLogger(__name__)
 _NANOSECONDS_PER_SECOND = 1_000_000_000
+ROUND_END_GRACE_NS = 200_000_000  # Section 9: ROUND_END fallback after D
 # The spec defines the EWMA weight but no prior; keep an unobserved client conservative.
 B3_DELIVERY_RATIO_INIT = 0.1
 
@@ -165,6 +167,9 @@ class B3GatewayCore:
         self.budget: int | None = None
         self.median_rtt_ns: float | None = None
         self.rtt_samples_ns: dict[int, int] = {}
+        # (send_pos, arrival_ns) of the first accepted DATA that produced each
+        # client's rtt_samples_ns entry; kept for raw logs, value unchanged.
+        self.rtt_first_data: dict[int, tuple[int, int]] = {}
         self.plan_srtt_ns: dict[int, int] = {}
         self.transmission_start_ns: dict[int, int] = {}
         self._plan_computed = False
@@ -325,6 +330,7 @@ class B3GatewayCore:
             sample = received_ns - self.plans[cid].sent_ns
             rtt_update(self.states[cid], sample)
             self.rtt_samples_ns[cid] = sample
+            self.rtt_first_data[cid] = (int(send_pos), int(received_ns))
         self._advance_rate_window(cid, received_ns, backlogged=None)
         self.windows[cid].add_delivery(
             received_ns,
@@ -462,9 +468,22 @@ class B3UdpGateway(asyncio.DatagramProtocol):
             raise B3PlanError("endpoint client_id is not registered")
         self.endpoints[client_id] = _endpoint(endpoint)
 
-    def start_round(self, round_id: int) -> B3GatewayCore:
+    def start_round(self, round_id: int, *, rho_us: Mapping[int, int] | None = None) -> B3GatewayCore:
+        """Send ROUND_START (mode PLAN) to every client and schedule t_plan and D.
+
+        ``rho_us`` gives each client's readiness delay (Section 3.1); the
+        default 0 keeps the previous behaviour.
+        """
         if self.transport is None:
             raise B3PlanError("B3 gateway is not bound")
+        rho_by_client = {cid: 0 for cid in self.endpoints}
+        if rho_us is not None:
+            if set(rho_us) != set(self.endpoints):
+                raise B3PlanError("rho_us must contain exactly the configured clients")
+            for cid, value in rho_us.items():
+                if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 0xFFFFFFFF:
+                    raise B3PlanError("rho_us values must be u32 integers")
+            rho_by_client = dict(rho_us)
         if self.core is not None and not self.core._finished:
             raise B3PlanError("previous B3 round has not finished")
         if self.core is not None and round_id <= self.core.round_id:
@@ -501,7 +520,7 @@ class B3UdpGateway(asyncio.DatagramProtocol):
                     "deadline_ns": deadline_ns,
                     "K": self.core.K,
                     "L": self.L,
-                    "rho_us": 0,
+                    "rho_us": rho_by_client[cid],
                     "mode": int(TransferMode.PLAN),
                 },
             )
@@ -515,6 +534,19 @@ class B3UdpGateway(asyncio.DatagramProtocol):
         data: bytes,
         addr: tuple[str, int] | tuple[str, int, int, int],
     ) -> None:
+        self.receive_datagram(data, addr, self.clock_ns())
+
+    def receive_datagram(
+        self,
+        data: bytes,
+        addr: tuple[str, int] | tuple[str, int, int, int],
+        received_ns: int,
+    ) -> None:
+        """Process one datagram stamped once at receipt.
+
+        Callers that also log the datagram pass the same ``received_ns``, so the
+        logged arrival time is exactly the time used for the RTT sample.
+        """
         core = self.core
         if core is None:
             self.rejected_datagrams += 1
@@ -525,7 +557,6 @@ class B3UdpGateway(asyncio.DatagramProtocol):
                 raise B3PlanError("unexpected B3 client message type")
             if self.endpoints.get(message.client_id) != _endpoint(addr[:2]):
                 raise B3PlanError("B3 datagram came from an unexpected endpoint")
-            received_ns = self.clock_ns()
             if message.message_type is MessageType.READY:
                 core.accept_ready(data, received_ns)
             else:
@@ -543,6 +574,24 @@ class B3UdpGateway(asyncio.DatagramProtocol):
     def connection_lost(self, exc: Exception | None) -> None:
         self.transport = None
         self._closed_event.set()
+
+    def send_round_end(self, result: B3RoundResult) -> None:
+        """Send ROUND_END with each client's delivered-block bitmap (Section 8)."""
+        core = self.core
+        if core is None or result.round_id != core.round_id:
+            raise B3PlanError("ROUND_END must match the current B3 round")
+        for cid in self.endpoints:
+            delivered = result.round_result.client_results[cid].delivered_indices
+            self._send_message(
+                MessageType.ROUND_END,
+                client_id=cid,
+                t_send_ns=self.clock_ns(),
+                body={
+                    "K": core.K,
+                    "n_delivered": len(delivered),
+                    "bitmap": bitmap_from_indices(delivered, core.K),
+                },
+            )
 
     async def wait(self) -> B3RoundResult:
         if self.core is None or self._deadline_task is None:
@@ -631,6 +680,53 @@ class B3UdpGateway(asyncio.DatagramProtocol):
             self.plan_local_handoffs += 1
 
 
+@dataclass(frozen=True, slots=True)
+class B3ClientRoundRecord:
+    """Immutable outcome of one finished client round, published exactly once.
+
+    ``transfer`` is None only when no PLAN was received. Otherwise it reflects
+    every DATA that was actually handed to the socket: on completion it is the
+    task's own result; on cancellation at round end or on a failed send it is
+    the progress recorded up to that point.
+    """
+
+    round_id: int
+    delivered_indices: tuple[int, ...]
+    finished_by: str  # "round_end" | "round_end_timeout"
+    transfer: B2ClientTransfer | None
+    transfer_status: str  # "no_plan" | "completed" | "cancelled" | "failed"
+    transfer_error: str | None
+    ready_sent_ns: int | None
+    plan_start_ns: int | None
+
+    @property
+    def packets_sent(self) -> int:
+        return 0 if self.transfer is None else self.transfer.packets_sent
+
+
+@dataclass(slots=True)
+class _TransferProgress:
+    """Sends recorded as they succeed, so partial transfers keep exact counts."""
+
+    client_id: int
+    round_id: int
+    sent_indices: list[int] = field(default_factory=list)
+    send_times_ns: list[int] = field(default_factory=list)
+    bytes_sent: int = 0
+    plan_start_ns: int | None = None
+
+    def snapshot(self, completed_ns: int, stop_reason: str) -> B2ClientTransfer:
+        return B2ClientTransfer(
+            client_id=self.client_id,
+            round_id=self.round_id,
+            sent_indices=tuple(self.sent_indices),
+            send_times_ns=tuple(self.send_times_ns),
+            application_bytes_sent=self.bytes_sent,
+            completed_ns=completed_ns,
+            stop_reason=stop_reason,
+        )
+
+
 class B3UdpClient(asyncio.DatagramProtocol):
     """Wait for standard PLAN, then send its first planned energy-order blocks."""
 
@@ -667,6 +763,18 @@ class B3UdpClient(asyncio.DatagramProtocol):
         self.last_transfer: B2ClientTransfer | None = None
         self.plan_start_ns: int | None = None
         self.rejected_datagrams = 0
+        self._ready_handle: asyncio.TimerHandle | None = None
+        self._round_end_handle: asyncio.TimerHandle | None = None
+        self.last_finished_round_id: int | None = None
+        self.last_delivered_indices: tuple[int, ...] = ()
+        self.round_end_timeouts = 0
+        self.ready_sent_ns: int | None = None
+        self._plan_progress: _TransferProgress | None = None
+        # Finished rounds, in completion order; each round is published once.
+        self.round_records: dict[int, B3ClientRoundRecord] = {}
+        self.last_round_record: B3ClientRoundRecord | None = None
+        self._finished_rounds: asyncio.Queue[B3ClientRoundRecord] = asyncio.Queue()
+        self._settling: set[asyncio.Task[B2ClientTransfer]] = set()
 
     @classmethod
     async def bind(
@@ -720,6 +828,8 @@ class B3UdpClient(asyncio.DatagramProtocol):
                 self._handle_round_start(message)
             elif message.message_type is MessageType.PLAN:
                 self._handle_plan(message)
+            elif message.message_type is MessageType.ROUND_END:
+                self._handle_round_end(message)
             else:
                 raise B3PlanError("unexpected B3 gateway message type")
         except (B3PlanError, WireProtocolError, B2TransferError, ValueError, TypeError):
@@ -739,8 +849,14 @@ class B3UdpClient(asyncio.DatagramProtocol):
             )
         except asyncio.TimeoutError as exc:
             raise B3PlanError("PLAN was not received before the deadline") from exc
-        if self._plan_task is not None:
-            self.last_transfer = await self._plan_task
+        task = self._plan_task
+        if task is not None:
+            # Wait for the task without letting its cancellation (at round end)
+            # cancel this caller.
+            await asyncio.wait({task})
+            if task.cancelled():
+                raise B3PlanError("PLAN transfer was cancelled at round end")
+            self.last_transfer = task.result()  # re-raises a failed send
         if self.last_transfer is None:
             raise B3PlanError("PLAN task completed without a transfer result")
         return self.last_transfer
@@ -758,17 +874,36 @@ class B3UdpClient(asyncio.DatagramProtocol):
             raise B3PlanError("ROUND_START event completed without a round ID")
         return self._round_id
 
+    async def wait_for_round_record(self, timeout: float | None = None) -> B3ClientRoundRecord:
+        """Next finished round (ROUND_END or 200 ms fallback) with its settled transfer."""
+        return await asyncio.wait_for(self._finished_rounds.get(), timeout=timeout)
+
+    async def wait_for_round_end(self, timeout: float | None = None) -> int:
+        """Wait until ROUND_END (or the 200 ms post-deadline fallback) finishes a round."""
+        return (await self.wait_for_round_record(timeout)).round_id
+
     async def close(self) -> None:
-        if self._plan_task is not None and not self._plan_task.done():
-            self._plan_task.cancel()
-            await asyncio.gather(self._plan_task, return_exceptions=True)
+        for handle in (self._ready_handle, self._round_end_handle):
+            if handle is not None:
+                handle.cancel()
+        self._ready_handle = self._round_end_handle = None
+        tasks = set(self._settling)
+        if self._plan_task is not None:
+            tasks.add(self._plan_task)
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         self._plan_task = None
+        self._settling.clear()
         transport, self.transport = self.transport, None
         self.sender.transport = None
         if transport is not None:
             transport.close()
 
     def _handle_round_start(self, message) -> None:
+        received_ns = self.clock_ns()  # rho_i is measured from ROUND_START receipt
         if self.core.round is not None:
             raise B3PlanError("ROUND_START arrived while a B3 round is active")
         if message.body["mode"] != int(TransferMode.PLAN):
@@ -792,16 +927,119 @@ class B3UdpClient(asyncio.DatagramProtocol):
         self._plan_event.clear()
         self.last_transfer = None
         self.plan_start_ns = None
+        self.ready_sent_ns = None
+        # A previous round's transfer settles through its own done-callback and
+        # its own progress object; it can no longer touch this round's state.
+        self._plan_task = None
+        self._plan_progress = None
+        round_id = message.round_id
+        loop = asyncio.get_running_loop()
+        if self._round_end_handle is not None:
+            self._round_end_handle.cancel()
+        # Section 9: without ROUND_END within 200 ms after D, every block is undelivered.
+        fallback_s = max(0.0, (self._deadline_ns + ROUND_END_GRACE_NS - self.clock_ns()) / _NANOSECONDS_PER_SECOND)
+        self._round_end_handle = loop.call_later(fallback_s, self._round_end_timeout, round_id)
+        rho_us = int(message.body["rho_us"])
+        if rho_us == 0:
+            self._send_ready(round_id, energies)
+        else:
+            # Section 2.1: on ROUND_START, wait the readiness delay rho_i, then
+            # READY. Time spent preparing the update counts toward rho_i.
+            remaining_ns = received_ns + rho_us * 1_000 - self.clock_ns()
+            self._ready_handle = loop.call_later(
+                max(0.0, remaining_ns / _NANOSECONDS_PER_SECOND), self._send_ready, round_id, energies
+            )
+
+    def _send_ready(self, round_id: int, energies: tuple[float, ...]) -> None:
+        self._ready_handle = None
+        if self.core.round is None or self.core.round.round_id != round_id:
+            return
+        self.ready_sent_ns = self.clock_ns()
         self._send(
             encode_message(
                 MessageType.READY,
-                round_id=message.round_id,
+                round_id=round_id,
                 client_id=self.core.client_id,
-                t_send_ns=self.clock_ns(),
+                t_send_ns=self.ready_sent_ns,
                 body={"K": len(energies), "energy": energies},
                 block_length=self.core.error_feedback.L,
             )
         )
+
+    def _handle_round_end(self, message) -> None:
+        current = self.core.round
+        if current is None or message.round_id != current.round_id:
+            raise B3PlanError("ROUND_END does not match the active B3 round")
+        if message.body["K"] != current.encoded.K:
+            raise B3PlanError("ROUND_END K does not match the active B3 round")
+        delivered = tuple(int(i) for i in indices_from_bitmap(message.body["bitmap"], current.encoded.K))
+        if len(delivered) != message.body["n_delivered"]:
+            raise B3PlanError("ROUND_END n_delivered disagrees with its bitmap")
+        self._finish_round(message.round_id, delivered, "round_end")
+
+    def _round_end_timeout(self, round_id: int) -> None:
+        self._round_end_handle = None
+        if self.core.round is not None and self.core.round.round_id == round_id:
+            self.round_end_timeouts += 1
+            self._finish_round(round_id, (), "round_end_timeout")
+
+    def _finish_round(self, round_id: int, delivered: tuple[int, ...], finished_by: str) -> None:
+        """End the round now; publish its record once the PLAN transfer settles.
+
+        Error feedback is applied immediately and never waits for the transfer.
+        A transfer still running at round end is cancelled (the round is over,
+        so further DATA would be late); every send it completed is already in
+        its progress object, so counts stay exact. The record is published from
+        the task's done-callback, exactly once, whatever the task's outcome.
+        """
+        if self.core.round is None or self.core.round.round_id != round_id:
+            return  # already finished (e.g. by an out-of-band delivery result)
+        for handle in (self._ready_handle, self._round_end_handle):
+            if handle is not None:
+                handle.cancel()
+        self._ready_handle = self._round_end_handle = None
+        self.core.finish_round(round_id, delivered)
+        self.last_finished_round_id = round_id
+        self.last_delivered_indices = delivered
+        task, progress = self._plan_task, self._plan_progress
+        ready_sent_ns = self.ready_sent_ns
+        if task is None or progress is None or progress.round_id != round_id:
+            self._publish(B3ClientRoundRecord(round_id, delivered, finished_by, None, "no_plan", None,
+                                              ready_sent_ns, None))
+            return
+
+        def settle(done: asyncio.Task[B2ClientTransfer]) -> None:
+            self._settling.discard(done)
+            transfer, status, error = self._settled_transfer(done, progress)
+            self._publish(B3ClientRoundRecord(round_id, delivered, finished_by, transfer, status, error,
+                                              ready_sent_ns, progress.plan_start_ns))
+
+        if task.done():
+            settle(task)
+        else:
+            self._settling.add(task)
+            task.add_done_callback(settle)
+            task.cancel()
+
+    def _settled_transfer(
+        self, task: asyncio.Task[B2ClientTransfer], progress: _TransferProgress
+    ) -> tuple[B2ClientTransfer, str, str | None]:
+        if task.cancelled():
+            return progress.snapshot(self.clock_ns(), "round_end"), "cancelled", None
+        error = task.exception()  # also marks the exception as retrieved
+        if error is not None:
+            return progress.snapshot(self.clock_ns(), "send_failed"), "failed", f"{type(error).__name__}: {error}"
+        return task.result(), "completed", None
+
+    def _publish(self, record: B3ClientRoundRecord) -> None:
+        if record.round_id in self.round_records:
+            raise B3PlanError(f"round {record.round_id} was already finalized")
+        self.round_records[record.round_id] = record
+        self.last_round_record = record
+        if record.transfer is not None and record.round_id == self._round_id:
+            # Never let a late-settling record overwrite a newer round's field.
+            self.last_transfer = record.transfer
+        self._finished_rounds.put_nowait(record)
 
     def _handle_plan(self, message) -> None:
         if (
@@ -823,33 +1061,34 @@ class B3UdpClient(asyncio.DatagramProtocol):
         self._plan_received = True
         self.plan_start_ns = None
         self._plan_event.set()
+        progress = _TransferProgress(self.core.client_id, message.round_id)
+        self._plan_progress = progress
         self._plan_task = asyncio.create_task(
-            self._send_plan_blocks(message.round_id, blocks, rate),
+            self._send_plan_blocks(message.round_id, blocks, rate, progress),
             name=f"b3-client-{self.core.client_id}-send",
         )
+
+    def _set_plan_start(self, progress: _TransferProgress, t_ns: int) -> None:
+        progress.plan_start_ns = t_ns
+        if progress.round_id == self._round_id:  # never write into a newer round
+            self.plan_start_ns = t_ns
 
     async def _send_plan_blocks(
         self,
         round_id: int,
         block_count: int,
         rate_bps: int,
+        progress: _TransferProgress | None = None,
     ) -> B2ClientTransfer:
+        progress = progress if progress is not None else _TransferProgress(self.core.client_id, round_id)
         deadline_ns = self._deadline_ns
         current = self.core.round
         if deadline_ns is None or current is None:
             raise B3PlanError("PLAN send has no active prepared round")
         t_start_ns = self.clock_ns()
-        self.plan_start_ns = t_start_ns
+        self._set_plan_start(progress, t_start_ns)
         if block_count == 0:
-            return B2ClientTransfer(
-                client_id=self.core.client_id,
-                round_id=round_id,
-                sent_indices=(),
-                send_times_ns=(),
-                application_bytes_sent=0,
-                completed_ns=self.clock_ns(),
-                stop_reason="all_blocks_sent",
-            )
+            return progress.snapshot(self.clock_ns(), "all_blocks_sent")
         if rate_bps <= 0:
             raise B3PlanError("positive PLAN k requires a positive rate")
         transport = self.sender.transport
@@ -859,9 +1098,10 @@ class B3UdpClient(asyncio.DatagramProtocol):
             raise B2TransferError("B3 UDP client is already sending a round")
 
         self.sender._sending = True
-        sent_indices: list[int] = []
-        send_times: list[int] = []
-        bytes_sent = 0
+        # Shared with the round's record: each successful send is appended
+        # immediately (no await in between), so cancellation keeps exact counts.
+        sent_indices = progress.sent_indices
+        send_times = progress.send_times_ns
         size = data_frame_size_bytes(self.core.error_feedback.L)
         stop_reason = "all_blocks_sent"
         try:
@@ -873,7 +1113,7 @@ class B3UdpClient(asyncio.DatagramProtocol):
                     break
                 if not send_times:
                     t_start_ns = now_ns
-                    self.plan_start_ns = t_start_ns
+                    self._set_plan_start(progress, t_start_ns)
                 send_pos = len(sent_indices) + 1
                 sent_by_now = paced_blocks_sent(
                     now_ns,
@@ -924,18 +1164,10 @@ class B3UdpClient(asyncio.DatagramProtocol):
                     raise B2TransferError(f"B3 UDP send failed: {exc}") from exc
                 sent_indices.append(block_idx)
                 send_times.append(now_ns)
-                bytes_sent += len(packet)
+                progress.bytes_sent += len(packet)
 
             self.sender._raise_transport_error()
-            return B2ClientTransfer(
-                client_id=self.core.client_id,
-                round_id=round_id,
-                sent_indices=tuple(sent_indices),
-                send_times_ns=tuple(send_times),
-                application_bytes_sent=bytes_sent,
-                completed_ns=self.clock_ns(),
-                stop_reason=stop_reason,
-            )
+            return progress.snapshot(self.clock_ns(), stop_reason)
         finally:
             self.sender._sending = False
 
