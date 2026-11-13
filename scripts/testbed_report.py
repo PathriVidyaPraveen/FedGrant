@@ -225,7 +225,8 @@ def plot_replay(rows: list[dict], lags: dict[str, np.ndarray], path: Path, *, mi
 
 # --- READY amendment validation (CHANGELOG 2026-11-13) ---------------------------------
 
-READY_RUNS = (("scale-L2-N20", "section7"), ("ready-lossless-L2-N20", "ready_lossless"))
+READY_RUNS = (("scale-L2-N20", "section7"), ("ready-lossless-L2-N20", "ready_lossless"),
+              ("ready-timing-L2-N20", "ready_lossless+receipt_timer"))
 
 
 def ready_validation(runs_root: Path, changelog: Path) -> tuple[list[dict], list[dict], dict] | None:

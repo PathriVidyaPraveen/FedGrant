@@ -1,7 +1,5 @@
 {
-  "changelog_amendment": [
-    "| 2026-11-13 | Client uplink loss scope (Section 7, client egress `ci-eth0`) | `netem ... loss gemodel p r 100% 0%` applies to every frame a client sends, including READY | READY frames (UDP to the gateway port, FedGrant type 2) bypass the Gilbert\u2013Elliott loss and keep the access delay \u03b4i; DATA and every other client frame keep the configured GE loss, delay and TBF unchanged | Section 6 delivers READY on a delay-only path in the simulator, while Section 7 applied loss to it; at N = 20, 13\u201316% of READYs were lost, a client without READY is excluded for the whole round and \u03b7 cannot be computed, which biases M1 against its M-sim twin. Conditions: the filter matches only READY; verify all READYs arrive and DATA still sees the configured GE loss; rerun every M1 run made before the change | APPROVED by all four (Tejaswi, Praveen, Jayadev, Prajin; 2026-11-13). Implemented in `fedgrant/mininet/tcsetup.py` (`client_egress(ready_lossless=True)`, default), verified before every run by `verify_tc`; `--ready-lossy` reproduces the original layout for comparison only. No M1 run had been made before the change |"
-  ],
+  "changelog_amendment": [],
   "runs": {
     "ready-lossless-L2-N20": {
       "N": 20,
@@ -435,6 +433,443 @@
             "tc qdisc add dev s1-gw parent 1:1 handle 10: tbf rate 10000000bit burst 3000 limit 94336"
           ],
           "effective": "qdisc netem 1: root refcnt 13 limit 1000 delay 5ms seed 11341192417653139840\r\nqdisc tbf 10: parent 1:1 rate 10Mbit burst 3000b/1 mpu 0b lat 73.1ms linklayer ethernet",
+          "host": "s1",
+          "interface": "s1-gw"
+        }
+      ]
+    },
+    "ready-timing-L2-N20": {
+      "N": 20,
+      "beta": 0.1,
+      "compute_window_s": 1.0,
+      "cross_mbps": 0.0,
+      "duration_ns": 398000000,
+      "experiment_id": "smoke-stub",
+      "gateway_factory": "fedgrant.mininet.stub_policy:create_gateway",
+      "ge_target_loss_rate": 0.05,
+      "ge_target_mean_burst": 8.0,
+      "layout": "ready_lossless+receipt_timer",
+      "platform": "Fedora 44 Mininet testbed",
+      "policy": "STUB-FIRST-ELIGIBLE",
+      "ready_lossless": true,
+      "rounds": 25,
+      "scenario": "L2",
+      "seed": 0,
+      "tc_readback": [
+        {
+          "configured_commands": [
+            "tc qdisc add dev c0-eth0 root handle 1: prio bands 2 priomap 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1",
+            "tc qdisc add dev c0-eth0 parent 1:1 handle 30: netem delay 10ms",
+            "tc qdisc add dev c0-eth0 parent 1:2 handle 2: netem delay 10ms loss gemodel 0.6579% 12.5% 100% 0%",
+            "tc qdisc add dev c0-eth0 parent 2:1 handle 10: tbf rate 2000000bit burst 3000 limit 47168",
+            "tc filter add dev c0-eth0 parent 1: protocol ip prio 1 u32 match ip protocol 17 0xff match ip dport 9000 0xffff match u16 0x4647 0xffff at 28 match u8 0x02 0xff at 31 flowid 1:1"
+          ],
+          "effective": "qdisc prio 1: root refcnt 13 bands 2 priomap 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1\r\nqdisc netem 2: parent 1:2 limit 1000 delay 10ms loss gemodel p 0.6579% r 12.5% 1-h 100% 1-k 0% seed 10716378635003342746\r\nqdisc netem 30: parent 1:1 limit 1000 delay 10ms seed 18355922322226530006\r\nqdisc tbf 10: parent 2:1 rate 2Mbit burst 3000b/1 mpu 0b lat 177ms linklayer ethernet",
+          "host": "c0",
+          "interface": "c0-eth0"
+        },
+        {
+          "configured_commands": [
+            "tc qdisc add dev c1-eth0 root handle 1: prio bands 2 priomap 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1",
+            "tc qdisc add dev c1-eth0 parent 1:1 handle 30: netem delay 20ms",
+            "tc qdisc add dev c1-eth0 parent 1:2 handle 2: netem delay 20ms loss gemodel 0.6579% 12.5% 100% 0%",
+            "tc qdisc add dev c1-eth0 parent 2:1 handle 10: tbf rate 4000000bit burst 3000 limit 47168",
+            "tc filter add dev c1-eth0 parent 1: protocol ip prio 1 u32 match ip protocol 17 0xff match ip dport 9000 0xffff match u16 0x4647 0xffff at 28 match u8 0x02 0xff at 31 flowid 1:1"
+          ],
+          "effective": "qdisc prio 1: root refcnt 13 bands 2 priomap 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1\r\nqdisc netem 2: parent 1:2 limit 1000 delay 20ms loss gemodel p 0.6579% r 12.5% 1-h 100% 1-k 0% seed 3792865739449392785\r\nqdisc netem 30: parent 1:1 limit 1000 delay 20ms seed 3581599155687386346\r\nqdisc tbf 10: parent 2:1 rate 4Mbit burst 3000b/1 mpu 0b lat 88.3ms linklayer ethernet",
+          "host": "c1",
+          "interface": "c1-eth0"
+        },
+        {
+          "configured_commands": [
+            "tc qdisc add dev c10-eth0 root handle 1: prio bands 2 priomap 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1",
+            "tc qdisc add dev c10-eth0 parent 1:1 handle 30: netem delay 30ms",
+            "tc qdisc add dev c10-eth0 parent 1:2 handle 2: netem delay 30ms loss gemodel 0.6579% 12.5% 100% 0%",
+            "tc qdisc add dev c10-eth0 parent 2:1 handle 10: tbf rate 4000000bit burst 3000 limit 47168",
+            "tc filter add dev c10-eth0 parent 1: protocol ip prio 1 u32 match ip protocol 17 0xff match ip dport 9000 0xffff match u16 0x4647 0xffff at 28 match u8 0x02 0xff at 31 flowid 1:1"
+          ],
+          "effective": "qdisc prio 1: root refcnt 13 bands 2 priomap 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1\r\nqdisc netem 2: parent 1:2 limit 1000 delay 30ms loss gemodel p 0.6579% r 12.5% 1-h 100% 1-k 0% seed 14082826741789728147\r\nqdisc netem 30: parent 1:1 limit 1000 delay 30ms seed 452331378136450545\r\nqdisc tbf 10: parent 2:1 rate 4Mbit burst 3000b/1 mpu 0b lat 88.3ms linklayer ethernet",
+          "host": "c10",
+          "interface": "c10-eth0"
+        },
+        {
+          "configured_commands": [
+            "tc qdisc add dev c11-eth0 root handle 1: prio bands 2 priomap 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1",
+            "tc qdisc add dev c11-eth0 parent 1:1 handle 30: netem delay 40ms",
+            "tc qdisc add dev c11-eth0 parent 1:2 handle 2: netem delay 40ms loss gemodel 0.6579% 12.5% 100% 0%",
+            "tc qdisc add dev c11-eth0 parent 2:1 handle 10: tbf rate 6000000bit burst 3000 limit 47168",
+            "tc filter add dev c11-eth0 parent 1: protocol ip prio 1 u32 match ip protocol 17 0xff match ip dport 9000 0xffff match u16 0x4647 0xffff at 28 match u8 0x02 0xff at 31 flowid 1:1"
+          ],
+          "effective": "qdisc prio 1: root refcnt 13 bands 2 priomap 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1\r\nqdisc netem 2: parent 1:2 limit 1000 delay 40ms loss gemodel p 0.6579% r 12.5% 1-h 100% 1-k 0% seed 5628493743553370244\r\nqdisc netem 30: parent 1:1 limit 1000 delay 40ms seed 143618271118221044\r\nqdisc tbf 10: parent 2:1 rate 6Mbit burst 2999b/1 mpu 0b lat 58.9ms linklayer ethernet",
+          "host": "c11",
+          "interface": "c11-eth0"
+        },
+        {
+          "configured_commands": [
+            "tc qdisc add dev c12-eth0 root handle 1: prio bands 2 priomap 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1",
+            "tc qdisc add dev c12-eth0 parent 1:1 handle 30: netem delay 10ms",
+            "tc qdisc add dev c12-eth0 parent 1:2 handle 2: netem delay 10ms loss gemodel 0.6579% 12.5% 100% 0%",
+            "tc qdisc add dev c12-eth0 parent 2:1 handle 10: tbf rate 2000000bit burst 3000 limit 47168",
+            "tc filter add dev c12-eth0 parent 1: protocol ip prio 1 u32 match ip protocol 17 0xff match ip dport 9000 0xffff match u16 0x4647 0xffff at 28 match u8 0x02 0xff at 31 flowid 1:1"
+          ],
+          "effective": "qdisc prio 1: root refcnt 13 bands 2 priomap 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1\r\nqdisc netem 2: parent 1:2 limit 1000 delay 10ms loss gemodel p 0.6579% r 12.5% 1-h 100% 1-k 0% seed 14548929030118099925\r\nqdisc netem 30: parent 1:1 limit 1000 delay 10ms seed 5394492252448890105\r\nqdisc tbf 10: parent 2:1 rate 2Mbit burst 3000b/1 mpu 0b lat 177ms linklayer ethernet",
+          "host": "c12",
+          "interface": "c12-eth0"
+        },
+        {
+          "configured_commands": [
+            "tc qdisc add dev c13-eth0 root handle 1: prio bands 2 priomap 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1",
+            "tc qdisc add dev c13-eth0 parent 1:1 handle 30: netem delay 20ms",
+            "tc qdisc add dev c13-eth0 parent 1:2 handle 2: netem delay 20ms loss gemodel 0.6579% 12.5% 100% 0%",
+            "tc qdisc add dev c13-eth0 parent 2:1 handle 10: tbf rate 4000000bit burst 3000 limit 47168",
+            "tc filter add dev c13-eth0 parent 1: protocol ip prio 1 u32 match ip protocol 17 0xff match ip dport 9000 0xffff match u16 0x4647 0xffff at 28 match u8 0x02 0xff at 31 flowid 1:1"
+          ],
+          "effective": "qdisc prio 1: root refcnt 13 bands 2 priomap 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1\r\nqdisc netem 2: parent 1:2 limit 1000 delay 20ms loss gemodel p 0.6579% r 12.5% 1-h 100% 1-k 0% seed 11798235687898463470\r\nqdisc netem 30: parent 1:1 limit 1000 delay 20ms seed 6826643067501640628\r\nqdisc tbf 10: parent 2:1 rate 4Mbit burst 3000b/1 mpu 0b lat 88.3ms linklayer ethernet",
+          "host": "c13",
+          "interface": "c13-eth0"
+        },
+        {
+          "configured_commands": [
+            "tc qdisc add dev c14-eth0 root handle 1: prio bands 2 priomap 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1",
+            "tc qdisc add dev c14-eth0 parent 1:1 handle 30: netem delay 30ms",
+            "tc qdisc add dev c14-eth0 parent 1:2 handle 2: netem delay 30ms loss gemodel 0.6579% 12.5% 100% 0%",
+            "tc qdisc add dev c14-eth0 parent 2:1 handle 10: tbf rate 6000000bit burst 3000 limit 47168",
+            "tc filter add dev c14-eth0 parent 1: protocol ip prio 1 u32 match ip protocol 17 0xff match ip dport 9000 0xffff match u16 0x4647 0xffff at 28 match u8 0x02 0xff at 31 flowid 1:1"
+          ],
+          "effective": "qdisc prio 1: root refcnt 13 bands 2 priomap 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1\r\nqdisc netem 2: parent 1:2 limit 1000 delay 30ms loss gemodel p 0.6579% r 12.5% 1-h 100% 1-k 0% seed 8869355696985244814\r\nqdisc netem 30: parent 1:1 limit 1000 delay 30ms seed 5599596120639226065\r\nqdisc tbf 10: parent 2:1 rate 6Mbit burst 2999b/1 mpu 0b lat 58.9ms linklayer ethernet",
+          "host": "c14",
+          "interface": "c14-eth0"
+        },
+        {
+          "configured_commands": [
+            "tc qdisc add dev c15-eth0 root handle 1: prio bands 2 priomap 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1",
+            "tc qdisc add dev c15-eth0 parent 1:1 handle 30: netem delay 40ms",
+            "tc qdisc add dev c15-eth0 parent 1:2 handle 2: netem delay 40ms loss gemodel 0.6579% 12.5% 100% 0%",
+            "tc qdisc add dev c15-eth0 parent 2:1 handle 10: tbf rate 2000000bit burst 3000 limit 47168",
+            "tc filter add dev c15-eth0 parent 1: protocol ip prio 1 u32 match ip protocol 17 0xff match ip dport 9000 0xffff match u16 0x4647 0xffff at 28 match u8 0x02 0xff at 31 flowid 1:1"
+          ],
+          "effective": "qdisc prio 1: root refcnt 13 bands 2 priomap 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1\r\nqdisc netem 2: parent 1:2 limit 1000 delay 40ms loss gemodel p 0.6579% r 12.5% 1-h 100% 1-k 0% seed 7771547286989582271\r\nqdisc netem 30: parent 1:1 limit 1000 delay 40ms seed 2548141841797648064\r\nqdisc tbf 10: parent 2:1 rate 2Mbit burst 3000b/1 mpu 0b lat 177ms linklayer ethernet",
+          "host": "c15",
+          "interface": "c15-eth0"
+        },
+        {
+          "configured_commands": [
+            "tc qdisc add dev c16-eth0 root handle 1: prio bands 2 priomap 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1",
+            "tc qdisc add dev c16-eth0 parent 1:1 handle 30: netem delay 10ms",
+            "tc qdisc add dev c16-eth0 parent 1:2 handle 2: netem delay 10ms loss gemodel 0.6579% 12.5% 100% 0%",
+            "tc qdisc add dev c16-eth0 parent 2:1 handle 10: tbf rate 4000000bit burst 3000 limit 47168",
+            "tc filter add dev c16-eth0 parent 1: protocol ip prio 1 u32 match ip protocol 17 0xff match ip dport 9000 0xffff match u16 0x4647 0xffff at 28 match u8 0x02 0xff at 31 flowid 1:1"
+          ],
+          "effective": "qdisc prio 1: root refcnt 13 bands 2 priomap 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1\r\nqdisc netem 2: parent 1:2 limit 1000 delay 10ms loss gemodel p 0.6579% r 12.5% 1-h 100% 1-k 0% seed 15457518111971917951\r\nqdisc netem 30: parent 1:1 limit 1000 delay 10ms seed 6418037578991933939\r\nqdisc tbf 10: parent 2:1 rate 4Mbit burst 3000b/1 mpu 0b lat 88.3ms linklayer ethernet",
+          "host": "c16",
+          "interface": "c16-eth0"
+        },
+        {
+          "configured_commands": [
+            "tc qdisc add dev c17-eth0 root handle 1: prio bands 2 priomap 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1",
+            "tc qdisc add dev c17-eth0 parent 1:1 handle 30: netem delay 20ms",
+            "tc qdisc add dev c17-eth0 parent 1:2 handle 2: netem delay 20ms loss gemodel 0.6579% 12.5% 100% 0%",
+            "tc qdisc add dev c17-eth0 parent 2:1 handle 10: tbf rate 6000000bit burst 3000 limit 47168",
+            "tc filter add dev c17-eth0 parent 1: protocol ip prio 1 u32 match ip protocol 17 0xff match ip dport 9000 0xffff match u16 0x4647 0xffff at 28 match u8 0x02 0xff at 31 flowid 1:1"
+          ],
+          "effective": "qdisc prio 1: root refcnt 13 bands 2 priomap 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1\r\nqdisc netem 2: parent 1:2 limit 1000 delay 20ms loss gemodel p 0.6579% r 12.5% 1-h 100% 1-k 0% seed 15118656366496990159\r\nqdisc netem 30: parent 1:1 limit 1000 delay 20ms seed 1669327719723832002\r\nqdisc tbf 10: parent 2:1 rate 6Mbit burst 2999b/1 mpu 0b lat 58.9ms linklayer ethernet",
+          "host": "c17",
+          "interface": "c17-eth0"
+        },
+        {
+          "configured_commands": [
+            "tc qdisc add dev c18-eth0 root handle 1: prio bands 2 priomap 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1",
+            "tc qdisc add dev c18-eth0 parent 1:1 handle 30: netem delay 30ms",
+            "tc qdisc add dev c18-eth0 parent 1:2 handle 2: netem delay 30ms loss gemodel 0.6579% 12.5% 100% 0%",
+            "tc qdisc add dev c18-eth0 parent 2:1 handle 10: tbf rate 2000000bit burst 3000 limit 47168",
+            "tc filter add dev c18-eth0 parent 1: protocol ip prio 1 u32 match ip protocol 17 0xff match ip dport 9000 0xffff match u16 0x4647 0xffff at 28 match u8 0x02 0xff at 31 flowid 1:1"
+          ],
+          "effective": "qdisc prio 1: root refcnt 13 bands 2 priomap 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1\r\nqdisc netem 2: parent 1:2 limit 1000 delay 30ms loss gemodel p 0.6579% r 12.5% 1-h 100% 1-k 0% seed 5147871005367557753\r\nqdisc netem 30: parent 1:1 limit 1000 delay 30ms seed 12390544685975345698\r\nqdisc tbf 10: parent 2:1 rate 2Mbit burst 3000b/1 mpu 0b lat 177ms linklayer ethernet",
+          "host": "c18",
+          "interface": "c18-eth0"
+        },
+        {
+          "configured_commands": [
+            "tc qdisc add dev c19-eth0 root handle 1: prio bands 2 priomap 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1",
+            "tc qdisc add dev c19-eth0 parent 1:1 handle 30: netem delay 40ms",
+            "tc qdisc add dev c19-eth0 parent 1:2 handle 2: netem delay 40ms loss gemodel 0.6579% 12.5% 100% 0%",
+            "tc qdisc add dev c19-eth0 parent 2:1 handle 10: tbf rate 4000000bit burst 3000 limit 47168",
+            "tc filter add dev c19-eth0 parent 1: protocol ip prio 1 u32 match ip protocol 17 0xff match ip dport 9000 0xffff match u16 0x4647 0xffff at 28 match u8 0x02 0xff at 31 flowid 1:1"
+          ],
+          "effective": "qdisc prio 1: root refcnt 13 bands 2 priomap 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1\r\nqdisc netem 2: parent 1:2 limit 1000 delay 40ms loss gemodel p 0.6579% r 12.5% 1-h 100% 1-k 0% seed 84287834707597362\r\nqdisc netem 30: parent 1:1 limit 1000 delay 40ms seed 10252440623651673326\r\nqdisc tbf 10: parent 2:1 rate 4Mbit burst 3000b/1 mpu 0b lat 88.3ms linklayer ethernet",
+          "host": "c19",
+          "interface": "c19-eth0"
+        },
+        {
+          "configured_commands": [
+            "tc qdisc add dev c2-eth0 root handle 1: prio bands 2 priomap 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1",
+            "tc qdisc add dev c2-eth0 parent 1:1 handle 30: netem delay 30ms",
+            "tc qdisc add dev c2-eth0 parent 1:2 handle 2: netem delay 30ms loss gemodel 0.6579% 12.5% 100% 0%",
+            "tc qdisc add dev c2-eth0 parent 2:1 handle 10: tbf rate 6000000bit burst 3000 limit 47168",
+            "tc filter add dev c2-eth0 parent 1: protocol ip prio 1 u32 match ip protocol 17 0xff match ip dport 9000 0xffff match u16 0x4647 0xffff at 28 match u8 0x02 0xff at 31 flowid 1:1"
+          ],
+          "effective": "qdisc prio 1: root refcnt 13 bands 2 priomap 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1\r\nqdisc netem 2: parent 1:2 limit 1000 delay 30ms loss gemodel p 0.6579% r 12.5% 1-h 100% 1-k 0% seed 12969105688270523312\r\nqdisc netem 30: parent 1:1 limit 1000 delay 30ms seed 14679837274364759166\r\nqdisc tbf 10: parent 2:1 rate 6Mbit burst 2999b/1 mpu 0b lat 58.9ms linklayer ethernet",
+          "host": "c2",
+          "interface": "c2-eth0"
+        },
+        {
+          "configured_commands": [
+            "tc qdisc add dev c3-eth0 root handle 1: prio bands 2 priomap 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1",
+            "tc qdisc add dev c3-eth0 parent 1:1 handle 30: netem delay 40ms",
+            "tc qdisc add dev c3-eth0 parent 1:2 handle 2: netem delay 40ms loss gemodel 0.6579% 12.5% 100% 0%",
+            "tc qdisc add dev c3-eth0 parent 2:1 handle 10: tbf rate 2000000bit burst 3000 limit 47168",
+            "tc filter add dev c3-eth0 parent 1: protocol ip prio 1 u32 match ip protocol 17 0xff match ip dport 9000 0xffff match u16 0x4647 0xffff at 28 match u8 0x02 0xff at 31 flowid 1:1"
+          ],
+          "effective": "qdisc prio 1: root refcnt 13 bands 2 priomap 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1\r\nqdisc netem 2: parent 1:2 limit 1000 delay 40ms loss gemodel p 0.6579% r 12.5% 1-h 100% 1-k 0% seed 1242266795533408063\r\nqdisc netem 30: parent 1:1 limit 1000 delay 40ms seed 7858776473045974542\r\nqdisc tbf 10: parent 2:1 rate 2Mbit burst 3000b/1 mpu 0b lat 177ms linklayer ethernet",
+          "host": "c3",
+          "interface": "c3-eth0"
+        },
+        {
+          "configured_commands": [
+            "tc qdisc add dev c4-eth0 root handle 1: prio bands 2 priomap 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1",
+            "tc qdisc add dev c4-eth0 parent 1:1 handle 30: netem delay 10ms",
+            "tc qdisc add dev c4-eth0 parent 1:2 handle 2: netem delay 10ms loss gemodel 0.6579% 12.5% 100% 0%",
+            "tc qdisc add dev c4-eth0 parent 2:1 handle 10: tbf rate 4000000bit burst 3000 limit 47168",
+            "tc filter add dev c4-eth0 parent 1: protocol ip prio 1 u32 match ip protocol 17 0xff match ip dport 9000 0xffff match u16 0x4647 0xffff at 28 match u8 0x02 0xff at 31 flowid 1:1"
+          ],
+          "effective": "qdisc prio 1: root refcnt 13 bands 2 priomap 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1\r\nqdisc netem 2: parent 1:2 limit 1000 delay 10ms loss gemodel p 0.6579% r 12.5% 1-h 100% 1-k 0% seed 3565356716252634477\r\nqdisc netem 30: parent 1:1 limit 1000 delay 10ms seed 3002851698399362816\r\nqdisc tbf 10: parent 2:1 rate 4Mbit burst 3000b/1 mpu 0b lat 88.3ms linklayer ethernet",
+          "host": "c4",
+          "interface": "c4-eth0"
+        },
+        {
+          "configured_commands": [
+            "tc qdisc add dev c5-eth0 root handle 1: prio bands 2 priomap 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1",
+            "tc qdisc add dev c5-eth0 parent 1:1 handle 30: netem delay 20ms",
+            "tc qdisc add dev c5-eth0 parent 1:2 handle 2: netem delay 20ms loss gemodel 0.6579% 12.5% 100% 0%",
+            "tc qdisc add dev c5-eth0 parent 2:1 handle 10: tbf rate 6000000bit burst 3000 limit 47168",
+            "tc filter add dev c5-eth0 parent 1: protocol ip prio 1 u32 match ip protocol 17 0xff match ip dport 9000 0xffff match u16 0x4647 0xffff at 28 match u8 0x02 0xff at 31 flowid 1:1"
+          ],
+          "effective": "qdisc prio 1: root refcnt 13 bands 2 priomap 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1\r\nqdisc netem 2: parent 1:2 limit 1000 delay 20ms loss gemodel p 0.6579% r 12.5% 1-h 100% 1-k 0% seed 12875224962466255391\r\nqdisc netem 30: parent 1:1 limit 1000 delay 20ms seed 4344207729617723274\r\nqdisc tbf 10: parent 2:1 rate 6Mbit burst 2999b/1 mpu 0b lat 58.9ms linklayer ethernet",
+          "host": "c5",
+          "interface": "c5-eth0"
+        },
+        {
+          "configured_commands": [
+            "tc qdisc add dev c6-eth0 root handle 1: prio bands 2 priomap 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1",
+            "tc qdisc add dev c6-eth0 parent 1:1 handle 30: netem delay 30ms",
+            "tc qdisc add dev c6-eth0 parent 1:2 handle 2: netem delay 30ms loss gemodel 0.6579% 12.5% 100% 0%",
+            "tc qdisc add dev c6-eth0 parent 2:1 handle 10: tbf rate 2000000bit burst 3000 limit 47168",
+            "tc filter add dev c6-eth0 parent 1: protocol ip prio 1 u32 match ip protocol 17 0xff match ip dport 9000 0xffff match u16 0x4647 0xffff at 28 match u8 0x02 0xff at 31 flowid 1:1"
+          ],
+          "effective": "qdisc prio 1: root refcnt 13 bands 2 priomap 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1\r\nqdisc netem 2: parent 1:2 limit 1000 delay 30ms loss gemodel p 0.6579% r 12.5% 1-h 100% 1-k 0% seed 16921245580140774209\r\nqdisc netem 30: parent 1:1 limit 1000 delay 30ms seed 16153611449000057638\r\nqdisc tbf 10: parent 2:1 rate 2Mbit burst 3000b/1 mpu 0b lat 177ms linklayer ethernet",
+          "host": "c6",
+          "interface": "c6-eth0"
+        },
+        {
+          "configured_commands": [
+            "tc qdisc add dev c7-eth0 root handle 1: prio bands 2 priomap 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1",
+            "tc qdisc add dev c7-eth0 parent 1:1 handle 30: netem delay 40ms",
+            "tc qdisc add dev c7-eth0 parent 1:2 handle 2: netem delay 40ms loss gemodel 0.6579% 12.5% 100% 0%",
+            "tc qdisc add dev c7-eth0 parent 2:1 handle 10: tbf rate 4000000bit burst 3000 limit 47168",
+            "tc filter add dev c7-eth0 parent 1: protocol ip prio 1 u32 match ip protocol 17 0xff match ip dport 9000 0xffff match u16 0x4647 0xffff at 28 match u8 0x02 0xff at 31 flowid 1:1"
+          ],
+          "effective": "qdisc prio 1: root refcnt 13 bands 2 priomap 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1\r\nqdisc netem 2: parent 1:2 limit 1000 delay 40ms loss gemodel p 0.6579% r 12.5% 1-h 100% 1-k 0% seed 6810239270706414926\r\nqdisc netem 30: parent 1:1 limit 1000 delay 40ms seed 13821376096490600162\r\nqdisc tbf 10: parent 2:1 rate 4Mbit burst 3000b/1 mpu 0b lat 88.3ms linklayer ethernet",
+          "host": "c7",
+          "interface": "c7-eth0"
+        },
+        {
+          "configured_commands": [
+            "tc qdisc add dev c8-eth0 root handle 1: prio bands 2 priomap 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1",
+            "tc qdisc add dev c8-eth0 parent 1:1 handle 30: netem delay 10ms",
+            "tc qdisc add dev c8-eth0 parent 1:2 handle 2: netem delay 10ms loss gemodel 0.6579% 12.5% 100% 0%",
+            "tc qdisc add dev c8-eth0 parent 2:1 handle 10: tbf rate 6000000bit burst 3000 limit 47168",
+            "tc filter add dev c8-eth0 parent 1: protocol ip prio 1 u32 match ip protocol 17 0xff match ip dport 9000 0xffff match u16 0x4647 0xffff at 28 match u8 0x02 0xff at 31 flowid 1:1"
+          ],
+          "effective": "qdisc prio 1: root refcnt 13 bands 2 priomap 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1\r\nqdisc netem 2: parent 1:2 limit 1000 delay 10ms loss gemodel p 0.6579% r 12.5% 1-h 100% 1-k 0% seed 6592477650137976888\r\nqdisc netem 30: parent 1:1 limit 1000 delay 10ms seed 14317217226533779842\r\nqdisc tbf 10: parent 2:1 rate 6Mbit burst 2999b/1 mpu 0b lat 58.9ms linklayer ethernet",
+          "host": "c8",
+          "interface": "c8-eth0"
+        },
+        {
+          "configured_commands": [
+            "tc qdisc add dev c9-eth0 root handle 1: prio bands 2 priomap 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1",
+            "tc qdisc add dev c9-eth0 parent 1:1 handle 30: netem delay 20ms",
+            "tc qdisc add dev c9-eth0 parent 1:2 handle 2: netem delay 20ms loss gemodel 0.6579% 12.5% 100% 0%",
+            "tc qdisc add dev c9-eth0 parent 2:1 handle 10: tbf rate 2000000bit burst 3000 limit 47168",
+            "tc filter add dev c9-eth0 parent 1: protocol ip prio 1 u32 match ip protocol 17 0xff match ip dport 9000 0xffff match u16 0x4647 0xffff at 28 match u8 0x02 0xff at 31 flowid 1:1"
+          ],
+          "effective": "qdisc prio 1: root refcnt 13 bands 2 priomap 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1\r\nqdisc netem 2: parent 1:2 limit 1000 delay 20ms loss gemodel p 0.6579% r 12.5% 1-h 100% 1-k 0% seed 6072612525984597301\r\nqdisc netem 30: parent 1:1 limit 1000 delay 20ms seed 7429240813973356392\r\nqdisc tbf 10: parent 2:1 rate 2Mbit burst 3000b/1 mpu 0b lat 177ms linklayer ethernet",
+          "host": "c9",
+          "interface": "c9-eth0"
+        },
+        {
+          "configured_commands": [
+            "tc qdisc add dev gw-eth0 root netem delay 5ms"
+          ],
+          "effective": "qdisc netem 802e: root refcnt 13 limit 1000 delay 5ms seed 16632502755255037729",
+          "host": "gw",
+          "interface": "gw-eth0"
+        },
+        {
+          "configured_commands": [
+            "tc qdisc add dev s1-c0 root netem delay 10ms"
+          ],
+          "effective": "qdisc netem 801a: root refcnt 13 limit 1000 delay 10ms seed 5425642667781272210",
+          "host": "s1",
+          "interface": "s1-c0"
+        },
+        {
+          "configured_commands": [
+            "tc qdisc add dev s1-c1 root netem delay 20ms"
+          ],
+          "effective": "qdisc netem 801b: root refcnt 13 limit 1000 delay 20ms seed 1933745150055860215",
+          "host": "s1",
+          "interface": "s1-c1"
+        },
+        {
+          "configured_commands": [
+            "tc qdisc add dev s1-c10 root netem delay 30ms"
+          ],
+          "effective": "qdisc netem 8024: root refcnt 13 limit 1000 delay 30ms seed 12230774560783000421",
+          "host": "s1",
+          "interface": "s1-c10"
+        },
+        {
+          "configured_commands": [
+            "tc qdisc add dev s1-c11 root netem delay 40ms"
+          ],
+          "effective": "qdisc netem 8025: root refcnt 13 limit 1000 delay 40ms seed 501360864477035606",
+          "host": "s1",
+          "interface": "s1-c11"
+        },
+        {
+          "configured_commands": [
+            "tc qdisc add dev s1-c12 root netem delay 10ms"
+          ],
+          "effective": "qdisc netem 8026: root refcnt 13 limit 1000 delay 10ms seed 17138398378111409833",
+          "host": "s1",
+          "interface": "s1-c12"
+        },
+        {
+          "configured_commands": [
+            "tc qdisc add dev s1-c13 root netem delay 20ms"
+          ],
+          "effective": "qdisc netem 8027: root refcnt 13 limit 1000 delay 20ms seed 18084765662621774365",
+          "host": "s1",
+          "interface": "s1-c13"
+        },
+        {
+          "configured_commands": [
+            "tc qdisc add dev s1-c14 root netem delay 30ms"
+          ],
+          "effective": "qdisc netem 8028: root refcnt 13 limit 1000 delay 30ms seed 4094547465903195786",
+          "host": "s1",
+          "interface": "s1-c14"
+        },
+        {
+          "configured_commands": [
+            "tc qdisc add dev s1-c15 root netem delay 40ms"
+          ],
+          "effective": "qdisc netem 8029: root refcnt 13 limit 1000 delay 40ms seed 17077685806241271253",
+          "host": "s1",
+          "interface": "s1-c15"
+        },
+        {
+          "configured_commands": [
+            "tc qdisc add dev s1-c16 root netem delay 10ms"
+          ],
+          "effective": "qdisc netem 802a: root refcnt 13 limit 1000 delay 10ms seed 176470532600751437",
+          "host": "s1",
+          "interface": "s1-c16"
+        },
+        {
+          "configured_commands": [
+            "tc qdisc add dev s1-c17 root netem delay 20ms"
+          ],
+          "effective": "qdisc netem 802b: root refcnt 13 limit 1000 delay 20ms seed 361059863118000333",
+          "host": "s1",
+          "interface": "s1-c17"
+        },
+        {
+          "configured_commands": [
+            "tc qdisc add dev s1-c18 root netem delay 30ms"
+          ],
+          "effective": "qdisc netem 802c: root refcnt 13 limit 1000 delay 30ms seed 13460126121104415458",
+          "host": "s1",
+          "interface": "s1-c18"
+        },
+        {
+          "configured_commands": [
+            "tc qdisc add dev s1-c19 root netem delay 40ms"
+          ],
+          "effective": "qdisc netem 802d: root refcnt 13 limit 1000 delay 40ms seed 11443686322794835700",
+          "host": "s1",
+          "interface": "s1-c19"
+        },
+        {
+          "configured_commands": [
+            "tc qdisc add dev s1-c2 root netem delay 30ms"
+          ],
+          "effective": "qdisc netem 801c: root refcnt 13 limit 1000 delay 30ms seed 1372477007714684971",
+          "host": "s1",
+          "interface": "s1-c2"
+        },
+        {
+          "configured_commands": [
+            "tc qdisc add dev s1-c3 root netem delay 40ms"
+          ],
+          "effective": "qdisc netem 801d: root refcnt 13 limit 1000 delay 40ms seed 12262400620261690516",
+          "host": "s1",
+          "interface": "s1-c3"
+        },
+        {
+          "configured_commands": [
+            "tc qdisc add dev s1-c4 root netem delay 10ms"
+          ],
+          "effective": "qdisc netem 801e: root refcnt 13 limit 1000 delay 10ms seed 3272254394466027296",
+          "host": "s1",
+          "interface": "s1-c4"
+        },
+        {
+          "configured_commands": [
+            "tc qdisc add dev s1-c5 root netem delay 20ms"
+          ],
+          "effective": "qdisc netem 801f: root refcnt 13 limit 1000 delay 20ms seed 11943280301752769990",
+          "host": "s1",
+          "interface": "s1-c5"
+        },
+        {
+          "configured_commands": [
+            "tc qdisc add dev s1-c6 root netem delay 30ms"
+          ],
+          "effective": "qdisc netem 8020: root refcnt 13 limit 1000 delay 30ms seed 17208494075848407258",
+          "host": "s1",
+          "interface": "s1-c6"
+        },
+        {
+          "configured_commands": [
+            "tc qdisc add dev s1-c7 root netem delay 40ms"
+          ],
+          "effective": "qdisc netem 8021: root refcnt 13 limit 1000 delay 40ms seed 2225784830183993013",
+          "host": "s1",
+          "interface": "s1-c7"
+        },
+        {
+          "configured_commands": [
+            "tc qdisc add dev s1-c8 root netem delay 10ms"
+          ],
+          "effective": "qdisc netem 8022: root refcnt 13 limit 1000 delay 10ms seed 8185737789583280710",
+          "host": "s1",
+          "interface": "s1-c8"
+        },
+        {
+          "configured_commands": [
+            "tc qdisc add dev s1-c9 root netem delay 20ms"
+          ],
+          "effective": "qdisc netem 8023: root refcnt 13 limit 1000 delay 20ms seed 8317830070401680269",
+          "host": "s1",
+          "interface": "s1-c9"
+        },
+        {
+          "configured_commands": [
+            "tc qdisc add dev s1-gw root handle 1: netem delay 5ms",
+            "tc qdisc add dev s1-gw parent 1:1 handle 10: tbf rate 10000000bit burst 3000 limit 94336"
+          ],
+          "effective": "qdisc netem 1: root refcnt 13 limit 1000 delay 5ms seed 15771334862299536596\r\nqdisc tbf 10: parent 1:1 rate 10Mbit burst 3000b/1 mpu 0b lat 73.1ms linklayer ethernet",
           "host": "s1",
           "interface": "s1-gw"
         }

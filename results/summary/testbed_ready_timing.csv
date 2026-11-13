@@ -1,2 +1,3 @@
 run,readies,send_residual_p50_ms,send_residual_p99_ms,send_residual_max_ms,arrival_residual_p50_ms,arrival_residual_p99_ms
 ready-lossless-L2-N20,500,5.484,8.998,9.919,5.841,9.553
+ready-timing-L2-N20,500,2.518,6.641,8.263,2.966,7.295
