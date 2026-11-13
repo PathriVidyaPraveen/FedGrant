@@ -125,6 +125,11 @@ def run_identity(experiment_id: str | None, policy: str | None, gateway_factory:
     B1/B2/B3 run their own gateway/client processes, so --gateway-factory
     does not apply to them.
     """
+    if experiment_id == "M2":
+        # M2 is end-to-end FL over Mininet; this runner launches network-only
+        # clients (bank profiles, no training), so it must never emit M2 results.
+        raise ValueError("experiment M2 needs the FL server/client workflow on Mininet, which is not "
+                         "integrated; this runner only produces network-only runs (M1, smoke)")
     if policy in BASELINE_MODES:
         return str(experiment_id or STUB_EXPERIMENT_ID), str(policy)
     is_stub = gateway_factory == DEFAULT_STUB_FACTORY

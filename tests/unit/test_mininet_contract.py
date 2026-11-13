@@ -311,3 +311,29 @@ def test_client_prefetch_serves_cached_update_once():
     assert calls == [1]                        # served from the cache at ROUND_START
     updates(2)
     assert calls == [1, 2]                     # not prefetched: built on demand
+
+
+def test_runner_refuses_m2_until_fl_workflow_exists():
+    for policy, factory in (("B3", PROD), ("FG-GRU", PROD), ("STUB-FIRST-ELIGIBLE", rm.DEFAULT_STUB_FACTORY)):
+        with pytest.raises(ValueError, match="M2"):
+            rm.run_identity("M2", policy, factory)
+    assert rm.run_identity("M1", "B3", PROD) == ("M1", "B3")
+
+
+def test_network_only_client_disables_error_feedback(monkeypatch):
+    """READY energies must stay the bank profile every round (M1/M-sim pairing, D-19)."""
+    created = []
+    real = client_proc.ClientCore
+
+    def spy(*args, **kwargs):
+        created.append(kwargs)
+        raise RuntimeError("stop after construction")
+
+    monkeypatch.setattr(client_proc, "ClientCore", spy)
+    args = argparse.Namespace(client_id=0, seed=0, clients=None, value_bank=None, rounds=1, port=9000,
+                              log_file="/tmp/unused.json", round_timeout_s=1.0)
+    import asyncio
+    with pytest.raises(RuntimeError, match="stop after construction"):
+        asyncio.run(client_proc.run(args))
+    assert created == [{"error_feedback": False}]
+    assert real is not None
