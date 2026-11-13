@@ -27,13 +27,14 @@ from fedgrant.sim.value_bank import load_value_bank
 
 
 @pytest.mark.parametrize(("master_seed", "round_id", "n"), [(0, 1, 20), (2, 37, 20), (5, 3, 4)])
-def test_readiness_draws_equal_the_simulators(master_seed, round_id, n) -> None:
+def test_ready_arrival_includes_both_control_path_legs_and_keeps_seeded_draws(master_seed, round_id, n) -> None:
     D = compute_deadline_ns(0.10, n)
     events: list[dict] = []
     run_network_round(round_id=round_id, num_clients=n, beta=0.10, scenario="L1",
                       seed=network_round_seed(master_seed, round_id), event_hook=events.append)
     ready = {e["client_id"]: e["t_ns"] for e in events if e["event"] == "ready_received"}
-    sim_rho = [ready[cid] - access_delay_ns(cid) - 5_000_000 for cid in range(n)]
+    # ROUND_START reaches the client after δ+5 ms; READY returns after ρ plus δ+5 ms.
+    sim_rho = [ready[cid] - 2 * (access_delay_ns(cid) + 5_000_000) for cid in range(n)]
     assert readiness_delays_ns(master_seed, round_id, n, D) == sim_rho
     assert all(0 <= rho <= int(0.1 * D) for rho in sim_rho)
     assert readiness_delays_us(master_seed, round_id, n, D) == {cid: r // 1000 for cid, r in enumerate(sim_rho)}
