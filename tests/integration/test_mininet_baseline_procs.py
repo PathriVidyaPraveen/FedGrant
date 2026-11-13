@@ -149,6 +149,9 @@ def test_baseline_processes_complete_rounds_over_real_sockets(policy, tmp_path) 
             # ROUND_END told the client exactly what the gateway accepted.
             assert client_rounds[r]["delivered"] == record["delivered"][str(cid)]
             assert client_rounds[r]["status"] == "round_end"
+            # Every baseline logs per-block energies (by block index) for the eta join (D-09).
+            energies = client_rounds[r]["block_energies"]
+            assert len(energies) == K and all(isinstance(x, float) and x >= 0 for x in energies)
             if policy in {"B2", "B3"}:
                 sent_blocks = {int(p["block_idx"]) for p in sent if int(p["round_id"]) == r}
                 assert set(record["delivered"][str(cid)]) <= sent_blocks
