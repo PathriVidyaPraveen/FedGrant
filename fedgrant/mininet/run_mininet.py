@@ -349,10 +349,15 @@ def run_experiment(*, n: int, scenario: str, seed: int, rounds: int, beta: float
     if not stub_run and policy not in GRANT_POLICIES and policy not in BASELINE_MODES:
         raise ValueError(f"policy {policy!r} has no Mininet implementation; "
                          f"expected one of {sorted(GRANT_POLICIES | set(BASELINE_MODES))}")
-    if experiment_id in MININET_EXPERIMENTS:
-        # Spec Section 5.2/12: real runs use the FULL value bank and always
-        # record gateway CPU/RSS (sampling is otherwise opt-in).
+    if not stub_run:
+        # Production policies always use the FULL value bank (spec Section 5.2):
+        # the gateway takes its client weights from it and clients their
+        # profiles. Without this the grant clients fell back to synthetic
+        # profiles and uniform weights while the B1-B3 processes silently used
+        # the bank, and meta.json mislabelled both.
         value_bank = value_bank or DEFAULT_VALUE_BANK
+    if experiment_id in MININET_EXPERIMENTS:
+        # Real runs always record gateway CPU/RSS (sampling is otherwise opt-in).
         profile_gateway = True
     if value_bank is not None and not Path(value_bank).is_file():
         raise FileNotFoundError(f"value bank not found: {value_bank} (get it from the FULL seed-0 run)")

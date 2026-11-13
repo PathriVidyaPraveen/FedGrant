@@ -337,3 +337,13 @@ def test_network_only_client_disables_error_feedback(monkeypatch):
         asyncio.run(client_proc.run(args))
     assert created == [{"error_feedback": False}]
     assert real is not None
+
+
+def test_production_runs_default_to_the_value_bank(tmp_path, monkeypatch):
+    """Non-stub smoke runs must not fall back to synthetic profiles / uniform weights."""
+    monkeypatch.chdir(tmp_path)  # no data/bank here: the runner must refuse rather than go synthetic
+    for policy, factory in (("B6", PROD), ("B2", rm.DEFAULT_STUB_FACTORY)):
+        with pytest.raises(FileNotFoundError, match="value bank"):
+            rm.run_experiment(n=20, scenario="L2", seed=0, rounds=1, beta=0.1, trace_dir=tmp_path,
+                              output_dir=tmp_path / f"run-{policy}", experiment_id=f"smoke-{policy}",
+                              policy=policy, gateway_factory=factory)
