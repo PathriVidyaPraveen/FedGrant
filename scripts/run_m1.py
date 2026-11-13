@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import signal
 import subprocess
 import sys
 import time
@@ -59,11 +60,28 @@ def command(grid_path: Path, scenario: str, policy: str, seed: int, out: Path) -
 
 def run_one(cmd: list[str], out: Path, log) -> bool:
     started = time.monotonic()
-    result = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
-    ok = result.returncode == 0 and (out / "meta.json").is_file()
-    log.write(json.dumps({"output": str(out), "returncode": result.returncode, "ok": ok,
+    proc = subprocess.Popen(cmd, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        _, stderr = proc.communicate()
+    except KeyboardInterrupt:
+        # Never SIGKILL run_mininet (subprocess.run would): it must tear down
+        # the Mininet network, the replay agents and the gateway/client
+        # processes. Forward the interrupt and wait for its cleanup.
+        print("\ninterrupted: waiting for run_mininet to tear down the network ...", flush=True)
+        if proc.poll() is None:
+            proc.send_signal(signal.SIGINT)
+        try:
+            proc.communicate(timeout=120)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+            print("run_mininet did not exit; run `sudo mn -c` and "
+                  "`sudo pkill -f fedgrant.mininet` before the next run", flush=True)
+        raise
+    ok = proc.returncode == 0 and (out / "meta.json").is_file()
+    log.write(json.dumps({"output": str(out), "returncode": proc.returncode, "ok": ok,
                           "seconds": round(time.monotonic() - started, 1),
-                          "stderr_tail": result.stderr[-2000:]}) + "\n")
+                          "stderr_tail": (stderr or "")[-2000:]}) + "\n")
     log.flush()
     return ok
 

@@ -657,7 +657,14 @@ def resolve_cli(argv: list[str] | None = None) -> dict:
     return settings
 
 
+def _terminate_as_interrupt(signum, frame) -> None:
+    # SIGTERM (e.g. from a job runner) gets the same cleanup path as Ctrl+C.
+    raise KeyboardInterrupt(f"signal {signum}")
+
+
 def main(argv: list[str] | None = None) -> None:
+    import signal
+    signal.signal(signal.SIGTERM, _terminate_as_interrupt)
     s = resolve_cli(argv)
     if hasattr(os, "geteuid") and os.geteuid() != 0:
         # Check before creating the run directory, so a forgotten sudo leaves nothing behind.
