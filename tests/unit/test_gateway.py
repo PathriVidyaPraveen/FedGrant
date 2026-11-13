@@ -1053,3 +1053,282 @@ def test_grant_timed_out_before_deadline_is_not_resolved_again_at_deadline() -> 
     assert [r for r in gateway.estimator.resolutions if r[1] is grant_1] == [timed_out[0]]
     assert timed_out[0][3] == 211  # resolved at its timeout, not at D
     assert state.outstanding == {}
+
+
+# -- bounded probe grants (rule (v) amendment), GatewayCore side ----------------------
+
+from fedgrant.policy.constants import THETA  # noqa: E402
+
+LOW_P, HIGH_P = 0.01, 0.5
+ENERGIES = [4.0, 2.0, 0.0]
+
+
+@dataclass(slots=True)
+class ProbeCandidateView(CandidateView):
+    """CandidateView plus the optional probe mask the eligibility provider will supply."""
+
+    probe: np.ndarray | None = None
+
+
+@dataclass
+class PerClientPrediction:
+    p: dict[int, float] = field(default_factory=dict)
+
+    def probability(self, client_id, now_ns):
+        return self.p[client_id]
+
+
+@dataclass
+class ProbeEligibility:
+    """Rules (i)-(iii) plus the probe amendment: a client below THETA is offered,
+    marked as a probe, only while core.probe_available(); honor=False models a
+    provider that ignores the allowance; stale marks clients regardless of p_hat;
+    ignore_pending offers clients with no pending position."""
+
+    prediction: PerClientPrediction
+    core: GatewayCore | None = None
+    honor: bool = True
+    stale: set[int] = field(default_factory=set)
+    ignore_pending: bool = False
+
+    def candidates(self, clients, now_ns, deadline_ns, retransmit):
+        ids, values, undelivered, probe = [], [], [], []
+        for cid, state in sorted(clients.items()):
+            if not state.ready or len(state.outstanding) >= state.cap:
+                continue
+            pending = state.has_pending(retransmit)
+            if not pending and not self.ignore_pending:
+                continue
+            low = self.prediction.p[cid] < THETA
+            if low and self.honor and not self.core.probe_available(cid):
+                continue
+            ids.append(cid)
+            values.append(float(state.val[state.next_pos(retransmit) - 1]) if pending else 0.0)
+            undelivered.append(state.K - state.m - len(state.outstanding))
+            probe.append(low or cid in self.stale)
+        return ProbeCandidateView(np.asarray(ids, np.int32), np.asarray(values, np.float64),
+                                  np.asarray(undelivered, np.int32), 0, probe=np.asarray(probe, dtype=bool))
+
+
+@dataclass
+class RecordingInflight:
+    added: list = field(default_factory=list)
+
+    def add(self, grant_id, p):
+        self.added.append((grant_id, p))
+
+    def __contains__(self, grant_id):
+        return any(g == grant_id for g, _ in self.added)
+
+
+@dataclass
+class RecordingPacing(FakePacing):
+    seen: list = field(default_factory=list)
+
+    def allow(self, client_id, p_hat, now_ns, deadline_ns):
+        self.seen.append((client_id, p_hat))
+        return self.allowed
+
+
+def probe_gateway(p_by_client: dict[int, float], **eligibility_options):
+    prediction = PerClientPrediction(dict(p_by_client))
+    eligibility = ProbeEligibility(prediction, **eligibility_options)
+    decisions: list[dict] = []
+    view = type("View", (), {})()
+    view.inflight = RecordingInflight()
+    gateway = GatewayCore(
+        {cid: ClientState(cid, 0.5, K=3) for cid in p_by_client},
+        selector=FakeSelector(), eligibility=eligibility, pacing=RecordingPacing(), prediction=prediction,
+        timeout=FakeTimeout(), estimator=FakeEstimator(), aggregate=FakeAggregate(), view=view,
+        decision_hook=decisions.append,
+    )
+    eligibility.core = gateway
+    gateway.on_round_start(100, round_id=7, deadline_ns=1000, K=3, L=2)
+    return gateway, prediction, eligibility, decisions
+
+
+def issued(decisions):
+    return [d for d in decisions if d["outcome"] == "grant_issued"]
+
+
+def test_t1_one_probe_per_round_second_is_blocked() -> None:
+    gateway, _, _, decisions = probe_gateway({1: LOW_P})
+    assert gateway.probe_available(1)
+
+    assert gateway.on_ready(1, ENERGIES, 200) == [SendGrant(1, 1, 1)]
+    # Positions 2 and 3 are still pending, but the allowance is used.
+    assert gateway.on_tick(201) == []
+    assert gateway.on_tick(202) == []
+
+    assert [(d["grant_id"], d["probe"]) for d in issued(decisions)] == [(1, 1)]
+    assert not gateway.probe_available(1) and gateway.is_probe_grant(1, 1)
+    assert gateway.round_probe_grants == 1 and gateway.stats.probe_grants == 1
+
+
+def test_t2_allowance_resets_at_the_next_valid_round_start() -> None:
+    gateway, _, _, decisions = probe_gateway({1: LOW_P})
+    gateway.on_ready(1, ENERGIES, 200)
+    gateway.on_deadline(1000)
+
+    gateway.on_round_start(1100, round_id=8, deadline_ns=2000, K=3, L=2)
+    assert gateway.probe_available(1) and gateway.round_probe_grants == 0
+    assert not gateway.is_probe_grant(1, 1)  # grant ids restart each round
+    assert gateway.on_ready(1, ENERGIES, 1200) == [SendGrant(1, 1, 1)]
+    assert issued(decisions)[-1]["round_id"] == 8 and issued(decisions)[-1]["probe"] == 1
+    assert gateway.round_probe_grants == 1 and gateway.stats.probe_grants == 2
+
+
+def test_invalid_round_start_keeps_the_previous_rounds_probe_state() -> None:
+    gateway, _, _, _ = probe_gateway({1: LOW_P})
+    gateway.on_ready(1, ENERGIES, 200)
+    gateway.on_deadline(1000)
+    with pytest.raises(GatewayError):
+        gateway.on_round_start(1100, round_id=7, deadline_ns=2000, K=3, L=2)  # round id not increasing
+    with pytest.raises(GatewayError):
+        gateway.on_round_start(900, round_id=8, deadline_ns=2000, K=3, L=2)  # before the completed deadline
+    assert gateway.is_probe_grant(1, 1) and not gateway.probe_available(1)
+    assert gateway.round_probe_grants == 1
+
+
+def test_t3_pacing_blocked_probe_keeps_its_allowance() -> None:
+    gateway, _, _, decisions = probe_gateway({1: LOW_P})
+    gateway.pacing.allowed = False
+
+    assert gateway.on_ready(1, ENERGIES, 200) == []
+    (blocked,) = decisions
+    assert blocked["outcome"] == "pacing_blocked" and blocked["probe"] == 1  # would-be classification
+    assert gateway.probe_available(1) and gateway.round_probe_grants == 0 and gateway.stats.probe_grants == 0
+    assert gateway.clients[1].outstanding == {}
+
+    gateway.pacing.allowed = True
+    assert gateway.on_tick(201) == [SendGrant(1, 1, 1)]
+    assert issued(decisions)[0]["probe"] == 1 and not gateway.probe_available(1)
+
+
+def test_t4_no_valid_send_position_does_not_consume_allowance() -> None:
+    gateway, prediction, _, decisions = probe_gateway({1: HIGH_P}, ignore_pending=True)
+    # Normal grants take every position; the provider still offers the client.
+    assert gateway.on_ready(1, ENERGIES, 200) == [SendGrant(1, 1, 1), SendGrant(1, 2, 2), SendGrant(1, 3, 3)]
+    prediction.p[1] = LOW_P
+    assert gateway.on_tick(201) == []  # offered as a probe, but next_pos > K: nothing issued
+    assert gateway.probe_available(1) and gateway.round_probe_grants == 0
+    assert all(d["probe"] == 0 for d in decisions) and len(issued(decisions)) == 3
+
+
+def test_t5_grants_after_p_hat_rises_are_normal_and_unrestricted() -> None:
+    gateway, prediction, _, decisions = probe_gateway({1: LOW_P})
+    assert gateway.on_ready(1, ENERGIES, 200) == [SendGrant(1, 1, 1)]
+    prediction.p[1] = HIGH_P  # e.g. the probe was delivered and the predictor recovered
+
+    actions = gateway.on_data(1, 1, 1, 0, [1.0, 0.0], 205)
+
+    assert actions == [SendGrant(1, 2, 2), SendGrant(1, 3, 3)]  # two normal grants despite the used allowance
+    assert [(d["grant_id"], d["probe"]) for d in issued(decisions)] == [(1, 1), (2, 0), (3, 0)]
+    assert gateway.is_probe_grant(1, 1) and not gateway.is_probe_grant(1, 2)
+    assert gateway.round_probe_grants == 1 and gateway.stats.probe_grants == 1
+
+
+def test_t6_pacing_and_phi_use_the_real_low_p_hat() -> None:
+    gateway, _, _, decisions = probe_gateway({1: LOW_P})
+    gateway.on_ready(1, ENERGIES, 200)
+    assert gateway.pacing.seen == [(1, LOW_P)]
+    assert gateway.clients[1].outstanding[1].p_issue == LOW_P
+    assert gateway.view.inflight.added == [(1, LOW_P)]
+    assert issued(decisions)[0]["p_hat"] == LOW_P
+
+
+def test_t7_missing_probe_mask_means_every_grant_is_normal() -> None:
+    gateway, _ = make_gateway()  # FakeEligibility returns a plain CandidateView (no probe field)
+    decisions: list[dict] = []
+    gateway.decision_hook = decisions.append
+    gateway.prediction.p = LOW_P
+    assert ready(gateway) == [SendGrant(1, 1, 1)]
+    assert gateway.on_data(1, 1, 1, 0, [1.0, 0.0], 205) == [SendGrant(1, 2, 2)]  # no allowance gating
+    assert [d["probe"] for d in decisions] == [0, 0]
+    assert gateway.round_probe_grants == 0 and gateway.stats.probe_grants == 0 and gateway.probe_available(1)
+
+
+def test_t8_probe_offered_after_allowance_used_raises_without_mutation() -> None:
+    gateway, _, eligibility, decisions = probe_gateway({1: LOW_P})
+    gateway.on_ready(1, ENERGIES, 200)
+    eligibility.honor = False  # a provider that ignores probe_available()
+    state = gateway.clients[1]
+    before = (dict(state.outstanding), state.status.copy().tolist(), gateway.next_grant_id,
+              list(gateway.view.inflight.added), len(decisions), gateway.stats.probe_grants,
+              gateway.round_probe_grants, len(gateway.pacing.seen))
+
+    with pytest.raises(GatewayError, match="probe allowance"):
+        gateway.on_tick(201)
+
+    after = (dict(state.outstanding), state.status.copy().tolist(), gateway.next_grant_id,
+             list(gateway.view.inflight.added), len(decisions), gateway.stats.probe_grants,
+             gateway.round_probe_grants, len(gateway.pacing.seen))
+    assert after == before  # raised before pacing, the decision record or any grant state
+
+
+def test_t9_probe_state_survives_deadline_and_drain_including_late_data() -> None:
+    gateway, _, _, _ = probe_gateway({1: LOW_P})
+    gateway.on_ready(1, ENERGIES, 200)
+    gateway.on_deadline(1000)
+    assert gateway.phase is GatewayPhase.DEADLINE
+    assert gateway.is_probe_grant(1, 1) and gateway.round_probe_grants == 1
+
+    gateway.on_data(1, 1, 1, 0, [1.0, 0.0], 1050)  # the probe's DATA arrives during the drain
+
+    assert gateway.stats.late_after_deadline == 1
+    assert gateway.is_probe_grant(1, 1) and gateway.round_probe_grants == 1 and gateway.stats.probe_grants == 1
+    assert not gateway.probe_available(1)
+
+
+def test_t10_cumulative_and_per_round_probe_counts() -> None:
+    gateway, prediction, _, _ = probe_gateway({1: LOW_P, 2: LOW_P})
+    per_round = []
+    # Round 7: only client 1 is ready -> 1 probe.
+    gateway.on_ready(1, ENERGIES, 200)
+    per_round.append(gateway.round_probe_grants)
+    gateway.on_deadline(1000)
+    # Round 8: both predictions high -> 0 probes.
+    prediction.p.update({1: HIGH_P, 2: HIGH_P})
+    gateway.on_round_start(1100, round_id=8, deadline_ns=2000, K=3, L=2)
+    gateway.on_ready(1, ENERGIES, 1200)
+    gateway.on_ready(2, ENERGIES, 1200)
+    per_round.append(gateway.round_probe_grants)
+    gateway.on_deadline(2000)
+    # Round 9: both low -> 2 probes.
+    prediction.p.update({1: LOW_P, 2: LOW_P})
+    gateway.on_round_start(2100, round_id=9, deadline_ns=3000, K=3, L=2)
+    gateway.on_ready(1, ENERGIES, 2200)
+    gateway.on_ready(2, ENERGIES, 2200)
+    per_round.append(gateway.round_probe_grants)
+
+    assert per_round == [1, 0, 2]
+    assert gateway.stats.probe_grants == sum(per_round) == 3
+
+
+def test_t11_clients_have_independent_allowances() -> None:
+    gateway, _, _, decisions = probe_gateway({1: LOW_P, 2: LOW_P})
+    gateway.on_ready(1, ENERGIES, 200)
+    assert gateway.on_ready(2, ENERGIES, 200) == [SendGrant(2, 2, 1)]  # client 1's used allowance is not client 2's
+    assert [(d["client_id"], d["probe"]) for d in issued(decisions)] == [(1, 1), (2, 1)]
+    assert gateway.is_probe_grant(1, 1) and gateway.is_probe_grant(2, 2) and not gateway.is_probe_grant(1, 2)
+    assert not gateway.probe_available(1) and not gateway.probe_available(2)
+    assert gateway.round_probe_grants == 2
+
+
+def test_t12_stale_mask_with_high_issue_time_p_hat_is_a_normal_grant() -> None:
+    gateway, _, _, decisions = probe_gateway({1: HIGH_P}, stale={1})  # provider marks 1 although p_hat >= THETA
+    assert gateway.on_ready(1, ENERGIES, 200) == [SendGrant(1, 1, 1), SendGrant(1, 2, 2), SendGrant(1, 3, 3)]
+    assert [d["probe"] for d in issued(decisions)] == [0, 0, 0]
+    assert gateway.probe_available(1) and gateway.round_probe_grants == 0 and gateway.stats.probe_grants == 0
+
+
+def test_probe_mask_must_align_with_candidates() -> None:
+    gateway, _, eligibility, _ = probe_gateway({1: LOW_P})
+
+    def misaligned(clients, now_ns, deadline_ns, retransmit):
+        return ProbeCandidateView(np.asarray([1], np.int32), np.asarray([1.0]), np.asarray([3], np.int32), 0,
+                                  probe=np.asarray([True, False]))
+
+    eligibility.candidates = misaligned
+    with pytest.raises(GatewayError, match="aligned"):
+        gateway.on_ready(1, ENERGIES, 200)

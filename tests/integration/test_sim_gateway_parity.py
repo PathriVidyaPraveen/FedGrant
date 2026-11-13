@@ -59,7 +59,7 @@ _INPUT_FIELDS = {
 _DECISION_FIELDS = {
     "event", "round_id", "t_ns", "abs_t_ns", "client_id", "candidate_client_ids",
     "candidate_next_values", "candidate_undelivered", "rr_pointer", "p_hat",
-    "pacing_allowed", "outcome",
+    "pacing_allowed", "outcome", "probe",
 }
 _GRANT_FIELDS = ("grant_id", "send_pos", "timeout_ns")
 # GatewaySim._decision_hook keeps the simulator's public decision schema on top
@@ -345,6 +345,8 @@ def test_simulator_replay_is_deterministic_and_reports_only_gateway_observables(
             assert event["outcome"] in {"grant_issued", "pacing_blocked"}
             issued = event["outcome"] == "grant_issued"
             assert all((event[k] is not None) == issued for k in _GRANT_FIELDS), event
+            # Simulator probe wiring (run_net eligibility mask) has not landed yet.
+            assert event["probe"] == 0, event
         else:
             expected = _INPUT_FIELDS[kind]
         assert set(event) == expected, (kind, sorted(set(event) ^ expected))

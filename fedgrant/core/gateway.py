@@ -20,7 +20,7 @@ import numpy as np
 from fedgrant.common.constants import DATA_GRANT_ID, L as L_DEFAULT, MessageType, TransferMode
 from fedgrant.common.wire import WireProtocolError, decode_message
 from fedgrant.encoder.ef import bitmap_from_indices
-from fedgrant.policy.constants import K as K_DEFAULT, S
+from fedgrant.policy.constants import K as K_DEFAULT, S, THETA
 from fedgrant.policy.features import build_pred_input
 from fedgrant.policy.types import CandidateView, Selector
 from fedgrant.predictors.base import Predictor, RoundCtx
@@ -210,6 +210,9 @@ class GatewayStats:
     # invalid_events; distinct from late_after_deadline, which is current-round
     # DATA arriving after D. Cumulative, like every other counter here.
     stale_round_data: int = 0
+    # Bounded probe grants (rule (v) amendment): grants issued to a client whose
+    # issue-time p_hat was below THETA. Cumulative; per round: round_probe_grants.
+    probe_grants: int = 0
 
 
 class GatewayCore:
@@ -277,6 +280,24 @@ class GatewayCore:
         self.stats = GatewayStats()
         self._p_hat: dict[int, float] = {}
         self._last_refresh_bucket = 0
+        # Bounded probe (rule (v) amendment): at most one probe grant per client
+        # per round. Reset only by a valid ROUND_START; kept through the deadline
+        # and drain so loggers can still classify the round's grants.
+        self._probe_used: set[int] = set()
+        self._probe_grants: dict[int, set[int]] = {}
+
+    def probe_available(self, client_id: int) -> bool:
+        """True while the client has not been issued a probe grant this round."""
+        return client_id not in self._probe_used
+
+    def is_probe_grant(self, client_id: int, grant_id: int) -> bool:
+        """Whether ``grant_id`` of the current (or just-finished) round was a probe."""
+        return grant_id in self._probe_grants.get(client_id, ())
+
+    @property
+    def round_probe_grants(self) -> int:
+        """Probe grants issued in the current (or just-finished) round."""
+        return sum(len(grants) for grants in self._probe_grants.values())
 
     def register_client(self, client_id: int, state: ClientState) -> None:
         """Attach one connected client state before or between rounds."""
@@ -359,6 +380,8 @@ class GatewayCore:
         self.delivered_blocks = {client_id: set() for client_id in self.clients}
         self.resolved_grants = {client_id: {} for client_id in self.clients}
         self.timed_out_grants = {client_id: set() for client_id in self.clients}
+        self._probe_used = set()
+        self._probe_grants = {client_id: set() for client_id in self.clients}
         self.round_min_value = None
         self._last_refresh_bucket = 0
         self._reset_view_arrivals()
@@ -772,6 +795,12 @@ class GatewayCore:
                 p_hat = self._predict_probability(client_id, t_ns)
             if not np.isfinite(p_hat) or not 0.0 <= p_hat <= 1.0:
                 raise GatewayError("prediction probability must be finite and in [0, 1]")
+            # Bounded probe: the eligibility provider marks candidates that fail
+            # only rule (v). A grant is a probe only if its issue-time p_hat (the
+            # value pacing uses below) is still under THETA; otherwise it is normal.
+            probe = self._probe_marked(candidates, client_id) and p_hat < THETA
+            if probe and not self.probe_available(client_id):
+                raise GatewayError("eligibility offered a probe to a client whose probe allowance is used")
             pacing_allowed = self.pacing.allow(client_id, p_hat, t_ns, self.round.deadline_ns)
             if not pacing_allowed:
                 if self.decision_hook is not None:
@@ -787,6 +816,7 @@ class GatewayCore:
                         "p_hat": p_hat,
                         "pacing_allowed": False,
                         "outcome": "pacing_blocked",
+                        "probe": int(probe),  # would-be classification; nothing consumed
                     })
                 break
             state = self.clients[client_id]
@@ -823,6 +853,7 @@ class GatewayCore:
                     "grant_id": grant_id,
                     "send_pos": send_pos,
                     "timeout_ns": timeout_ns,
+                    "probe": int(probe),
                 })
             self.next_grant_id += 1
             state.take_position(send_pos, self.retransmit)
@@ -832,12 +863,29 @@ class GatewayCore:
                 inflight = getattr(self.view, "inflight", None)
                 if inflight is not None and hasattr(inflight, "add"):
                     inflight.add(grant_id, issue_probability)
+            if probe:
+                # The outstanding grant and its Phi entry exist: the allowance is used.
+                self._probe_used.add(client_id)
+                self._probe_grants.setdefault(client_id, set()).add(grant_id)
+                self.stats.probe_grants += 1
             if self.estimator is not None:
                 on_issue = getattr(self.estimator, "grant_issued", None)
                 if on_issue is not None:
                     on_issue(client_id, grant, t_ns)
             actions.append(SendGrant(client_id, grant_id, send_pos))
         return actions
+
+    @staticmethod
+    def _probe_marked(candidates: CandidateView, client_id: int) -> bool:
+        """The provider's probe flag for ``client_id`` (False when no mask is supplied)."""
+        mask = getattr(candidates, "probe", None)
+        if mask is None:
+            return False
+        flags = np.asarray(mask)
+        ids = np.asarray(candidates.client_id)
+        if flags.dtype != np.bool_ or flags.shape != ids.shape:
+            raise GatewayError("CandidateView.probe must be a bool mask aligned with client_id")
+        return bool(flags[np.flatnonzero(ids == client_id)[0]])
 
     def _remove_inflight_if_unowned(self, grant_id: int) -> None:
         """Keep an injected feature view consistent when no estimator owns Phi."""
