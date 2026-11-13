@@ -1,0 +1,3 @@
+run,layout,scenario,clients,rounds,ready_sent,ready_lost,rounds_all_registered,eta_rounds,data_sent,data_received,data_uplink_loss_pct,ge_target_loss_pct,invalid_events
+scale-L2-N20,section7,L2,20,25,500,66,3,3,2035,2021,0.69,5.0,0
+ready-lossless-L2-N20,ready_lossless,L2,20,25,500,0,25,25,2189,2086,4.71,5.0,0
