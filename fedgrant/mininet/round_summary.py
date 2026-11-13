@@ -87,4 +87,29 @@ def enrich_round_metrics(run_dir: str | Path, *, cross_mbps: float, capacity_bps
     _write(root / "round_metrics.csv", ROUND_METRIC_COLUMNS, rounds)
 
 
-__all__ = ["enrich_round_metrics"]
+def fill_baseline_eta(run_dir: str | Path, num_clients: int) -> int:
+    """Fill blank per-round eta for B1/B2 runs from the post-run join (design decision D-09).
+
+    B1/B2 clients send no READY, so the gateway cannot compute Eq. (7) live;
+    ``baseline_metrics.eta_from_run_dir`` joins the gateway's delivered sets
+    with each client's block energies. Rounds where any client's energies are
+    missing stay blank. Returns the number of rounds filled.
+    """
+    from fedgrant.mininet.baseline_metrics import eta_from_run_dir
+
+    root = Path(run_dir)
+    rounds = _read(root / "round_metrics.csv")
+    if not rounds:
+        return 0
+    eta = eta_from_run_dir(root, num_clients)
+    filled = 0
+    for row in rounds:
+        value = eta.get(int(row["round_id"]))
+        if value is not None and not str(row.get("eta", "")).strip():
+            row["eta"] = repr(float(value))
+            filled += 1
+    _write(root / "round_metrics.csv", ROUND_METRIC_COLUMNS, rounds)
+    return filled
+
+
+__all__ = ["enrich_round_metrics", "fill_baseline_eta"]

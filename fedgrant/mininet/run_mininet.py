@@ -26,7 +26,7 @@ from fedgrant.mininet.profile_update import profile_bank
 from fedgrant.mininet.teardown import teardown
 from fedgrant.mininet.telemetry import ProcessSampler, sample_qdisc
 from fedgrant.mininet.round_state import RoundStateFile
-from fedgrant.mininet.round_summary import enrich_round_metrics
+from fedgrant.mininet.round_summary import enrich_round_metrics, fill_baseline_eta
 from fedgrant.mininet.topo import SCENARIO_LOSS, build, client_parameters, verify_tc
 from fedgrant.mininet.telemetry import summarize_gateway_profile
 from fedgrant.sim.run_net import compute_deadline_ns
@@ -467,6 +467,7 @@ def run_experiment(*, n: int, scenario: str, seed: int, rounds: int, beta: float
             process_sampler.stop()
             process_sampler = None
         enrich_round_metrics(out, cross_mbps=cross_mbps)
+        baseline_eta_rounds = (fill_baseline_eta(out, n) if policy in {"B1", "B2"} else None)
         if stub_run:
             summary_path = out / "gateway_summary.json"
             summary = json.loads(summary_path.read_text(encoding="utf-8"))
@@ -502,6 +503,7 @@ def run_experiment(*, n: int, scenario: str, seed: int, rounds: int, beta: float
             "value_bank": ({"path": str(value_bank), "sha256": _sha256(Path(value_bank))}
                            if value_bank else None),
             "profile_source": "value_bank" if value_bank else "synthetic",
+            "baseline_eta_rounds_filled": baseline_eta_rounds,
             "models_dir": str(models_dir),
             "model_sha256": {name: _sha256(Path(models_dir) / name)
                              for name in POLICY_MODEL_FILES.get(policy, ())},

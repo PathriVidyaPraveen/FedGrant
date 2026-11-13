@@ -128,3 +128,28 @@ def test_round_summary_fills_split_from_capture(tmp_path):
 def test_cross_duration_covers_every_round():
     assert cross_duration_s(100, 398_000_000, 1.0) == int(np.ceil(0.4 + 100 * 1.498 + 3.0))
     assert cross_duration_s(1, 398_000_000, 1.0) >= 5
+
+
+def test_fill_baseline_eta_joins_client_energies_and_gateway_deliveries(tmp_path):
+    """B1/B2 send no READY: eta comes from the post-run join (design decision D-09)."""
+    import json
+    from fedgrant.mininet.round_summary import fill_baseline_eta
+
+    _write_csv(tmp_path / "round_metrics.csv", ROUND_METRIC_COLUMNS,
+               [{"round_id": r, "round_start_mono_ns": 1, "deadline_mono_ns": 2} for r in (1, 2)])
+    weights = {0: 0.25, 1: 0.75}
+    energies = {0: [4.0, 1.0], 1: [2.0, 2.0]}
+    with (tmp_path / "gateway_rounds.jsonl").open("w") as f:
+        f.write(json.dumps({"round_id": 1, "delivered": {"0": [0], "1": [1]}}) + "\n")
+        f.write(json.dumps({"round_id": 2, "delivered": {"0": [0, 1]}}) + "\n")
+    for cid in (0, 1):
+        (tmp_path / f"client_{cid}.json").write_text(json.dumps({"client_weight": weights[cid]}))
+        with (tmp_path / f"client_{cid}_rounds.jsonl").open("w") as f:
+            f.write(json.dumps({"round_id": 1, "block_energies": energies[cid]}) + "\n")
+            if cid == 0:  # client 1 has no round-2 energies -> round 2 stays blank
+                f.write(json.dumps({"round_id": 2, "block_energies": energies[cid]}) + "\n")
+    assert fill_baseline_eta(tmp_path, 2) == 1
+    rows = list(csv.DictReader((tmp_path / "round_metrics.csv").open()))
+    total = 0.25**2 * 5 + 0.75**2 * 4
+    assert float(rows[0]["eta"]) == pytest.approx((0.25**2 * 4 + 0.75**2 * 2) / total)
+    assert rows[1]["eta"] == ""

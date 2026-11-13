@@ -239,3 +239,25 @@ def test_m1_run_passes_bank_and_enables_profiling(tmp_path, fake_runtime):
     assert cmd[cmd.index("--value-bank") + 1] == str(bank)
     failure = json.loads((tmp_path / "run" / "run_failure.json").read_text())
     assert (failure["experiment_id"], failure["policy"]) == ("M1", "B6")
+
+
+def test_grant_round_protocol_sends_simulator_readiness_delays():
+    """B4/B6/FG-GRU ROUND_STARTs carry the same per-client rho as M-sim and B1-B3."""
+    from fedgrant.core.gateway import SendRoundStart
+    from fedgrant.mininet.round_loop import readiness_delays_us
+
+    class Tap:
+        def __init__(self):
+            self.sent = []
+
+        def dispatch_actions(self, actions):
+            self.sent += list(actions)
+
+    core, tap = create_gateway(3), Tap()
+    proto = gateway_proc.GrantRoundProtocol(core, tap, num_clients=3, K=K, L=L, seed=5)
+    window = proto.begin_round(2, 1_000_000_000, 398_000_000)
+    proto.send_round_start(window)
+    sent = {a.client_id: a.rho_us for a in tap.sent if isinstance(a, SendRoundStart)}
+    expected = readiness_delays_us(5, 2, 3, 398_000_000)
+    assert sent == expected
+    assert all(0 <= rho <= 39_800 for rho in sent.values()) and len(set(sent.values())) > 1
