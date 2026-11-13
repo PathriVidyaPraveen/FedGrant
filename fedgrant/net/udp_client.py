@@ -149,6 +149,10 @@ class UdpClient(asyncio.DatagramProtocol):
         return self.core.last_completed_round_id
 
     def _handle_round_start(self, message) -> None:
+        # rho_i is measured from ROUND_START receipt (design decision D-20):
+        # take the timer origin before the update is prepared and encoded.
+        loop = asyncio.get_running_loop()
+        received_at = loop.time()
         if self.core.round is not None:
             raise ClientCoreError("ROUND_START arrived while a round is active")
         if (
@@ -173,12 +177,15 @@ class UdpClient(asyncio.DatagramProtocol):
         round_id = message.round_id
         self._ready_round_id = None
         delay_seconds = body["rho_us"] / 1_000_000.0
-        self._ready_handle = asyncio.get_running_loop().call_later(
-            delay_seconds, self._send_ready, round_id, energies
+        # Preparation above is synchronous, so READY can never precede it. If it
+        # overran received_at + rho, call_at with a past time sends READY on the
+        # next loop iteration, i.e. as soon as preparation has completed.
+        self._ready_handle = loop.call_at(
+            received_at + delay_seconds, self._send_ready, round_id, energies
         )
         timeout_ns = body["deadline_ns"] + ROUND_END_GRACE_NS
         timeout_seconds = max(0, timeout_ns - self.clock_ns()) / _NANOSECONDS_PER_SECOND
-        self._round_end_handle = asyncio.get_running_loop().call_later(
+        self._round_end_handle = loop.call_later(
             timeout_seconds, self._finish_round_timeout, round_id
         )
 
