@@ -23,8 +23,10 @@ def test_tc_applier_runs_validated_command_and_raises_on_failure():
         return subprocess.CompletedProcess(command, 0, "", "")
 
     tc_applier("c3-eth0", run=ok)(2_000_000)
-    assert calls == [["tc", "qdisc", "change", "dev", "c3-eth0", "parent", "1:1", "handle", "10:", "tbf",
+    assert calls == [["tc", "qdisc", "change", "dev", "c3-eth0", "parent", "2:1", "handle", "10:", "tbf",
                       "rate", "2000000bit", "burst", "3000", "limit", "47168"]]
+    tc_applier("c3-eth0", run=ok, parent="1:1")(2_000_000)
+    assert calls[-1][6] == "1:1"
 
     def bad(command, **kwargs):
         return subprocess.CompletedProcess(command, 2, "", "RTNETLINK answers: Invalid argument")
@@ -78,6 +80,9 @@ def test_replay_agent_command_only_for_trace_scenarios(tmp_path):
     cmd = rm.replay_agent_command(scenario="L5", **kwargs)
     assert cmd[:3] == ["py", "-m", "fedgrant.mininet.replay_agent"]
     assert cmd[cmd.index("--split") + 1] == "ood" and cmd[cmd.index("--iface") + 1] == "c4-eth0"
+    assert cmd[cmd.index("--tbf-parent") + 1] == "2:1"
+    legacy = rm.replay_agent_command(scenario="L4", ready_lossless=False, **kwargs)
+    assert legacy[legacy.index("--tbf-parent") + 1] == "1:1"
     assert rm.replay_agent_command(scenario="L4", **kwargs)[cmd.index("--split") + 1] == "test"
 
 
@@ -133,8 +138,11 @@ def test_netlink_applier_sets_same_parameters_as_tc():
     netlink_applier("c2-eth0", ipr)(4_123_456)
     args, kwargs = ipr.calls[0]
     assert args == ("change", "tbf", 7)
-    assert kwargs == {"handle": 0x00100000, "parent": 0x00010001, "rate": "4123456bit", "burst": 3000,
+    assert kwargs == {"handle": 0x00100000, "parent": 0x00020001, "rate": "4123456bit", "burst": 3000,
                       "limit": ACCESS_QUEUE_BYTES}
+    legacy = FakeIPRoute()
+    netlink_applier("c2-eth0", legacy, parent="1:1")(1_000_000)
+    assert legacy.calls[0][1]["parent"] == 0x00010001
     with pytest.raises(RuntimeError, match="not found"):
         netlink_applier("c9-eth0", FakeIPRoute())
     with pytest.raises(ValueError):
