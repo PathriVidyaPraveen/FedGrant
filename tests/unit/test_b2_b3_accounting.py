@@ -212,7 +212,12 @@ def test_real_b2_b3_rows_follow_summary_schema(tmp_path) -> None:
             assert isinstance(rows[policy][column], float), (policy, column)
     assert rows["B2"]["plan_messages_sent"] == rows["B2"]["plan_data_rtt_p50_ms"] == ""
     assert rows["B3"]["plan_messages_sent"] == 20.0
-    assert rows["B3"]["plan_data_rtt_p50_ms"] > 0 and rows["B3"]["plan_data_rtt_samples"] > 0
+    # A PLAN does not guarantee an RTT sample: one exists only for a client's first
+    # accepted DATA. With no sample the p50 is empty, never zero.
+    if rows["B3"]["plan_data_rtt_samples"] > 0:
+        assert rows["B3"]["plan_data_rtt_p50_ms"] > 0
+    else:
+        assert rows["B3"]["plan_data_rtt_samples"] == 0.0 and rows["B3"]["plan_data_rtt_p50_ms"] == ""
     assert rows["B3"]["data_bytes_sent"] == rows["B3"]["data_packets_sent"] * (_HEADER_BYTES + 2 * L)
     assert D_MODEL > (D_MODEL // L) * L  # final block is padded: boundary is explicit
 
