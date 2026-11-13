@@ -144,6 +144,29 @@ def run_full(
     return history
 
 
+def _plan_data_rtt_send_pos(round_result, encoded_updates, client_ids) -> list[int] | None:
+    """send_pos of the DATA that produced each B3 RTT sample (parallel to client_ids).
+
+    The sample is taken at a client's first accepted DATA, which is the first
+    entry of the accumulator's ``receive_order`` (accepted blocks in arrival
+    order); B3 sends block ``order[send_pos - 1]`` at ``send_pos``. Returns
+    None, rather than inventing values, when that information is unavailable.
+    """
+    results = getattr(round_result, "client_results", None)
+    if results is None:
+        return None
+    positions: list[int] = []
+    for cid in client_ids:
+        order = getattr(results.get(cid), "receive_order", None)
+        if not order:
+            return None
+        matches = np.flatnonzero(np.asarray(encoded_updates[cid].order) == int(order[0]))
+        if matches.size != 1:
+            return None
+        positions.append(int(matches[0]) + 1)
+    return positions
+
+
 def run_fl_simulated(
     model: FEMNISTCNN,
     train_clients: Sequence[tuple[torch.Tensor, torch.Tensor]],
@@ -288,10 +311,18 @@ def run_fl_simulated(
                 ),
             }
             if transport_baseline == "B3" and baseline_result is not None:
-                # B3 mode-2 RTT: first DATA arrival minus PLAN send, one sample
-                # per client per round. Kept separate from grant RTT samples.
+                # B3 mode-2 RTT (Section 10): first accepted DATA arrival at the
+                # gateway minus that client's PLAN send time, at most one sample
+                # per client per round, produced by B3GatewayCore. Kept separate
+                # from grant RTT. The two lists are parallel and client-sorted;
+                # clients without a sample (no PLAN handoff / no DATA) are absent.
                 b3_rtt = baseline_result.get("b3_rtt_samples_ns", {})
-                record["plan_data_rtt_samples_ns"] = [int(b3_rtt[cid]) for cid in sorted(b3_rtt)]
+                client_ids = sorted(int(cid) for cid in b3_rtt)
+                record["plan_data_rtt_client_ids"] = client_ids
+                record["plan_data_rtt_samples_ns"] = [int(b3_rtt[cid]) for cid in client_ids]
+                send_pos = _plan_data_rtt_send_pos(baseline_result.get("round_result"), enc_list, client_ids)
+                if send_pos is not None:
+                    record["plan_data_rtt_send_pos"] = send_pos
             if round_id % eval_every == 0 or round_id == num_rounds:
                 test_clients = test_client_loader()
                 loss, accuracy = evaluate(model, test_clients, dev)

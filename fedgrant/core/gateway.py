@@ -27,6 +27,8 @@ from fedgrant.predictors.base import Predictor, RoundCtx
 from fedgrant.predictors.fallback import FallbackPredictor
 from fedgrant.core.state import ClientState, OutstandingGrant, Status, values_from_energies
 
+PREDICTION_REFRESH_NS = 5_000_000  # Section 4.6: batched refresh every 5 ms
+
 
 class GatewayError(ValueError):
     """Raised for invalid gateway configuration or event arguments."""
@@ -269,6 +271,7 @@ class GatewayCore:
         self.round_min_value: float | None = None
         self.stats = GatewayStats()
         self._p_hat: dict[int, float] = {}
+        self._last_refresh_bucket = 0
 
     def register_client(self, client_id: int, state: ClientState) -> None:
         """Attach one connected client state before or between rounds."""
@@ -352,6 +355,7 @@ class GatewayCore:
         self.resolved_grants = {client_id: {} for client_id in self.clients}
         self.timed_out_grants = {client_id: set() for client_id in self.clients}
         self.round_min_value = None
+        self._last_refresh_bucket = 0
         self._reset_view_arrivals()
         return [
             SendRoundStart(
@@ -653,7 +657,13 @@ class GatewayCore:
                 self._resolve_timeout(client_id, state, grant_id, grant, t_ns)
         if self.estimator is not None:
             self.estimator.on_tick(t_ns)
-        if self.predictor is not None and (t_ns - self.round.start_ns) % 5_000_000 == 0:
+        # Section 4.6 / Algorithm 1 line 26: batched refresh on the 5 ms tick.
+        # Use bucket crossing rather than exact multiples: the simulator ticks
+        # at exact multiples of 1 ms from the round start (same instants as
+        # before), while the UDP daemon's 1 ms ticks have an arbitrary phase.
+        bucket = (t_ns - self.round.start_ns) // PREDICTION_REFRESH_NS
+        if self.predictor is not None and bucket > self._last_refresh_bucket:
+            self._last_refresh_bucket = bucket
             self._refresh_predictions(t_ns)
         return self._pump(t_ns)
 

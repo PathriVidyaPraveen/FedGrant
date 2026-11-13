@@ -474,9 +474,9 @@ def run_baseline_network_round(
 
     engine.run_until(deadline_abs_ns)
     frames_sent_at_deadline = bottleneck.frames_sent
-    data_queue_drops_at_deadline = (
-        sum(link.drops_queue for link in access_links) + bottleneck.drops_queue_client
-    )
+    access_queue_drops_at_deadline = sum(link.drops_queue for link in access_links)
+    bottleneck_data_drops_at_deadline = bottleneck.drops_queue_client
+    data_queue_drops_at_deadline = access_queue_drops_at_deadline + bottleneck_data_drops_at_deadline
     cross_queue_drops_at_deadline = bottleneck.drops_queue_cross
     if cross_traffic is not None:
         cross_traffic.stop()
@@ -550,11 +550,11 @@ def run_baseline_network_round(
         for block_idx in indices
     )
     eta = delivered_energy / total_energy if total_energy > 0 else 0.0
-    delivered_payload_bytes = sum(
-        int(round_result.client_results[cid].n_coords[block_idx]) * 2
-        for cid, indices in delivered_by_client.items()
-        for block_idx in indices
-    )
+    # Same accounting boundary as the grant simulator (run_net) and the FL
+    # baseline simulator: every DATA carries a fixed L-coordinate fp16 block
+    # (the final block is zero-padded on the wire), so delivered payload bytes
+    # are unique delivered blocks x 2L. n_coords is decoder metadata only.
+    delivered_payload_bytes = sum(len(indices) for indices in delivered_by_client.values()) * 2 * L
     duration_s = duration_ns / 1_000_000_000.0
     queueing_delays_ms = [
         (float(sample["backlog_bits"]) / float(C)) * 1000.0
@@ -572,6 +572,9 @@ def run_baseline_network_round(
         "queueing_delay_mean_ms": float(np.mean(queueing_delays_ms)) if queueing_delays_ms else 0.0,
         "queueing_delay_p99_ms": float(np.percentile(queueing_delays_ms, 99)) if queueing_delays_ms else 0.0,
         "drops_queue_data": data_queue_drops_at_deadline,
+        "drops_queue_access": access_queue_drops_at_deadline,
+        # Spec queue drops: bottleneck drop-tail drops of FedGrant frames.
+        "drops_queue_bn_client": bottleneck_data_drops_at_deadline,
         "drops_queue_cross": cross_queue_drops_at_deadline,
         "wasted_grants_ratio": None,
         "late_after_timeout": None,
