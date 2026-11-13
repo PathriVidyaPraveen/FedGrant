@@ -75,7 +75,11 @@ def _runner_args(tmp_path, bank_path, policy: str, **overrides) -> argparse.Name
     log_dir = tmp_path / "run"
     values = dict(
         clients=N, rounds=2, duration_ns=300_000_000, blocks=K, block_length=L, port=9000, client_port=9001,
-        start_delay_s=0.05, compute_window_s=0.05, late_drain_s=0.05, inter_round_s=0.0,
+        # Gateway and clients share one event loop here. With seeded readiness
+        # delays (rho_i <= 0.1 D) a 50 + 50 ms gap let round-1 DATA answered late
+        # arrive after round 2 started (dropped and counted, Section 8). Real runs
+        # use drain 0.1 s + Tc 1.0 s; keep a realistic gap.
+        start_delay_s=0.05, compute_window_s=0.3, late_drain_s=0.1, inter_round_s=0.0,
         gateway_factory=PRODUCTION_FACTORY, log_dir=str(log_dir), round_state=str(log_dir / ".round_state.json"),
         profile_gateway=False, policy=policy, seed=SEED, value_bank=str(bank_path), models_dir="models",
     )

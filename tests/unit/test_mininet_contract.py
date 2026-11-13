@@ -261,3 +261,53 @@ def test_grant_round_protocol_sends_simulator_readiness_delays():
     expected = readiness_delays_us(5, 2, 3, 398_000_000)
     assert sent == expected
     assert all(0 <= rho <= 39_800 for rho in sent.values()) and len(set(sent.values())) > 1
+
+
+def test_grant_round_protocol_records_predictor_fallbacks(tmp_path):
+    """Per-round FallbackPredictor.n_fallbacks goes to gateway_summary; the run total to meta."""
+    class Tap:
+        def dispatch_actions(self, actions):
+            pass
+
+        def capture_deadline_state(self):
+            return 0
+
+        def log_timeouts(self):
+            pass
+
+    stub = gateway_proc.GrantRoundProtocol(create_gateway(2), Tap(), num_clients=2, K=K, L=L)
+    window = stub.begin_round(1, 1_000_000_000, 398_000_000)
+    stub.at_deadline(window)
+    assert stub.finish_round(window)[1]["predictor_fallbacks"] is None  # stub core has no predictor
+
+    counter = [5]
+    proto = gateway_proc.GrantRoundProtocol(create_gateway(2), Tap(), num_clients=2, K=K, L=L)
+    proto._fallbacks = lambda: counter[0]
+    window = proto.begin_round(1, 1_000_000_000, 398_000_000)
+    counter[0] = 8
+    proto.at_deadline(window)
+    assert proto.finish_round(window)[1]["predictor_fallbacks"] == 3  # delta within the round
+
+    path = tmp_path / "gateway_summary.json"
+    path.write_text(json.dumps([{"predictor_fallbacks": 3}, {"predictor_fallbacks": 0}, {"predictor_fallbacks": None}]))
+    assert rm._fallback_total(path) == 3
+    path.write_text(json.dumps([{"accepted_data": 1}]))
+    assert rm._fallback_total(path) is None
+
+
+def test_client_prefetch_serves_cached_update_once():
+    calls = []
+
+    def provider(round_id):
+        calls.append(round_id)
+        return np.full(3, float(round_id), np.float32)
+
+    updates = client_proc.PrefetchedUpdates(provider, rounds=2)
+    updates.prefetch(1)
+    updates.prefetch(1)
+    updates.prefetch(3)                       # beyond the run: ignored
+    assert calls == [1]
+    np.testing.assert_array_equal(updates(1), np.full(3, 1.0, np.float32))
+    assert calls == [1]                        # served from the cache at ROUND_START
+    updates(2)
+    assert calls == [1, 2]                     # not prefetched: built on demand
