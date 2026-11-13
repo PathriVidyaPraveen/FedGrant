@@ -410,9 +410,14 @@ class BaselineGateway:
             self.logs.packet(t_ns=received_ns, round_id=0, client_id=-1, direction="received",
                              packet_type="malformed", size=len(data), result="rejected")
             return
-        if message.message_type not in (MessageType.READY, MessageType.DATA):
-            self._count_invalid()
-        result = self._classify(self.current, message.round_id, received_ns, accepted)
+        if message.message_type is MessageType.READY:
+            # accepted_data / rejected_data / late_after_deadline count DATA only
+            # (same meaning as GatewayCore's counters); READY is logged, not counted.
+            result = "accepted" if accepted else "rejected"
+        else:
+            if message.message_type is not MessageType.DATA:
+                self._count_invalid()
+            result = self._classify(self.current, message.round_id, received_ns, accepted)
         body = message.body
         self.logs.packet(t_ns=received_ns, round_id=message.round_id, client_id=message.client_id,
                          direction="received", packet_type=MessageType(message.message_type).name, size=len(data),
