@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from fedgrant.mininet.ge import ge_params
-from fedgrant.mininet.tcsetup import bottleneck, client_egress, gateway_egress, reverse_access
+from fedgrant.mininet.tcsetup import READY_FILTER_MATCHES, bottleneck, client_egress, gateway_egress, reverse_access
 from fedgrant.policy.constants import C, Q, S
 from fedgrant.sim.links import access_delay_ns, mean_access_rate_bps
 
@@ -56,6 +56,21 @@ def _verify_iface(host: Any, iface: str, commands: list[str]) -> None:
         raise RuntimeError(f"tc returned no qdiscs for {iface}")
     lines = output.lower().splitlines()
     expected = "\n".join(commands).lower()
+    if " prio " in expected:
+        # READY-lossless client layout (CHANGELOG 2026-11-13): prio root, a
+        # delay-only netem for READY, and the READY-only u32 filter.
+        if not any(line.startswith("qdisc prio 1:") for line in lines):
+            raise RuntimeError(f"{iface}: expected prio root qdisc; got {output.strip()!r}")
+        if not any("netem" in line and "loss" not in line for line in lines):
+            raise RuntimeError(f"{iface}: expected a loss-free netem for READY; got {output.strip()!r}")
+    elif any(line.startswith("qdisc prio") for line in lines):
+        raise RuntimeError(f"{iface}: unexpected prio root (READY-lossless layout) where the original "
+                           f"Section 7 layout was requested; got {output.strip()!r}")
+    if any(command.lstrip().startswith("tc filter") for command in commands):
+        filters = host.cmd(f"tc filter show dev {shlex.quote(iface)}").lower()
+        missing = [m for m in READY_FILTER_MATCHES if m not in filters]
+        if missing or "flowid 1:1" not in filters:
+            raise RuntimeError(f"{iface}: READY filter missing or different (missing {missing}); got {filters.strip()!r}")
     if "netem" in expected:
         netem_lines = [line for line in lines if "netem" in line]
         if not netem_lines:
@@ -108,7 +123,8 @@ def verify_tc(net: Any, expected: dict[tuple[str, str], list[str]]) -> None:
         _verify_iface(host, iface, commands)
 
 
-def build(n: int = 20, scenario: str = "L2", *, seed: int = 0, controller: Any = None, verify: bool = True):
+def build(n: int = 20, scenario: str = "L2", *, seed: int = 0, controller: Any = None, verify: bool = True,
+          ready_lossless: bool = True):
     """Build and start the network; caller owns ``net.stop()`` in a finally block."""
     if isinstance(n, bool) or not isinstance(n, int) or not 1 <= n <= 50:
         raise ValueError("n must be an integer in [1, 50]")
@@ -148,7 +164,7 @@ def build(n: int = 20, scenario: str = "L2", *, seed: int = 0, controller: Any =
             client_name, iface = f"c{i}", f"c{i}-eth0"
             client = net.get(client_name)
             client.setIP(f"10.0.0.{i + 1}/24", intf=iface)
-            commands = client_egress(iface, params.delay_ms, p, r, params.rate_bps)
+            commands = client_egress(iface, params.delay_ms, p, r, params.rate_bps, ready_lossless=ready_lossless)
             for command in commands:
                 result = client.cmd(command)
                 if "Error" in result or "RTNETLINK" in result:
@@ -198,6 +214,7 @@ def build(n: int = 20, scenario: str = "L2", *, seed: int = 0, controller: Any =
         net._fedgrant_expected_tc = expected
         net._fedgrant_scenario = scenario
         net._fedgrant_seed = int(seed)
+        net._fedgrant_ready_lossless = bool(ready_lossless)
         return net
     except BaseException:
         net.stop()

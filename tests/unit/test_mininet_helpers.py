@@ -55,9 +55,19 @@ def test_loss_block_bootstrap_rejects_invalid_options(kwargs):
 def test_tc_builders_exact_strings_and_frame_queue_sizes():
     assert S == 1474 and ACCESS_QUEUE_BYTES == 32 * S == 47168
     assert BOTTLENECK_QUEUE_BYTES == Q * S == 94336
-    assert client_egress("c3-eth0", 40, 0.006579, 0.125, 2_000_000) == [
+    # Original Section 7 layout (kept for comparison runs).
+    assert client_egress("c3-eth0", 40, 0.006579, 0.125, 2_000_000, ready_lossless=False) == [
         "tc qdisc add dev c3-eth0 root handle 1: netem delay 40ms loss gemodel 0.6579% 12.5% 100% 0%",
         "tc qdisc add dev c3-eth0 parent 1:1 handle 10: tbf rate 2000000bit burst 3000 limit 47168",
+    ]
+    # Default: READY-lossless layout (CHANGELOG amendment 2026-11-13).
+    assert client_egress("c3-eth0", 40, 0.006579, 0.125, 2_000_000) == [
+        "tc qdisc add dev c3-eth0 root handle 1: prio bands 2 priomap 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1",
+        "tc qdisc add dev c3-eth0 parent 1:1 handle 30: netem delay 40ms",
+        "tc qdisc add dev c3-eth0 parent 1:2 handle 2: netem delay 40ms loss gemodel 0.6579% 12.5% 100% 0%",
+        "tc qdisc add dev c3-eth0 parent 2:1 handle 10: tbf rate 2000000bit burst 3000 limit 47168",
+        "tc filter add dev c3-eth0 parent 1: protocol ip prio 1 u32 match ip protocol 17 0xff "
+        "match ip dport 9000 0xffff match u16 0x4647 0xffff at 28 match u8 0x02 0xff at 31 flowid 1:1",
     ]
     assert reverse_access("s1-c3", 40) == ["tc qdisc add dev s1-c3 root netem delay 40ms"]
     assert bottleneck("s1-gw") == [
@@ -65,7 +75,11 @@ def test_tc_builders_exact_strings_and_frame_queue_sizes():
         "tc qdisc add dev s1-gw parent 1:1 handle 10: tbf rate 10000000bit burst 3000 limit 94336",
     ]
     assert gateway_egress("gw-eth0") == ["tc qdisc add dev gw-eth0 root netem delay 5ms"]
-    assert tbf_change("c3-eth0", 3_456_000).endswith("rate 3456000bit burst 3000 limit 47168")
+    assert tbf_change("c3-eth0", 3_456_000) == (
+        "tc qdisc change dev c3-eth0 parent 2:1 handle 10: tbf rate 3456000bit burst 3000 limit 47168")
+    assert " parent 1:1 " in tbf_change("c3-eth0", 3_456_000, parent="1:1")
+    with pytest.raises(ValueError):
+        tbf_change("c3-eth0", 3_456_000, parent="7:7")
 
 
 @pytest.mark.parametrize("args", [

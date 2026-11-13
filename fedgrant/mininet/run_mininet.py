@@ -255,14 +255,15 @@ def process_commands(*, python: str, policy: str, n: int, rounds: int, seed: int
 
 
 def replay_agent_command(*, python: str, client_id: int, scenario: str, seed: int, trace_dir: str | Path,
-                         round_state_path: Path, out: Path) -> list[str] | None:
+                         round_state_path: Path, out: Path, ready_lossless: bool = True) -> list[str] | None:
     """Command for one client's trace-replay agent, or None when the scenario has constant rates."""
     if scenario not in {"L4", "L5"}:
         return None
     return [python, "-m", "fedgrant.mininet.replay_agent", "--client-id", str(client_id),
             "--split", "ood" if scenario == "L5" else "test", "--seed", str(seed),
             "--trace-dir", str(trace_dir), "--iface", f"c{client_id}-eth0",
-            "--round-state", str(round_state_path), "--log", str(out / f"trace_replay_client_{client_id}.csv")]
+            "--round-state", str(round_state_path), "--log", str(out / f"trace_replay_client_{client_id}.csv"),
+            "--tbf-parent", "2:1" if ready_lossless else "1:1"]
 
 
 def wait_for_replay_agents(agents: list, log_paths: list[Path], *, timeout_s: float = 30.0,
@@ -305,6 +306,15 @@ def stop_replay_agents(agents: list) -> list[str]:
     return failures
 
 
+def _fallback_total(summary_path: Path) -> int | None:
+    """Sum of per-round predictor fallbacks (Section 9); None when not recorded (stub, B1-B3)."""
+    if not summary_path.is_file():
+        return None
+    counts = [r.get("predictor_fallbacks") for r in json.loads(summary_path.read_text(encoding="utf-8"))]
+    counts = [int(c) for c in counts if c is not None]
+    return sum(counts) if counts else None
+
+
 def _sha256(path: Path) -> str | None:
     return hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
 
@@ -315,7 +325,7 @@ def run_experiment(*, n: int, scenario: str, seed: int, rounds: int, beta: float
                    profile_gateway: bool = False, experiment_id: str | None = None,
                    policy: str | None = None, compute_window_s: float = 1.0,
                    config: dict | None = None, value_bank: str | None = None,
-                   models_dir: str = DEFAULT_MODELS_DIR) -> Path:
+                   models_dir: str = DEFAULT_MODELS_DIR, ready_lossless: bool = True) -> Path:
     """Run Mininet UDP rounds; the default stub factory is a protocol smoke test only.
 
     Every exit path stops samplers, replay threads, cross traffic, child
@@ -364,7 +374,7 @@ def run_experiment(*, n: int, scenario: str, seed: int, rounds: int, beta: float
     sampler = None
     process_sampler = None
     try:
-        net = build(n=n, scenario=scenario, seed=seed)
+        net = build(n=n, scenario=scenario, seed=seed, ready_lossless=ready_lossless)
         verify_tc(net, net._fedgrant_expected_tc)
         round_state_path = out / ".round_state.json"
         RoundStateFile(round_state_path).write(round_id=0, active=False)
@@ -382,7 +392,8 @@ def run_experiment(*, n: int, scenario: str, seed: int, rounds: int, beta: float
         # started before the gateway so it is waiting when round 1 begins.
         for i in range(n):
             agent_cmd = replay_agent_command(python=py, client_id=i, scenario=scenario, seed=seed,
-                                             trace_dir=trace_dir, round_state_path=round_state_path, out=out)
+                                             trace_dir=trace_dir, round_state_path=round_state_path, out=out,
+                                             ready_lossless=ready_lossless)
             if agent_cmd is None:
                 break
             if roles["pinning_enabled"] and roles["clients"]:
@@ -503,7 +514,10 @@ def run_experiment(*, n: int, scenario: str, seed: int, rounds: int, beta: float
             "value_bank": ({"path": str(value_bank), "sha256": _sha256(Path(value_bank))}
                            if value_bank else None),
             "profile_source": "value_bank" if value_bank else "synthetic",
+            # CHANGELOG amendment 2026-11-13: READY bypasses uplink GE loss (delay only).
+            "ready_lossless": bool(ready_lossless),
             "baseline_eta_rounds_filled": baseline_eta_rounds,
+            "predictor_fallbacks_total": _fallback_total(out / "gateway_summary.json"),
             "models_dir": str(models_dir),
             "model_sha256": {name: _sha256(Path(models_dir) / name)
                              for name in POLICY_MODEL_FILES.get(policy, ())},
@@ -590,7 +604,7 @@ def run_experiment(*, n: int, scenario: str, seed: int, rounds: int, beta: float
 _DEFAULTS = {"clients": 3, "scenario": "L2", "seed": 0, "rounds": 1, "beta": 0.10, "cross_mbps": 0.0,
              "trace_dir": "data/traces", "gateway_factory": DEFAULT_STUB_FACTORY, "compute_window_s": 1.0,
              "experiment_id": None, "policy": None, "output": None, "profile_gateway": False,
-             "value_bank": None, "models_dir": DEFAULT_MODELS_DIR}
+             "value_bank": None, "models_dir": DEFAULT_MODELS_DIR, "ready_lossless": True}
 
 
 def resolve_cli(argv: list[str] | None = None) -> dict:
@@ -612,6 +626,8 @@ def resolve_cli(argv: list[str] | None = None) -> dict:
     parser.add_argument("--value-bank", dest="value_bank",
                         help=f"FULL value bank .npz (default for M1/M2: {DEFAULT_VALUE_BANK})")
     parser.add_argument("--models-dir", dest="models_dir")
+    parser.add_argument("--ready-lossy", dest="ready_lossless", action="store_false", default=None,
+                        help="original Section 7 uplink: READY subject to GE loss (comparison runs only)")
     parser.add_argument("--profile-gateway", dest="profile_gateway", action="store_true", default=None,
                         help="collect gateway process CPU/RSS and scheduler-latency samples")
     args = vars(parser.parse_args(argv))
@@ -643,7 +659,7 @@ def main(argv: list[str] | None = None) -> None:
                           experiment_id=s["experiment_id"],
                           policy=s["policy"], compute_window_s=float(s["compute_window_s"]),
                           config=s if "config_path" in s else None, value_bank=s["value_bank"],
-                          models_dir=s["models_dir"])
+                          models_dir=s["models_dir"], ready_lossless=bool(s["ready_lossless"]))
     print(path)
 
 

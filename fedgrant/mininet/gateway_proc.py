@@ -40,6 +40,7 @@ class GrantRoundProtocol:
         stats = self.core.stats
         self._before = {name: getattr(stats, name) for name in (
             "late_after_timeout", "late_after_deadline", "accepted_data", "rejected_data", "invalid_events")}
+        self._fallbacks_before = self._fallbacks()
         # Per-client readiness rho_i ~ U(0, 0.1 D) from the simulator's seeded
         # stream (Section 3.1), the same draws as the M-sim twin and the B1-B3
         # processes; each client waits rho_i after ROUND_START before READY.
@@ -47,6 +48,11 @@ class GrantRoundProtocol:
         self._actions = self.core.on_round_start(now_ns, round_id=round_id, duration_ns=duration_ns,
                                                  K=self.K, L=self.L, rho_us=rho_us)
         return RoundWindow(round_id, self.core.round.start_ns, self.core.round.deadline_ns)
+
+    def _fallbacks(self) -> int | None:
+        predictor = getattr(self.core, "predictor", None)
+        count = getattr(predictor, "n_fallbacks", None)
+        return None if count is None else int(count)
 
     def send_round_start(self, window: RoundWindow) -> None:
         # The round loop has already published the round window, so client
@@ -88,6 +94,10 @@ class GrantRoundProtocol:
         }
         record = {name: getattr(stats, name) - self._before[name]
                   for name in ("accepted_data", "rejected_data", "invalid_events")}
+        # Section 9 fallback: >0 means the configured predictor (e.g. P-GRU) was
+        # replaced by P-EWMA for part of this round; such runs are flagged.
+        now = self._fallbacks()
+        record["predictor_fallbacks"] = None if now is None else now - self._fallbacks_before
         return row, record
 
 

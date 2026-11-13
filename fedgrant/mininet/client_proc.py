@@ -19,6 +19,26 @@ from fedgrant.common.wire import decode_message, WireProtocolError
 from fedgrant.net.udp_client import UdpClient
 
 
+class PrefetchedUpdates:
+    """Build round r's update before its ROUND_START (Section 7: clients finish within Tc).
+
+    The ROUND_START handler then only looks the update up, so READY follows
+    ROUND_START by rho_i, as in the simulator and the B1-B3 clients (D-20).
+    """
+
+    def __init__(self, provider, rounds: int):
+        self.provider, self.rounds = provider, int(rounds)
+        self._cache: dict[int, np.ndarray] = {}
+
+    def prefetch(self, round_id: int) -> None:
+        if 1 <= round_id <= self.rounds and round_id not in self._cache:
+            self._cache[round_id] = self.provider(round_id)
+
+    def __call__(self, round_id: int) -> np.ndarray:
+        cached = self._cache.pop(round_id, None)
+        return self.provider(round_id) if cached is None else cached
+
+
 def make_update_provider(args: argparse.Namespace):
     """Bank profiles for real runs (contract Section 3); synthetic ones only for smoke runs."""
     if args.value_bank:
@@ -35,7 +55,8 @@ def make_update_provider(args: argparse.Namespace):
 
 
 async def run(args: argparse.Namespace) -> None:
-    update_provider = make_update_provider(args)
+    update_provider = PrefetchedUpdates(make_update_provider(args), args.rounds)
+    update_provider.prefetch(1)
     core = ClientCore(args.client_id)
 
     packet_path = Path(args.log_file).with_name(f"client_{args.client_id}_packets.csv")
@@ -74,6 +95,8 @@ async def run(args: argparse.Namespace) -> None:
             if round_id > last_seen:
                 completed.append(round_id)
                 last_seen = round_id
+                # Idle until the next ROUND_START (late drain + Tc): prepare its update now.
+                update_provider.prefetch(round_id + 1)
             # Event is level-triggered and remains set after ROUND_END. Consume
             # it here so the next wait cannot return the previous round twice.
             client._round_end_event.clear()
