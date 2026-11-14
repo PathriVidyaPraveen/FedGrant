@@ -1,0 +1,397 @@
+{
+  "environment": {
+    "in_container": false,
+    "kernel": "7.2.8-200.fc44.x86_64",
+    "machine": "x86_64",
+    "python": "3.14.7"
+  },
+  "format": "fedgrant-m1-fingerprint/1",
+  "identity": {
+    "N": 20,
+    "beta": 0.1,
+    "compute_window_s": 1.0,
+    "config_sha256": "511b9ac06344071444715c318c48af3b87682cd4f4b730ccce33f9cfb54ccdb2",
+    "cross_mbps": 0.0,
+    "duration_ns": 398000000,
+    "effective_queue_settings": {
+      "bottleneck_interface": "s1-gw",
+      "bottleneck_limit_bytes": 94336,
+      "bottleneck_limit_frames": 64,
+      "bottleneck_rate_bps": 10000000,
+      "frame_size_bytes": 1474,
+      "ge_target_loss_rate": 0.05,
+      "ge_target_mean_burst": 8.0,
+      "per_client_access": [
+        {
+          "client_id": 0,
+          "delay_ms": 10,
+          "rate_bps": 2000000,
+          "rtt_ms": 30
+        },
+        {
+          "client_id": 1,
+          "delay_ms": 20,
+          "rate_bps": 4000000,
+          "rtt_ms": 50
+        },
+        {
+          "client_id": 2,
+          "delay_ms": 30,
+          "rate_bps": 6000000,
+          "rtt_ms": 70
+        },
+        {
+          "client_id": 3,
+          "delay_ms": 40,
+          "rate_bps": 2000000,
+          "rtt_ms": 90
+        },
+        {
+          "client_id": 4,
+          "delay_ms": 10,
+          "rate_bps": 4000000,
+          "rtt_ms": 30
+        },
+        {
+          "client_id": 5,
+          "delay_ms": 20,
+          "rate_bps": 6000000,
+          "rtt_ms": 50
+        },
+        {
+          "client_id": 6,
+          "delay_ms": 30,
+          "rate_bps": 2000000,
+          "rtt_ms": 70
+        },
+        {
+          "client_id": 7,
+          "delay_ms": 40,
+          "rate_bps": 4000000,
+          "rtt_ms": 90
+        },
+        {
+          "client_id": 8,
+          "delay_ms": 10,
+          "rate_bps": 6000000,
+          "rtt_ms": 30
+        },
+        {
+          "client_id": 9,
+          "delay_ms": 20,
+          "rate_bps": 2000000,
+          "rtt_ms": 50
+        },
+        {
+          "client_id": 10,
+          "delay_ms": 30,
+          "rate_bps": 4000000,
+          "rtt_ms": 70
+        },
+        {
+          "client_id": 11,
+          "delay_ms": 40,
+          "rate_bps": 6000000,
+          "rtt_ms": 90
+        },
+        {
+          "client_id": 12,
+          "delay_ms": 10,
+          "rate_bps": 2000000,
+          "rtt_ms": 30
+        },
+        {
+          "client_id": 13,
+          "delay_ms": 20,
+          "rate_bps": 4000000,
+          "rtt_ms": 50
+        },
+        {
+          "client_id": 14,
+          "delay_ms": 30,
+          "rate_bps": 6000000,
+          "rtt_ms": 70
+        },
+        {
+          "client_id": 15,
+          "delay_ms": 40,
+          "rate_bps": 2000000,
+          "rtt_ms": 90
+        },
+        {
+          "client_id": 16,
+          "delay_ms": 10,
+          "rate_bps": 4000000,
+          "rtt_ms": 30
+        },
+        {
+          "client_id": 17,
+          "delay_ms": 20,
+          "rate_bps": 6000000,
+          "rtt_ms": 50
+        },
+        {
+          "client_id": 18,
+          "delay_ms": 30,
+          "rate_bps": 2000000,
+          "rtt_ms": 70
+        },
+        {
+          "client_id": 19,
+          "delay_ms": 40,
+          "rate_bps": 4000000,
+          "rtt_ms": 90
+        }
+      ],
+      "sampling_interval_ms": 10,
+      "tc_configured": {
+        "c0-eth0": [
+          "tc qdisc add dev c0-eth0 root handle 1: prio bands 2 priomap 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1",
+          "tc qdisc add dev c0-eth0 parent 1:1 handle 30: netem delay 10ms",
+          "tc qdisc add dev c0-eth0 parent 1:2 handle 2: netem delay 10ms loss gemodel 0.6579% 12.5% 100% 0%",
+          "tc qdisc add dev c0-eth0 parent 2:1 handle 10: tbf rate 2000000bit burst 3000 limit 47168",
+          "tc filter add dev c0-eth0 parent 1: protocol ip prio 1 u32 match ip protocol 17 0xff match ip dport 9000 0xffff match u16 0x4647 0xffff at 28 match u8 0x02 0xff at 31 flowid 1:1"
+        ],
+        "c1-eth0": [
+          "tc qdisc add dev c1-eth0 root handle 1: prio bands 2 priomap 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1",
+          "tc qdisc add dev c1-eth0 parent 1:1 handle 30: netem delay 20ms",
+          "tc qdisc add dev c1-eth0 parent 1:2 handle 2: netem delay 20ms loss gemodel 0.6579% 12.5% 100% 0%",
+          "tc qdisc add dev c1-eth0 parent 2:1 handle 10: tbf rate 4000000bit burst 3000 limit 47168",
+          "tc filter add dev c1-eth0 parent 1: protocol ip prio 1 u32 match ip protocol 17 0xff match ip dport 9000 0xffff match u16 0x4647 0xffff at 28 match u8 0x02 0xff at 31 flowid 1:1"
+        ],
+        "c10-eth0": [
+          "tc qdisc add dev c10-eth0 root handle 1: prio bands 2 priomap 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1",
+          "tc qdisc add dev c10-eth0 parent 1:1 handle 30: netem delay 30ms",
+          "tc qdisc add dev c10-eth0 parent 1:2 handle 2: netem delay 30ms loss gemodel 0.6579% 12.5% 100% 0%",
+          "tc qdisc add dev c10-eth0 parent 2:1 handle 10: tbf rate 4000000bit burst 3000 limit 47168",
+          "tc filter add dev c10-eth0 parent 1: protocol ip prio 1 u32 match ip protocol 17 0xff match ip dport 9000 0xffff match u16 0x4647 0xffff at 28 match u8 0x02 0xff at 31 flowid 1:1"
+        ],
+        "c11-eth0": [
+          "tc qdisc add dev c11-eth0 root handle 1: prio bands 2 priomap 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1",
+          "tc qdisc add dev c11-eth0 parent 1:1 handle 30: netem delay 40ms",
+          "tc qdisc add dev c11-eth0 parent 1:2 handle 2: netem delay 40ms loss gemodel 0.6579% 12.5% 100% 0%",
+          "tc qdisc add dev c11-eth0 parent 2:1 handle 10: tbf rate 6000000bit burst 3000 limit 47168",
+          "tc filter add dev c11-eth0 parent 1: protocol ip prio 1 u32 match ip protocol 17 0xff match ip dport 9000 0xffff match u16 0x4647 0xffff at 28 match u8 0x02 0xff at 31 flowid 1:1"
+        ],
+        "c12-eth0": [
+          "tc qdisc add dev c12-eth0 root handle 1: prio bands 2 priomap 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1",
+          "tc qdisc add dev c12-eth0 parent 1:1 handle 30: netem delay 10ms",
+          "tc qdisc add dev c12-eth0 parent 1:2 handle 2: netem delay 10ms loss gemodel 0.6579% 12.5% 100% 0%",
+          "tc qdisc add dev c12-eth0 parent 2:1 handle 10: tbf rate 2000000bit burst 3000 limit 47168",
+          "tc filter add dev c12-eth0 parent 1: protocol ip prio 1 u32 match ip protocol 17 0xff match ip dport 9000 0xffff match u16 0x4647 0xffff at 28 match u8 0x02 0xff at 31 flowid 1:1"
+        ],
+        "c13-eth0": [
+          "tc qdisc add dev c13-eth0 root handle 1: prio bands 2 priomap 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1",
+          "tc qdisc add dev c13-eth0 parent 1:1 handle 30: netem delay 20ms",
+          "tc qdisc add dev c13-eth0 parent 1:2 handle 2: netem delay 20ms loss gemodel 0.6579% 12.5% 100% 0%",
+          "tc qdisc add dev c13-eth0 parent 2:1 handle 10: tbf rate 4000000bit burst 3000 limit 47168",
+          "tc filter add dev c13-eth0 parent 1: protocol ip prio 1 u32 match ip protocol 17 0xff match ip dport 9000 0xffff match u16 0x4647 0xffff at 28 match u8 0x02 0xff at 31 flowid 1:1"
+        ],
+        "c14-eth0": [
+          "tc qdisc add dev c14-eth0 root handle 1: prio bands 2 priomap 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1",
+          "tc qdisc add dev c14-eth0 parent 1:1 handle 30: netem delay 30ms",
+          "tc qdisc add dev c14-eth0 parent 1:2 handle 2: netem delay 30ms loss gemodel 0.6579% 12.5% 100% 0%",
+          "tc qdisc add dev c14-eth0 parent 2:1 handle 10: tbf rate 6000000bit burst 3000 limit 47168",
+          "tc filter add dev c14-eth0 parent 1: protocol ip prio 1 u32 match ip protocol 17 0xff match ip dport 9000 0xffff match u16 0x4647 0xffff at 28 match u8 0x02 0xff at 31 flowid 1:1"
+        ],
+        "c15-eth0": [
+          "tc qdisc add dev c15-eth0 root handle 1: prio bands 2 priomap 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1",
+          "tc qdisc add dev c15-eth0 parent 1:1 handle 30: netem delay 40ms",
+          "tc qdisc add dev c15-eth0 parent 1:2 handle 2: netem delay 40ms loss gemodel 0.6579% 12.5% 100% 0%",
+          "tc qdisc add dev c15-eth0 parent 2:1 handle 10: tbf rate 2000000bit burst 3000 limit 47168",
+          "tc filter add dev c15-eth0 parent 1: protocol ip prio 1 u32 match ip protocol 17 0xff match ip dport 9000 0xffff match u16 0x4647 0xffff at 28 match u8 0x02 0xff at 31 flowid 1:1"
+        ],
+        "c16-eth0": [
+          "tc qdisc add dev c16-eth0 root handle 1: prio bands 2 priomap 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1",
+          "tc qdisc add dev c16-eth0 parent 1:1 handle 30: netem delay 10ms",
+          "tc qdisc add dev c16-eth0 parent 1:2 handle 2: netem delay 10ms loss gemodel 0.6579% 12.5% 100% 0%",
+          "tc qdisc add dev c16-eth0 parent 2:1 handle 10: tbf rate 4000000bit burst 3000 limit 47168",
+          "tc filter add dev c16-eth0 parent 1: protocol ip prio 1 u32 match ip protocol 17 0xff match ip dport 9000 0xffff match u16 0x4647 0xffff at 28 match u8 0x02 0xff at 31 flowid 1:1"
+        ],
+        "c17-eth0": [
+          "tc qdisc add dev c17-eth0 root handle 1: prio bands 2 priomap 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1",
+          "tc qdisc add dev c17-eth0 parent 1:1 handle 30: netem delay 20ms",
+          "tc qdisc add dev c17-eth0 parent 1:2 handle 2: netem delay 20ms loss gemodel 0.6579% 12.5% 100% 0%",
+          "tc qdisc add dev c17-eth0 parent 2:1 handle 10: tbf rate 6000000bit burst 3000 limit 47168",
+          "tc filter add dev c17-eth0 parent 1: protocol ip prio 1 u32 match ip protocol 17 0xff match ip dport 9000 0xffff match u16 0x4647 0xffff at 28 match u8 0x02 0xff at 31 flowid 1:1"
+        ],
+        "c18-eth0": [
+          "tc qdisc add dev c18-eth0 root handle 1: prio bands 2 priomap 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1",
+          "tc qdisc add dev c18-eth0 parent 1:1 handle 30: netem delay 30ms",
+          "tc qdisc add dev c18-eth0 parent 1:2 handle 2: netem delay 30ms loss gemodel 0.6579% 12.5% 100% 0%",
+          "tc qdisc add dev c18-eth0 parent 2:1 handle 10: tbf rate 2000000bit burst 3000 limit 47168",
+          "tc filter add dev c18-eth0 parent 1: protocol ip prio 1 u32 match ip protocol 17 0xff match ip dport 9000 0xffff match u16 0x4647 0xffff at 28 match u8 0x02 0xff at 31 flowid 1:1"
+        ],
+        "c19-eth0": [
+          "tc qdisc add dev c19-eth0 root handle 1: prio bands 2 priomap 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1",
+          "tc qdisc add dev c19-eth0 parent 1:1 handle 30: netem delay 40ms",
+          "tc qdisc add dev c19-eth0 parent 1:2 handle 2: netem delay 40ms loss gemodel 0.6579% 12.5% 100% 0%",
+          "tc qdisc add dev c19-eth0 parent 2:1 handle 10: tbf rate 4000000bit burst 3000 limit 47168",
+          "tc filter add dev c19-eth0 parent 1: protocol ip prio 1 u32 match ip protocol 17 0xff match ip dport 9000 0xffff match u16 0x4647 0xffff at 28 match u8 0x02 0xff at 31 flowid 1:1"
+        ],
+        "c2-eth0": [
+          "tc qdisc add dev c2-eth0 root handle 1: prio bands 2 priomap 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1",
+          "tc qdisc add dev c2-eth0 parent 1:1 handle 30: netem delay 30ms",
+          "tc qdisc add dev c2-eth0 parent 1:2 handle 2: netem delay 30ms loss gemodel 0.6579% 12.5% 100% 0%",
+          "tc qdisc add dev c2-eth0 parent 2:1 handle 10: tbf rate 6000000bit burst 3000 limit 47168",
+          "tc filter add dev c2-eth0 parent 1: protocol ip prio 1 u32 match ip protocol 17 0xff match ip dport 9000 0xffff match u16 0x4647 0xffff at 28 match u8 0x02 0xff at 31 flowid 1:1"
+        ],
+        "c3-eth0": [
+          "tc qdisc add dev c3-eth0 root handle 1: prio bands 2 priomap 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1",
+          "tc qdisc add dev c3-eth0 parent 1:1 handle 30: netem delay 40ms",
+          "tc qdisc add dev c3-eth0 parent 1:2 handle 2: netem delay 40ms loss gemodel 0.6579% 12.5% 100% 0%",
+          "tc qdisc add dev c3-eth0 parent 2:1 handle 10: tbf rate 2000000bit burst 3000 limit 47168",
+          "tc filter add dev c3-eth0 parent 1: protocol ip prio 1 u32 match ip protocol 17 0xff match ip dport 9000 0xffff match u16 0x4647 0xffff at 28 match u8 0x02 0xff at 31 flowid 1:1"
+        ],
+        "c4-eth0": [
+          "tc qdisc add dev c4-eth0 root handle 1: prio bands 2 priomap 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1",
+          "tc qdisc add dev c4-eth0 parent 1:1 handle 30: netem delay 10ms",
+          "tc qdisc add dev c4-eth0 parent 1:2 handle 2: netem delay 10ms loss gemodel 0.6579% 12.5% 100% 0%",
+          "tc qdisc add dev c4-eth0 parent 2:1 handle 10: tbf rate 4000000bit burst 3000 limit 47168",
+          "tc filter add dev c4-eth0 parent 1: protocol ip prio 1 u32 match ip protocol 17 0xff match ip dport 9000 0xffff match u16 0x4647 0xffff at 28 match u8 0x02 0xff at 31 flowid 1:1"
+        ],
+        "c5-eth0": [
+          "tc qdisc add dev c5-eth0 root handle 1: prio bands 2 priomap 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1",
+          "tc qdisc add dev c5-eth0 parent 1:1 handle 30: netem delay 20ms",
+          "tc qdisc add dev c5-eth0 parent 1:2 handle 2: netem delay 20ms loss gemodel 0.6579% 12.5% 100% 0%",
+          "tc qdisc add dev c5-eth0 parent 2:1 handle 10: tbf rate 6000000bit burst 3000 limit 47168",
+          "tc filter add dev c5-eth0 parent 1: protocol ip prio 1 u32 match ip protocol 17 0xff match ip dport 9000 0xffff match u16 0x4647 0xffff at 28 match u8 0x02 0xff at 31 flowid 1:1"
+        ],
+        "c6-eth0": [
+          "tc qdisc add dev c6-eth0 root handle 1: prio bands 2 priomap 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1",
+          "tc qdisc add dev c6-eth0 parent 1:1 handle 30: netem delay 30ms",
+          "tc qdisc add dev c6-eth0 parent 1:2 handle 2: netem delay 30ms loss gemodel 0.6579% 12.5% 100% 0%",
+          "tc qdisc add dev c6-eth0 parent 2:1 handle 10: tbf rate 2000000bit burst 3000 limit 47168",
+          "tc filter add dev c6-eth0 parent 1: protocol ip prio 1 u32 match ip protocol 17 0xff match ip dport 9000 0xffff match u16 0x4647 0xffff at 28 match u8 0x02 0xff at 31 flowid 1:1"
+        ],
+        "c7-eth0": [
+          "tc qdisc add dev c7-eth0 root handle 1: prio bands 2 priomap 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1",
+          "tc qdisc add dev c7-eth0 parent 1:1 handle 30: netem delay 40ms",
+          "tc qdisc add dev c7-eth0 parent 1:2 handle 2: netem delay 40ms loss gemodel 0.6579% 12.5% 100% 0%",
+          "tc qdisc add dev c7-eth0 parent 2:1 handle 10: tbf rate 4000000bit burst 3000 limit 47168",
+          "tc filter add dev c7-eth0 parent 1: protocol ip prio 1 u32 match ip protocol 17 0xff match ip dport 9000 0xffff match u16 0x4647 0xffff at 28 match u8 0x02 0xff at 31 flowid 1:1"
+        ],
+        "c8-eth0": [
+          "tc qdisc add dev c8-eth0 root handle 1: prio bands 2 priomap 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1",
+          "tc qdisc add dev c8-eth0 parent 1:1 handle 30: netem delay 10ms",
+          "tc qdisc add dev c8-eth0 parent 1:2 handle 2: netem delay 10ms loss gemodel 0.6579% 12.5% 100% 0%",
+          "tc qdisc add dev c8-eth0 parent 2:1 handle 10: tbf rate 6000000bit burst 3000 limit 47168",
+          "tc filter add dev c8-eth0 parent 1: protocol ip prio 1 u32 match ip protocol 17 0xff match ip dport 9000 0xffff match u16 0x4647 0xffff at 28 match u8 0x02 0xff at 31 flowid 1:1"
+        ],
+        "c9-eth0": [
+          "tc qdisc add dev c9-eth0 root handle 1: prio bands 2 priomap 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1",
+          "tc qdisc add dev c9-eth0 parent 1:1 handle 30: netem delay 20ms",
+          "tc qdisc add dev c9-eth0 parent 1:2 handle 2: netem delay 20ms loss gemodel 0.6579% 12.5% 100% 0%",
+          "tc qdisc add dev c9-eth0 parent 2:1 handle 10: tbf rate 2000000bit burst 3000 limit 47168",
+          "tc filter add dev c9-eth0 parent 1: protocol ip prio 1 u32 match ip protocol 17 0xff match ip dport 9000 0xffff match u16 0x4647 0xffff at 28 match u8 0x02 0xff at 31 flowid 1:1"
+        ],
+        "gw-eth0": [
+          "tc qdisc add dev gw-eth0 root netem delay 5ms"
+        ],
+        "s1-c0": [
+          "tc qdisc add dev s1-c0 root netem delay 10ms"
+        ],
+        "s1-c1": [
+          "tc qdisc add dev s1-c1 root netem delay 20ms"
+        ],
+        "s1-c10": [
+          "tc qdisc add dev s1-c10 root netem delay 30ms"
+        ],
+        "s1-c11": [
+          "tc qdisc add dev s1-c11 root netem delay 40ms"
+        ],
+        "s1-c12": [
+          "tc qdisc add dev s1-c12 root netem delay 10ms"
+        ],
+        "s1-c13": [
+          "tc qdisc add dev s1-c13 root netem delay 20ms"
+        ],
+        "s1-c14": [
+          "tc qdisc add dev s1-c14 root netem delay 30ms"
+        ],
+        "s1-c15": [
+          "tc qdisc add dev s1-c15 root netem delay 40ms"
+        ],
+        "s1-c16": [
+          "tc qdisc add dev s1-c16 root netem delay 10ms"
+        ],
+        "s1-c17": [
+          "tc qdisc add dev s1-c17 root netem delay 20ms"
+        ],
+        "s1-c18": [
+          "tc qdisc add dev s1-c18 root netem delay 30ms"
+        ],
+        "s1-c19": [
+          "tc qdisc add dev s1-c19 root netem delay 40ms"
+        ],
+        "s1-c2": [
+          "tc qdisc add dev s1-c2 root netem delay 30ms"
+        ],
+        "s1-c3": [
+          "tc qdisc add dev s1-c3 root netem delay 40ms"
+        ],
+        "s1-c4": [
+          "tc qdisc add dev s1-c4 root netem delay 10ms"
+        ],
+        "s1-c5": [
+          "tc qdisc add dev s1-c5 root netem delay 20ms"
+        ],
+        "s1-c6": [
+          "tc qdisc add dev s1-c6 root netem delay 30ms"
+        ],
+        "s1-c7": [
+          "tc qdisc add dev s1-c7 root netem delay 40ms"
+        ],
+        "s1-c8": [
+          "tc qdisc add dev s1-c8 root netem delay 10ms"
+        ],
+        "s1-c9": [
+          "tc qdisc add dev s1-c9 root netem delay 20ms"
+        ],
+        "s1-gw": [
+          "tc qdisc add dev s1-gw root handle 1: netem delay 5ms",
+          "tc qdisc add dev s1-gw parent 1:1 handle 10: tbf rate 10000000bit burst 3000 limit 94336"
+        ]
+      }
+    },
+    "experiment_id": "M1",
+    "n_rounds": 100,
+    "platform": "mininet",
+    "policy": "B2",
+    "profile_source": "value_bank",
+    "ready_lossless": true,
+    "scenario": "L2",
+    "seed": 1,
+    "trace_sha256": {
+      "ATT-LTE-driving_test.csv": "85554d1070bbf45e066451f448b5f0a901df30fa56ab709a277f6fa894f99e1b",
+      "ATT-LTE-driving_train.csv": "d05789591153811c81629f9801da3c969bd8dda9cf8d80df8bff92287a3c4928",
+      "ATT-LTE-driving_val.csv": "4de9649e13def2ec75027c78ab5a27d5f4bd4a922a66705b0944a0a6d20c3967",
+      "TMobile-UMTS-driving_ood.csv": "0981b4cd4cb37d47febc618b4461d3766cf8e814cd83ab618ca83ec27f3a5ad6",
+      "Verizon-EVDO-driving_ood.csv": "80fd81ac5d461f6f32ba56a57d2abde81ea43cc2d5fcd927a815bdde0492acfe",
+      "Verizon-LTE-driving_test.csv": "6210ff582bd3c9e2a14fc5432d69fe759ad6cfcd83c811cb4a5511af2e6159ec",
+      "Verizon-LTE-driving_train.csv": "e13507f719ba93f906f8fc6f1787af86dade8036d7f8764dbc187e2591aaee9e",
+      "Verizon-LTE-driving_val.csv": "05150d18480a63d1e3dc41a00f21426808947209d385ced799ebeab13aeec1df",
+      "Verizon-LTE-short_test.csv": "d835556fdd5dc07ac2a89a65d631863d160f168eef77744118941ef45dd9cbd9",
+      "Verizon-LTE-short_train.csv": "cc50ee050de71d58bccbf94b7b0fb64dee1441bb99f7daf4ba7275566f303ab5",
+      "Verizon-LTE-short_val.csv": "053ea18e40560dafb59c24582e30c0913fbb35052018167586fa879799a7af75"
+    },
+    "value_bank_sha256": "037a54a870b8a7bee6acb3240d07b02cc8aa883f15c9ac8707abadb464adde9d"
+  },
+  "metrics": {
+    "clients_represented": 19.9625,
+    "delivered_blocks": 292.6,
+    "eta": 0.40321034433165526,
+    "goodput_bps": 8233969.849246231,
+    "gw_cpu_pct": 26.35220700444896,
+    "gw_rss_mb": 59.22265625,
+    "late_after_deadline": 85.425,
+    "queue_drops_fg": 1072.7375,
+    "queueing_delay_p99_ms": 75.4688,
+    "rtt_p50_ms": null,
+    "rtt_p99_ms": null,
+    "sched_lat_p50_us": null,
+    "sched_lat_p99_us": null,
+    "utilization": 0.8539570854271357
+  },
+  "run": "L2-B2-s1"
+}
