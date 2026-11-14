@@ -207,6 +207,65 @@ an "all READYs received" early-close in `B3GatewayCore`. Affected tests:
 `test_mininet_baseline_procs.py` (B3 assertions), `test_sim_adapter_timing.py`
 (acceptance rule only). Results: every B3 row in M-sim, N-main and M1.
 
+### 4.1 Addendum 2026-11-14: M-sim fixed-cutoff diagnostic (Jayadev)
+
+Source: `b3_cutoff_fixed_2026-11-14.zip` shared by Jayadev (summary plus per-run
+`rounds`, `ready`, `clients` and `plan_data_rtt` CSVs). **Provenance gap:** the
+bundle has no manifest (commit, branch, diagnostic script), and it is not in the
+repository's `results/summary/` yet. Rule under test: fixed cutoff
+t_plan = 0.1 D + 90 ms; N = 20; L2/L4; seeds 0–2; β = 0.10 and 0.20 for 100
+rounds; β = 0.05 for one round. Totals, READY counts and RTT p50 were
+re-derived from the per-run files and agree with the summary (four β = 0.20
+p95 values differ by 0.1–0.3 ms, a percentile-method difference).
+
+| β | Scenario | Planned → delivered (3 seeds) | Late after D | Never arrived | Rounds with late DATA | PLAN→DATA RTT p50 / p95 (ms) |
+|---|---|---|---|---|---|---|
+| 0.10 | L2 | 45,692 → 43,840 (95.9 %) | 0 | 4.1 % of planned | 0 / 300 | 90.6–94.5 / 159.9–161.7 |
+| 0.10 | L4 | 43,570 → 37,486 (86.0 %) | 5,062 (83 % of undelivered) | 2.3 % | 290 / 300 | 90.2–90.7 / 189.1 |
+| 0.20 | L2 | 138,771 → 103,113 (74.3 %) | 0 | 25.7 % | 0 / 300 | 68.1–69.7 / 153.8–164.3 |
+| 0.20 | L4 | 131,929 → 99,228 (75.2 %) | 8,998 (28 % of undelivered) | 18.0 % | 282 / 300 | 85.3–86.5 / 268.1–282.1 |
+| 0.05 | L2, L4 | 0 → 0 in all six rounds | — | — | — | none |
+
+Verified from the files:
+
+- **Registration:** every READY (2,000 per 100-round run) arrived by the
+  cutoff; none was rejected. Arrivals fit the delay model exactly
+  (arrival − 2(δᵢ + 5 ms) ∈ [0, 0.1 D]). In simulation the latest READY lands
+  only 0.01–0.17 ms before the cutoff.
+- **β = 0.05:** remaining time after the cutoff minus the initial median RTT
+  is −10.9 ms, so the budget is 0. This is infeasible under the current
+  formulas, as calculated in §4.
+- **L4 shortfall** is mostly late DATA (83 % of undelivered blocks arrived
+  after D at β = 0.10): a transfer-time problem.
+- **β = 0.20 shortfall is a different problem.** In L2, 25.7 % of planned
+  blocks never arrived, with no late DATA, although every client sent all
+  its planned blocks. This is loss in the network, heaviest for δᵢ = 40 ms
+  clients (40 %). The bundle has no drop counters, so GE loss and bottleneck
+  queue drops cannot be separated. This needs investigating independently of
+  the cutoff.
+
+**Mininet margin (calculated, not measured on B3).** Shifting every simulated
+READY by Tejaswi's Fedora arrival residual (`results/summary/testbed_ready_timing.csv`):
+
+| Uniform lateness | β = 0.10: READYs missing the cutoff | Rounds affected |
+|---|---|---|
+| +2.966 ms (p50) | 1.9 % | 31 % |
+| +7.295 ms (p99) | 4.5 % | 62 % |
+| +10 ms | 6.1 % | 72 % |
+
+With no margin, a fixed cutoff would routinely exclude δᵢ = 40 ms clients in
+Mininet that M-sim accepts. The margin should cover the measured maximum
+residual, which the Fedora report does not give yet (Tejaswi).
+
+**Still open:**
+
+- the margin value;
+- an L4 acceptance criterion;
+- the β = 0.20 loss source;
+- how β = 0.05 is reported;
+- the B3 Mininet validation run;
+- committing this bundle with a manifest.
+
 ---
 
 ## 5. ML dataset
