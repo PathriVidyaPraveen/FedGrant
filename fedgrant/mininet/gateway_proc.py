@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
+from pathlib import Path
 
 from fedgrant.core.state import Status
 from fedgrant.mininet.contract import (
@@ -25,6 +27,36 @@ def build_context(args: argparse.Namespace) -> MininetGatewayContext:
         deadline_ns=args.duration_ns, K=args.blocks, L=args.block_length,
         models_dir=args.models_dir, log_dir=args.log_dir,
     )
+
+
+def _round_probe_grants(core):
+    """Probe grants issued this round (GatewayCore.round_probe_grants); blank without probe support."""
+    value = getattr(core, "round_probe_grants", None)
+    if callable(value):
+        value = value()
+    return "" if value is None else int(value)
+
+
+class NetworkOnlyAggregateSink:
+    """Aggregate receiver for network-only runs (M1, smoke): records each aggregate's size.
+
+    M1 measures the network only, so the aggregate G is not applied to a model;
+    without a receiver UdpGateway logs an error and counts aggregate_transfer_errors
+    every round. One line per round goes to aggregates.jsonl. M2 (FL over Mininet)
+    needs a real sender to the FL server instead.
+    """
+
+    def __init__(self, log_dir: str | Path):
+        self.path = Path(log_dir) / "aggregates.jsonl"
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text("", encoding="utf-8")
+
+    async def send_aggregate(self, round_id, aggregate, client_n_coords) -> None:
+        record = {"round_id": int(round_id), "dimension": int(getattr(aggregate, "size", 0) or 0),
+                  "clients": len(client_n_coords),
+                  "delivered_coords": int(sum(sum(blocks.values()) for blocks in client_n_coords.values()))}
+        with self.path.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(record) + "\n")
 
 
 class GrantRoundProtocol:
@@ -91,6 +123,7 @@ class GrantRoundProtocol:
             "wasted_grants": timed_out / issued if issued else 0.0,
             "late_after_timeout": stats.late_after_timeout - self._before["late_after_timeout"],
             "late_after_deadline": stats.late_after_deadline - self._before["late_after_deadline"],
+            "probe_grants": _round_probe_grants(core),
         }
         record = {name: getattr(stats, name) - self._before[name]
                   for name in ("accepted_data", "rejected_data", "invalid_events")}
@@ -106,7 +139,8 @@ async def serve(args: argparse.Namespace) -> None:
     endpoints = {i: (f"10.0.0.{i + 1}", args.client_port) for i in range(args.clients)}
     gateway = await LoggingUdpGateway.bind(core, local_addr=("10.0.0.254", args.port),
                                            endpoints=endpoints, log_dir=args.log_dir,
-                                           profile_scheduler=args.profile_gateway)
+                                           profile_scheduler=args.profile_gateway,
+                                           aggregate_sender=NetworkOnlyAggregateSink(args.log_dir))
     try:
         await run_rounds(
             GrantRoundProtocol(core, gateway, num_clients=args.clients, K=args.blocks, L=args.block_length,

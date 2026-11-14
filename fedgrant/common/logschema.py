@@ -14,6 +14,9 @@ PACKET_COLUMNS = (
 GRANT_COLUMNS = (
     "t_mono_ns", "round_id", "client_id", "grant_id", "send_pos", "event", "issue_ns",
     "timeout_ns", "latency_us", "rtt_ms",
+    # CHANGELOG 2026-11-14 eligibility amendment: 1 on the "issued" row of a probe
+    # grant (p_hat < theta at issue), 0 otherwise; blank on other events.
+    "probe",
 )
 QUEUE_COLUMNS = (
     "t_mono_ns", "round_id", "interface", "qdisc", "backlog_bytes", "bytes", "packets", "drops",
@@ -32,6 +35,7 @@ ROUND_METRIC_COLUMNS = (
     "grants_issued", "grants_delivered", "grants_timed_out",
     "grant_rtt_samples", "plan_data_rtt_samples", "queue_drops_data",
     "queueing_delay_mean_ms", "queueing_delay_p99_ms",
+    "probe_grants",   # grant policies: probe grants issued this round (blank for B1-B3)
 )
 RTT_COLUMNS = ("t_mono_ns", "round_id", "rtt_ms", "rtt_type", "client_id")
 SCHEDULER_COLUMNS = ("t_mono_ns", "round_id", "trigger", "latency_us")

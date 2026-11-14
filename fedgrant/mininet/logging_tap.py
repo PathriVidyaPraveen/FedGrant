@@ -15,6 +15,12 @@ from fedgrant.core.gateway import SendGrant
 from fedgrant.net.udp_gateway import UdpGateway
 
 
+def _probe_flag(core, client_id: int, grant_id: int):
+    """1/0 for a probe grant (GatewayCore.is_probe_grant); blank if the core has no probe support."""
+    is_probe = getattr(core, "is_probe_grant", None)
+    return "" if is_probe is None else int(bool(is_probe(client_id, grant_id)))
+
+
 class LoggingUdpGateway(UdpGateway):
     """Same UDP gateway API as UdpGateway plus one strict raw packet log."""
 
@@ -155,7 +161,7 @@ class LoggingUdpGateway(UdpGateway):
                                                  "issue_ns": grant.t_issue_ns, "timeout_ns": grant.timeout_ns,
                                                  "latency_us": ((sent_perf_ns - self._dispatch_trigger_perf_ns) / 1e3
                                                                 if self._dispatch_trigger_perf_ns is not None else ""),
-                                                 "rtt_ms": ""})
+                                                 "rtt_ms": "", "probe": _probe_flag(self.core, client_id, action.grant_id)})
                     self._grant_file.flush()
                     if self.profile_scheduler and self._dispatch_trigger_perf_ns is not None:
                         self._scheduler_writer.writerow({"t_mono_ns": now_ns, "round_id": round_id,

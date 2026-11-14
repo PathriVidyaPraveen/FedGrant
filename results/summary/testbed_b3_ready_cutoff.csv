@@ -1,0 +1,19 @@
+group,ready_path,runs,readies,rounds,residual_p50_ms,residual_p99_ms,residual_p999_ms,residual_max_ms,latest_arrival_ms,margin_ms,cutoff_ms,readies_missed,readies_missed_pct,rounds_affected,rounds_affected_pct
+ready-timing-L2-N20,quiet: no DATA queued ahead of READY (as in B3 before t_plan),1,500,25,2.97,7.30,8.53,8.64,134.2,0,129.8,10,2.00,7,28.0
+ready-timing-L2-N20,quiet: no DATA queued ahead of READY (as in B3 before t_plan),1,500,25,2.97,7.30,8.53,8.64,134.2,5,134.8,0,0.00,0,0.0
+ready-timing-L2-N20,quiet: no DATA queued ahead of READY (as in B3 before t_plan),1,500,25,2.97,7.30,8.53,8.64,134.2,10,139.8,0,0.00,0,0.0
+ready-timing-L2-N20,quiet: no DATA queued ahead of READY (as in B3 before t_plan),1,500,25,2.97,7.30,8.53,8.64,134.2,15,144.8,0,0.00,0,0.0
+ready-timing-L2-N20,quiet: no DATA queued ahead of READY (as in B3 before t_plan),1,500,25,2.97,7.30,8.53,8.64,134.2,20,149.8,0,0.00,0,0.0
+ready-timing-L2-N20,quiet: no DATA queued ahead of READY (as in B3 before t_plan),1,500,25,2.97,7.30,8.53,8.64,134.2,30,159.8,0,0.00,0,0.0
+M1-B4B6-L2,loaded: READY queues behind granted DATA at the bottleneck,6,12000,600,3.95,38.62,57.77,75.07,198.1,0,129.8,870,7.25,389,64.8
+M1-B4B6-L2,loaded: READY queues behind granted DATA at the bottleneck,6,12000,600,3.95,38.62,57.77,75.07,198.1,5,134.8,594,4.95,267,44.5
+M1-B4B6-L2,loaded: READY queues behind granted DATA at the bottleneck,6,12000,600,3.95,38.62,57.77,75.07,198.1,10,139.8,428,3.57,200,33.3
+M1-B4B6-L2,loaded: READY queues behind granted DATA at the bottleneck,6,12000,600,3.95,38.62,57.77,75.07,198.1,15,144.8,290,2.42,149,24.8
+M1-B4B6-L2,loaded: READY queues behind granted DATA at the bottleneck,6,12000,600,3.95,38.62,57.77,75.07,198.1,20,149.8,196,1.63,107,17.8
+M1-B4B6-L2,loaded: READY queues behind granted DATA at the bottleneck,6,12000,600,3.95,38.62,57.77,75.07,198.1,30,159.8,94,0.78,57,9.5
+M1-B4B6-L4,loaded: READY queues behind granted DATA at the bottleneck,6,11988,600,3.64,32.37,70.74,108.47,214.4,0,129.8,462,3.85,257,42.8
+M1-B4B6-L4,loaded: READY queues behind granted DATA at the bottleneck,6,11988,600,3.64,32.37,70.74,108.47,214.4,5,134.8,215,1.79,87,14.5
+M1-B4B6-L4,loaded: READY queues behind granted DATA at the bottleneck,6,11988,600,3.64,32.37,70.74,108.47,214.4,10,139.8,160,1.33,65,10.8
+M1-B4B6-L4,loaded: READY queues behind granted DATA at the bottleneck,6,11988,600,3.64,32.37,70.74,108.47,214.4,15,144.8,116,0.97,48,8.0
+M1-B4B6-L4,loaded: READY queues behind granted DATA at the bottleneck,6,11988,600,3.64,32.37,70.74,108.47,214.4,20,149.8,89,0.74,39,6.5
+M1-B4B6-L4,loaded: READY queues behind granted DATA at the bottleneck,6,11988,600,3.64,32.37,70.74,108.47,214.4,30,159.8,49,0.41,25,4.2
