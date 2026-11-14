@@ -243,6 +243,19 @@ def test_production_round_over_udp_observes_each_resolved_grant_once(policy: str
         resolutions: list[dict] = []
         adapter.sample_hook = lambda e: resolutions.append(e) if e["event"] == "grant_resolved" else None
         spy = ObserveSpy(core.predictor)
+        # Pass-through spy: how many grants are still outstanding when the
+        # round's deadline fires (on the tick loop or otherwise). On localhost
+        # this can legitimately be zero: every grant issued before the rule (iv)
+        # cutoff may have been answered or timed out before D.
+        at_deadline: list[int] = []
+        on_deadline = core.on_deadline
+
+        def deadline_spy(t_ns):
+            if core.phase is GatewayPhase.ACTIVE:
+                at_deadline.append(sum(len(s.outstanding) for s in core.clients.values()))
+            return on_deadline(t_ns)
+
+        core.on_deadline = deadline_spy
         gateway = await UdpGateway.bind(core, local_addr=("127.0.0.1", 0), aggregate_handler=lambda agg: None)
         port = gateway.transport.get_extra_info("sockname")[1]
         clients = []
@@ -266,9 +279,9 @@ def test_production_round_over_udp_observes_each_resolved_grant_once(policy: str
             await gateway.close()
         after = (sum(s.n_resolved for s in core.clients.values()), len(spy.calls),
                  sum(primary._buf(c).total for c in core.clients) if policy == "FG-GRU" else None)
-        return core, spy, resolutions, before, after, [c.stats.round_end_timeouts for c in clients]
+        return core, spy, resolutions, before, after, [c.stats.round_end_timeouts for c in clients], at_deadline
 
-    core, spy, resolutions, before, after, client_fallbacks = asyncio.run(scenario())
+    core, spy, resolutions, before, after, client_fallbacks, at_deadline = asyncio.run(scenario())
     start, deadline = core.round.start_ns, core.round.deadline_ns
 
     assert core.phase is GatewayPhase.DEADLINE and client_fallbacks == [0] * N
@@ -283,11 +296,14 @@ def test_production_round_over_udp_observes_each_resolved_grant_once(policy: str
     assert len(per_grant) == core.next_grant_id - 1 and set(per_grant.values()) == {1}
     for (client, y, t_ns, obs), r in zip(spy.calls, resolutions, strict=True):
         assert (client, y, t_ns) == (r["client_id"], r["y"], r["t_ns"]) and obs[0] == y
-    # DATA, timeout and deadline resolutions are all present.
+    # DATA and timeout resolutions are present, and the deadline resolved
+    # exactly the grants still outstanding when it fired (possibly none; the
+    # deterministic deadline path is covered above).
     d_rel = deadline - start
     assert any(r["y"] == 1 for r in resolutions)
     assert any(r["y"] == 0 and r["t_ns"] < d_rel for r in resolutions)
-    assert any(r["y"] == 0 and r["t_ns"] == d_rel for r in resolutions)
+    assert len(at_deadline) == 1
+    assert sum(r["y"] == 0 and r["t_ns"] == d_rel for r in resolutions) == at_deadline[0]
     # Gateway accounting is unchanged by the observation path.
     delivered = sum(s.m for s in core.clients.values())
     assert core.stats.accepted_data == delivered == sum(len(b) for b in core.delivered_blocks.values())
