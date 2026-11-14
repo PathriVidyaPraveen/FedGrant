@@ -558,6 +558,20 @@ def _row_for_missing(job: Mapping[str, Any]) -> dict[str, Any]:
         str(job["policy"]), int(job["seed"]), int(job["n_rounds"]),
         cross_mbps=float(job["cross_mbps"]), status="missing",
     )
+def _round_probe_grants(result: Mapping[str, Any], metrics: Mapping[str, Any]) -> int | None:
+    """Probe grants issued in this round by a grant policy (rule (v) bounded probe).
+
+    Prefers the simulator's ``probe_grants`` metric; otherwise reads the round's
+    GatewayCore counter (reset at ROUND_START, kept through the drain, so it holds
+    this round's count when the round returns). None (blank) when neither exists.
+    """
+    if metrics.get("probe_grants") is not None:
+        return int(metrics["probe_grants"])
+    core = getattr(result.get("gateway"), "core", None)
+    value = getattr(core, "round_probe_grants", None)
+    return None if value is None else int(value)
+
+
 def _log_row(schema: str, **values: Any) -> dict[str, Any]:
     return {
         column: "" if values.get(column) is None else values.get(column, "")
@@ -758,6 +772,7 @@ def _write_simulator_run(
             grants_timed_out=metrics.get("grants_timed_out"),
             grant_rtt_samples=grant_rtt_count if not is_baseline else None,
             plan_data_rtt_samples=len(baseline_rtts) if is_baseline and policy_name == "B3" else None,
+            probe_grants=None if is_baseline else _round_probe_grants(result, metrics),
             queue_drops_data=metrics.get("drops_queue_data"),
             queueing_delay_mean_ms=metrics.get("queueing_delay_mean_ms"),
             queueing_delay_p99_ms=metrics.get("queueing_delay_p99_ms"),
