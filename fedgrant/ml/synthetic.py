@@ -30,7 +30,7 @@ from fedgrant.core.estimators import RateWindow, grant_timeout
 from fedgrant.core.state import ClientState, OutstandingGrant, values_from_energies
 from fedgrant.ml.schema import SPLITS, SplitRecorder
 from fedgrant.policy.constants import C, K, S
-from fedgrant.policy.eligibility import is_eligible
+from fedgrant.policy.eligibility import Reason, is_eligible
 from fedgrant.policy.features import GatewayView, features48, resolve_event
 from fedgrant.policy.pacing import p_target, pacing_p
 from fedgrant.policy.selectors import ValueSelector, value_key
@@ -181,6 +181,7 @@ def simulate_run(rec: SplitRecorder, seed: int, split: str, n_clients: int = N_C
             heapq.heappush(heap, (t, kind, seq, arg))
             seq += 1
 
+        probed: set[int] = set()                         # probe allowance resets at ROUND_START
         for i, st in enumerate(states):
             st.reset_round(K, round_start_ns=t0_abs)
             rho = int(rng_ready.random() * 0.1 * D)        # readiness delay U(0, 0.1 D)
@@ -235,7 +236,9 @@ def simulate_run(rec: SplitRecorder, seed: int, split: str, n_clients: int = N_C
                 return
             refresh_view(t)
             while True:
-                elig = [i for i in ids if is_eligible(states[i], t, D, pewma.value(i), cfg)[0]]
+                reasons = {i: is_eligible(states[i], t, D, pewma.value(i), cfg,
+                                          probe_available=i not in probed)[1] for i in ids}
+                elig = [i for i in ids if reasons[i] in (Reason.ELIGIBLE, Reason.PROBE)]
                 if not elig:
                     return
                 if rng_expl.random() < cfg.explore_eps:
@@ -251,6 +254,8 @@ def simulate_run(rec: SplitRecorder, seed: int, split: str, n_clients: int = N_C
                 p = pacing_p(pewma.value(i), cfg)
                 if not view.inflight.can_issue(p, view.P_target):
                     return
+                if reasons[i] is Reason.PROBE:
+                    probed.add(i)                            # allowance used up at issue
                 issue(i, t, p)
 
         while heap and heap[0][0] <= D:

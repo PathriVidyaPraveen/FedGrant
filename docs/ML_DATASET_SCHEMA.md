@@ -139,7 +139,11 @@ rec.save(f"data/mldata/{split}.npz")               # validates, then writes
 ```
 
 Generating policy (Section 4.5): selector `value`, P-EWMA for eligibility and pacing,
-exploration ε = 0.1 (Section 9), N = 20, 50 rounds per run. Train, validation and test-ID
+exploration ε = 0.1 (Section 9), N = 20, 50 rounds per run, with the 2026-11-13 CHANGELOG
+amendment to rule (v) (at most one probe grant per round for a client failing only rule (v)). Each split
+manifest records `policy.revision` = `fedgrant.policy.constants.POLICY_REVISION`;
+`ml.train` / `ml.train_all` refuse data from any other revision unless
+`--allow-stale-policy` is given (pipeline tests only). Train, validation and test-ID
 runs cycle through a seeded permutation of the full grid: constant or ID-trace capacity,
 π ∈ {0.02, 0.05, 0.10}, mean burst ∈ {1, 8, 32}, and β ∈ {0.05, 0.10, 0.20}. Test-OOD
 runs cycle through OOD-trace capacity, π ∈ {0.05, 0.15}, mean burst ∈ {8, 32}, and the

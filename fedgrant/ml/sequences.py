@@ -165,6 +165,31 @@ def resolve_split_path(data_dir: str | Path, split: str) -> Path:
     raise FileNotFoundError(f"neither {f} nor {d / split}/ exists")
 
 
+def check_policy_revision(data_dir: str | Path, splits: tuple[str, ...] = ("train", "val")) -> None:
+    """Refuse simulator data generated under another grant-policy revision.
+
+    Every datagen shard directory has a manifest.json whose policy.revision must
+    equal fedgrant.policy.constants.POLICY_REVISION; a manifest without one
+    predates the 2026-11-13 amendments. Single-file splits (DIR/<split>.npz,
+    e.g. the synthetic stand-in) carry no manifest and are not checked.
+    """
+    import json
+
+    from fedgrant.policy.constants import POLICY_REVISION
+
+    for split in splits:
+        manifest = resolve_split_path(data_dir, split) / "manifest.json"
+        if not manifest.is_file():
+            continue
+        found = json.loads(manifest.read_text(encoding="utf-8")).get("policy", {}).get("revision")
+        if found != POLICY_REVISION:
+            raise ValueError(
+                f"{manifest}: data generated under policy revision {found!r}, current is "
+                f"{POLICY_REVISION!r}; regenerate it with python -m fedgrant.ml.datagen "
+                "(or pass --allow-stale-policy for a pipeline test)"
+            )
+
+
 class GRUData:
     """Standardized P-GRU inputs of one split, gathered by sample index.
 

@@ -53,6 +53,9 @@ class PMLPNumpy:
         self.mu = np.asarray(d["mu_x48"], np.float64)
         self.s = np.asarray(d["s_x48"], np.float64)
         self.seed = int(d["seed"]) if "seed" in d else -1
+        # Warm up NumPy/BLAS once here: the first matmul of a process can take tens
+        # of ms and would trip the 2 ms wall-clock fallback (Section 9) in round 1.
+        stable_sigmoid(self.logits(np.zeros((2, 48), np.float32)))
 
     def reset_round(self, ctx: RoundCtx) -> None:
         """No state."""

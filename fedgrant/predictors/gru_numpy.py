@@ -87,6 +87,21 @@ class PGRUNumpy:
         self.seed = int(d["seed"]) if "seed" in d else -1
         self._c: dict[int, _ClientBuf] = {}
         self.n_recomputed = 0                # hidden states recomputed so far (diagnostics)
+        self._warm_up()
+
+    def _warm_up(self) -> None:
+        """Run every kernel once on throwaway inputs; no client state is touched.
+
+        The first matmul of a process can take tens of ms (BLAS start-up) and
+        would trip the 2 ms wall-clock fallback (Section 9) in round 1.
+        """
+        tmp = [_ClientBuf(), _ClientBuf()]
+        for b in tmp:
+            b.append(np.zeros(N_OBS, np.float32))
+        saved = self.n_recomputed
+        self._recompute(tmp)
+        self.n_recomputed = saved
+        stable_sigmoid(self._head(np.stack([b.h for b in tmp]), np.zeros((2, 16), np.float32)))
 
     # ------------------------------------------------------------------ Predictor
     def reset_round(self, ctx: RoundCtx) -> None:

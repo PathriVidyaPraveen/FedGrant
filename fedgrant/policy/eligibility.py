@@ -1,4 +1,17 @@
-"""Eligibility rule (Section 3.9): client i is eligible iff rules (i)-(v) all hold."""
+"""Eligibility rule (Section 3.9): client i is eligible iff rules (i)-(v) all hold.
+
+Bounded probe (CHANGELOG amendment, PROPOSED 2026-11-13): a client that passes
+rules (i)-(iv) and fails only rule (v) (p_hat < theta) is still a candidate,
+with Reason.PROBE, while its per-round probe allowance is unused. The caller
+owns the allowance: it resets at ROUND_START and is used up when a grant is
+ISSUED to a client whose reason was PROBE (not when it is selected). Selector,
+exploration, pacing (with the client's real p_hat), position, timeout and
+predictor feedback are all unchanged. Under A4 (pred_in_eligibility=False)
+rule (v) is off, so PROBE never occurs.
+
+Without the probe, rule (v) is absorbing: an ineligible client gets no grants,
+hence no outcomes, so p_hat never changes and the client is excluded for good.
+"""
 
 from __future__ import annotations
 
@@ -20,10 +33,16 @@ class Reason(IntEnum):
     CAP_REACHED = 3      # (iii)
     TOO_LATE = 4         # (iv)
     LOW_PREDICTION = 5   # (v)
+    PROBE = 6            # eligible: fails only (v), probe allowance unused this round
 
 
 def is_eligible(
-    state: ClientState, t_ns: int, D_ns: int, p_hat: float, cfg: PolicyConfig
+    state: ClientState,
+    t_ns: int,
+    D_ns: int,
+    p_hat: float,
+    cfg: PolicyConfig,
+    probe_available: bool = False,
 ) -> tuple[bool, Reason]:
     """Rules (i)-(v) of Section 3.9, checked in order; returns (eligible, reason).
 
@@ -32,6 +51,10 @@ def is_eligible(
     (iii) outstanding_i < cap_i.
     (iv)  t + srtt_i + 2 ms <= D.
     (v)   p_hat_i(t) >= theta = 0.05; skipped when cfg.pred_in_eligibility is False (A4).
+          If only (v) fails and probe_available is True, returns (True, PROBE).
+
+    probe_available: the client's per-round probe allowance is unused. The
+    default False gives the unamended rule; callers must pass it explicitly.
     """
     if not state.ready:
         return False, Reason.NOT_READY
@@ -42,5 +65,7 @@ def is_eligible(
     if t_ns + state.srtt_ns + DEADLINE_MARGIN_NS > D_ns:
         return False, Reason.TOO_LATE
     if cfg.pred_in_eligibility and not p_hat >= THETA:      # NaN fails too
+        if probe_available:
+            return True, Reason.PROBE
         return False, Reason.LOW_PREDICTION
     return True, Reason.ELIGIBLE
