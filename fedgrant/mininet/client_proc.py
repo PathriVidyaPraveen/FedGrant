@@ -57,7 +57,11 @@ def make_update_provider(args: argparse.Namespace):
 async def run(args: argparse.Namespace) -> None:
     update_provider = PrefetchedUpdates(make_update_provider(args), args.rounds)
     update_provider.prefetch(1)
-    core = ClientCore(args.client_id)
+    # Network-only Mininet runs (M1, smoke): each round's update is the bank
+    # profile itself, so error feedback stays off (decision D-19, as in the B1-B3
+    # clients). With it on, undelivered residuals would change the READY energies
+    # away from the profile the M-sim twin receives. Real FL (M2) is not this path.
+    core = ClientCore(args.client_id, error_feedback=False)
 
     packet_path = Path(args.log_file).with_name(f"client_{args.client_id}_packets.csv")
     packet_stream = packet_path.open("w", newline="", encoding="utf-8")

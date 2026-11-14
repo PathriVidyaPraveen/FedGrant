@@ -225,7 +225,8 @@ def plot_replay(rows: list[dict], lags: dict[str, np.ndarray], path: Path, *, mi
 
 # --- READY amendment validation (CHANGELOG 2026-11-13) ---------------------------------
 
-READY_RUNS = (("scale-L2-N20", "section7"), ("ready-lossless-L2-N20", "ready_lossless"))
+READY_RUNS = (("scale-L2-N20", "section7"), ("ready-lossless-L2-N20", "ready_lossless"),
+              ("ready-timing-L2-N20", "ready_lossless+receipt_timer"))
 
 
 def ready_validation(runs_root: Path, changelog: Path) -> tuple[list[dict], list[dict], dict] | None:
@@ -279,6 +280,61 @@ def ready_validation(runs_root: Path, changelog: Path) -> tuple[list[dict], list
     amendment = [line for line in changelog.read_text(encoding="utf-8").splitlines()
                  if "Client uplink loss scope" in line] if changelog.is_file() else []
     return runs, rounds_out, {"runs": configs, "changelog_amendment": amendment}
+
+
+# --- READY timing against the readiness model -----------------------------------------------
+
+READY_TIMING_RUNS = ("ready-lossless-L2-N20", "ready-timing-L2-N20")
+
+
+def ready_timing(runs_root: Path) -> list[dict]:
+    """READY timing residuals per run (timer origin = client receipt of ROUND_START).
+
+    For each client-round, with rho_i recomputed from the seeded stream and the
+    one-way control path delta_i + 5 ms (reverse access + gateway egress):
+      send residual    = READY sent - ROUND_START sent - (delta_i + 5 ms) - rho_i
+      arrival residual = READY received - ROUND_START sent - 2 (delta_i + 5 ms) - rho_i
+    Both should be close to 0 once the client schedules READY from receipt.
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from fedgrant.mininet.round_loop import readiness_delays_us
+    from fedgrant.mininet.topo import client_parameters
+
+    rows = []
+    for name in READY_TIMING_RUNS:
+        root = runs_root / name
+        if not (root / "packets.csv").is_file() or not (root / "meta.json").is_file():
+            print(f"skip: {root} not found", file=sys.stderr)
+            continue
+        meta = json.loads((root / "meta.json").read_text(encoding="utf-8"))
+        n, seed, duration = int(meta["N"]), int(meta["seed"]), int(meta["duration_ns"])
+        rs_sent, ready_sent, ready_recv = {}, {}, {}
+        with (root / "packets.csv").open(newline="", encoding="utf-8") as stream:
+            for r in csv.DictReader(stream):
+                key = (int(r["round_id"] or 0), int(r["client_id"] or -1))
+                if r["packet_type"] == "ROUND_START" and r["direction"] == "sent":
+                    rs_sent[key] = int(r["t_mono_ns"])
+                elif r["packet_type"] == "READY":
+                    (ready_sent if r["direction"] == "sent" else ready_recv)[key] = int(r["t_mono_ns"])
+        send_res, arrival_res = [], []
+        for (rid, cid), t_send in ready_sent.items():
+            if (rid, cid) not in rs_sent:
+                continue
+            rho = readiness_delays_us(seed, rid, n, duration)[cid] * 1000
+            path = (client_parameters(cid).delay_ms + 5) * 1_000_000
+            send_res.append((t_send - rs_sent[(rid, cid)] - path - rho) / 1e6)
+            if (rid, cid) in ready_recv:
+                arrival_res.append((ready_recv[(rid, cid)] - rs_sent[(rid, cid)] - 2 * path - rho) / 1e6)
+        if not send_res:
+            continue
+        s_arr, a_arr = np.asarray(send_res), np.asarray(arrival_res)
+        rows.append({"run": name, "readies": s_arr.size,
+                     "send_residual_p50_ms": f"{np.percentile(s_arr, 50):.3f}",
+                     "send_residual_p99_ms": f"{np.percentile(s_arr, 99):.3f}",
+                     "send_residual_max_ms": f"{s_arr.max():.3f}",
+                     "arrival_residual_p50_ms": f"{np.percentile(a_arr, 50):.3f}" if a_arr.size else "",
+                     "arrival_residual_p99_ms": f"{np.percentile(a_arr, 99):.3f}" if a_arr.size else ""})
+    return rows
 
 
 # --- LaTeX tables ----------------------------------------------------------------------------------
@@ -342,6 +398,9 @@ def main(argv: list[str] | None = None) -> None:
         _write_csv(summary / "testbed_ready_rounds.csv", list(rounds[0]), rounds)
         (summary / "testbed_ready_validation.json").write_text(
             json.dumps(evidence, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    timing = ready_timing(Path(args.runs_root))
+    if timing:
+        _write_csv(summary / "testbed_ready_timing.csv", list(timing[0]), timing)
     (summary / "testbed_tables.tex").write_text(latex_tables(ge, traces, replay), encoding="utf-8")
     print(f"GE scenarios: {len(ge)}, trace segments: {len(traces)}, replay runs: {len(replay)}")
 

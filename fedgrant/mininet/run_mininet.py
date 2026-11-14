@@ -125,6 +125,11 @@ def run_identity(experiment_id: str | None, policy: str | None, gateway_factory:
     B1/B2/B3 run their own gateway/client processes, so --gateway-factory
     does not apply to them.
     """
+    if experiment_id == "M2":
+        # M2 is end-to-end FL over Mininet; this runner launches network-only
+        # clients (bank profiles, no training), so it must never emit M2 results.
+        raise ValueError("experiment M2 needs the FL server/client workflow on Mininet, which is not "
+                         "integrated; this runner only produces network-only runs (M1, smoke)")
     if policy in BASELINE_MODES:
         return str(experiment_id or STUB_EXPERIMENT_ID), str(policy)
     is_stub = gateway_factory == DEFAULT_STUB_FACTORY
@@ -344,10 +349,15 @@ def run_experiment(*, n: int, scenario: str, seed: int, rounds: int, beta: float
     if not stub_run and policy not in GRANT_POLICIES and policy not in BASELINE_MODES:
         raise ValueError(f"policy {policy!r} has no Mininet implementation; "
                          f"expected one of {sorted(GRANT_POLICIES | set(BASELINE_MODES))}")
-    if experiment_id in MININET_EXPERIMENTS:
-        # Spec Section 5.2/12: real runs use the FULL value bank and always
-        # record gateway CPU/RSS (sampling is otherwise opt-in).
+    if not stub_run:
+        # Production policies always use the FULL value bank (spec Section 5.2):
+        # the gateway takes its client weights from it and clients their
+        # profiles. Without this the grant clients fell back to synthetic
+        # profiles and uniform weights while the B1-B3 processes silently used
+        # the bank, and meta.json mislabelled both.
         value_bank = value_bank or DEFAULT_VALUE_BANK
+    if experiment_id in MININET_EXPERIMENTS:
+        # Real runs always record gateway CPU/RSS (sampling is otherwise opt-in).
         profile_gateway = True
     if value_bank is not None and not Path(value_bank).is_file():
         raise FileNotFoundError(f"value bank not found: {value_bank} (get it from the FULL seed-0 run)")
@@ -647,7 +657,14 @@ def resolve_cli(argv: list[str] | None = None) -> dict:
     return settings
 
 
+def _terminate_as_interrupt(signum, frame) -> None:
+    # SIGTERM (e.g. from a job runner) gets the same cleanup path as Ctrl+C.
+    raise KeyboardInterrupt(f"signal {signum}")
+
+
 def main(argv: list[str] | None = None) -> None:
+    import signal
+    signal.signal(signal.SIGTERM, _terminate_as_interrupt)
     s = resolve_cli(argv)
     if hasattr(os, "geteuid") and os.geteuid() != 0:
         # Check before creating the run directory, so a forgotten sudo leaves nothing behind.
