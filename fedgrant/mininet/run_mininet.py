@@ -145,6 +145,47 @@ def run_identity(experiment_id: str | None, policy: str | None, gateway_factory:
     return str(experiment_id), str(policy)
 
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
+# Where the policy-revision stamp (CHANGELOG eligibility amendment) may live;
+# the first module that defines POLICY_REVISION wins.
+_POLICY_REVISION_MODULES = ("fedgrant.policy.eligibility", "fedgrant.policy.constants", "fedgrant.ml.datagen")
+
+
+def policy_revision() -> str | None:
+    """POLICY_REVISION of the grant-policy code (None before the stamp existed)."""
+    import importlib
+    for name in _POLICY_REVISION_MODULES:
+        try:
+            value = getattr(importlib.import_module(name), "POLICY_REVISION", None)
+        except Exception:  # an optional module (e.g. ML) may not import on a lean install
+            continue
+        if value is not None:
+            return str(value)
+    return None
+
+
+def code_provenance(repo: Path = REPO_ROOT) -> dict:
+    """Code version that produced a run: git commit, uncommitted changes, policy revision.
+
+    Runs execute under sudo while the checkout belongs to the user, so git is told
+    to trust this one directory (safe.directory) instead of refusing to answer.
+    Outside a git checkout (e.g. a source tarball) the commit fields are None.
+    """
+    def git(*args: str) -> str | None:
+        try:
+            done = subprocess.run(["git", "-c", f"safe.directory={repo}", "-C", str(repo), *args],
+                                  capture_output=True, text=True, timeout=10, check=True)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return done.stdout.rstrip("\n")  # keep porcelain's leading status columns
+
+    commit = git("rev-parse", "HEAD")
+    status = git("status", "--porcelain", "--untracked-files=no") if commit else None
+    changed = [line[3:] for line in status.splitlines()] if status else []
+    return {"git_commit": commit, "git_dirty": bool(changed) if commit else None,
+            "git_changed_files": changed[:50], "policy_revision": policy_revision()}
+
+
 class _QueueSampler:
     def __init__(self, net, path: Path, interfaces: list[tuple[str, str]], interval_s: float = 0.01,
                  cpu_id: int | None = None, round_state_path: Path | None = None):
@@ -369,7 +410,7 @@ def run_experiment(*, n: int, scenario: str, seed: int, rounds: int, beta: float
     out.mkdir(parents=True, exist_ok=True)
     identity = {"experiment_id": experiment_id, "policy": policy, "scenario": scenario,
                 "seed": int(seed), "N": int(n), "beta": float(beta), "cross_mbps": float(cross_mbps),
-                "n_rounds": int(rounds), "platform": "mininet"}
+                "n_rounds": int(rounds), "platform": "mininet", "provenance": code_provenance()}
     started = time.monotonic_ns()
     roles = cpu_roles()
     net = None

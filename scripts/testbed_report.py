@@ -333,7 +333,93 @@ def ready_timing(runs_root: Path) -> list[dict]:
                      "send_residual_p99_ms": f"{np.percentile(s_arr, 99):.3f}",
                      "send_residual_max_ms": f"{s_arr.max():.3f}",
                      "arrival_residual_p50_ms": f"{np.percentile(a_arr, 50):.3f}" if a_arr.size else "",
-                     "arrival_residual_p99_ms": f"{np.percentile(a_arr, 99):.3f}" if a_arr.size else ""})
+                     "arrival_residual_p99_ms": f"{np.percentile(a_arr, 99):.3f}" if a_arr.size else "",
+                     "arrival_residual_max_ms": f"{a_arr.max():.3f}" if a_arr.size else ""})
+    return rows
+
+
+# --- B3 plan-time cutoff against measured READY arrivals -------------------------------------------
+
+B3_CUTOFF_GROUPS = (
+    # (label, run-directory glob, READY path condition)
+    ("ready-timing-L2-N20", "ready-timing-L2-N20", "quiet: no DATA queued ahead of READY (as in B3 before t_plan)"),
+    ("M1-B4B6-L2", "M1/L2-B[46]-s[0-9]", "loaded: READY queues behind granted DATA at the bottleneck"),
+    ("M1-B4B6-L4", "M1/L4-B[46]-s[0-9]", "loaded: READY queues behind granted DATA at the bottleneck"),
+)
+B3_MARGINS_MS = (0, 5, 10, 15, 20, 30)
+
+
+def _ready_arrivals(root: Path) -> tuple[int, list[tuple[int, float, float]]]:
+    """(D_ns, [(round, arrival offset ms, arrival residual ms)]) for every received READY.
+
+    offset   = READY received - ROUND_START sent (gateway clock)
+    residual = offset - 2 (delta_i + 5 ms) - rho_i   (the approved timing model)
+    """
+    from fedgrant.mininet.round_loop import readiness_delays_us
+    from fedgrant.mininet.topo import client_parameters
+
+    meta = json.loads((root / "meta.json").read_text(encoding="utf-8"))
+    n, seed, duration = int(meta["N"]), int(meta["seed"]), int(meta["duration_ns"])
+    rs_sent, ready_recv = {}, {}
+    with (root / "packets.csv").open(newline="", encoding="utf-8") as stream:
+        for r in csv.DictReader(stream):
+            if r["packet_type"] not in ("ROUND_START", "READY"):
+                continue
+            key = (int(r["round_id"] or 0), int(r["client_id"] or -1))
+            if r["packet_type"] == "ROUND_START" and r["direction"] == "sent":
+                rs_sent[key] = int(r["t_mono_ns"])
+            elif r["packet_type"] == "READY" and r["direction"] == "received":
+                ready_recv.setdefault(key, int(r["t_mono_ns"]))
+    out = []
+    for (rid, cid), t_recv in ready_recv.items():
+        if (rid, cid) not in rs_sent:
+            continue
+        rho_ns = readiness_delays_us(seed, rid, n, duration)[cid] * 1000
+        path_ns = (client_parameters(cid).delay_ms + 5) * 1_000_000
+        offset = (t_recv - rs_sent[(rid, cid)]) / 1e6
+        out.append((rid, offset, offset - (2 * path_ns + rho_ns) / 1e6))
+    return duration, out
+
+
+def b3_ready_cutoff(runs_root: Path) -> list[dict]:
+    """READYs that would miss a B3 cutoff t_plan = 0.1 D + 2 (delta_max + 5 ms) + margin.
+
+    delta_max = 40 ms, so the zero-margin cutoff is 0.1 D + 90 ms (129.8 ms at
+    beta = 0.10). A round is affected if any of its READYs misses the cutoff.
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    rows = []
+    for label, pattern, path in B3_CUTOFF_GROUPS:
+        dirs = sorted(p for p in runs_root.glob(pattern) if (p / "meta.json").is_file() and (p / "packets.csv").is_file())
+        if not dirs:
+            print(f"skip: no runs for {label} under {runs_root}", file=sys.stderr)
+            continue
+        offsets, residuals, per_round, durations = [], [], {}, set()
+        for root in dirs:
+            duration, arrivals = _ready_arrivals(root)
+            durations.add(duration)
+            for rid, offset, residual in arrivals:
+                offsets.append(offset)
+                residuals.append(residual)
+                per_round.setdefault((root.name, rid), []).append(offset)
+        if len(durations) != 1 or not offsets:
+            continue
+        off, res = np.asarray(offsets), np.asarray(residuals)
+        base = 0.1 * durations.pop() / 1e6 + 2 * (40 + 5)
+        for margin in B3_MARGINS_MS:
+            cutoff = base + margin
+            late_rounds = sum(any(o > cutoff for o in v) for v in per_round.values())
+            rows.append({"group": label, "ready_path": path, "runs": len(dirs), "readies": off.size,
+                         "rounds": len(per_round),
+                         "residual_p50_ms": f"{np.percentile(res, 50):.2f}",
+                         "residual_p99_ms": f"{np.percentile(res, 99):.2f}",
+                         "residual_p999_ms": f"{np.percentile(res, 99.9):.2f}",
+                         "residual_max_ms": f"{res.max():.2f}", "latest_arrival_ms": f"{off.max():.1f}",
+                         "margin_ms": margin, "cutoff_ms": f"{cutoff:.1f}",
+                         "readies_missed": int((off > cutoff).sum()),
+                         "readies_missed_pct": f"{100 * (off > cutoff).mean():.2f}",
+                         "rounds_affected": late_rounds,
+                         "rounds_affected_pct": f"{100 * late_rounds / len(per_round):.1f}"})
     return rows
 
 
@@ -401,6 +487,9 @@ def main(argv: list[str] | None = None) -> None:
     timing = ready_timing(Path(args.runs_root))
     if timing:
         _write_csv(summary / "testbed_ready_timing.csv", list(timing[0]), timing)
+    cutoff = b3_ready_cutoff(Path(args.runs_root))
+    if cutoff:
+        _write_csv(summary / "testbed_b3_ready_cutoff.csv", list(cutoff[0]), cutoff)
     (summary / "testbed_tables.tex").write_text(latex_tables(ge, traces, replay), encoding="utf-8")
     print(f"GE scenarios: {len(ge)}, trace segments: {len(traces)}, replay runs: {len(replay)}")
 
