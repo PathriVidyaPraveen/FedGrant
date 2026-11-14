@@ -125,6 +125,11 @@ def run_identity(experiment_id: str | None, policy: str | None, gateway_factory:
     B1/B2/B3 run their own gateway/client processes, so --gateway-factory
     does not apply to them.
     """
+    if experiment_id == "M2":
+        # M2 is end-to-end FL over Mininet; this runner launches network-only
+        # clients (bank profiles, no training), so it must never emit M2 results.
+        raise ValueError("experiment M2 needs the FL server/client workflow on Mininet, which is not "
+                         "integrated; this runner only produces network-only runs (M1, smoke)")
     if policy in BASELINE_MODES:
         return str(experiment_id or STUB_EXPERIMENT_ID), str(policy)
     is_stub = gateway_factory == DEFAULT_STUB_FACTORY
@@ -138,6 +143,47 @@ def run_identity(experiment_id: str | None, policy: str | None, gateway_factory:
             "pass the production --gateway-factory for M1/M2 runs"
         )
     return str(experiment_id), str(policy)
+
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+# Where the policy-revision stamp (CHANGELOG eligibility amendment) may live;
+# the first module that defines POLICY_REVISION wins.
+_POLICY_REVISION_MODULES = ("fedgrant.policy.eligibility", "fedgrant.policy.constants", "fedgrant.ml.datagen")
+
+
+def policy_revision() -> str | None:
+    """POLICY_REVISION of the grant-policy code (None before the stamp existed)."""
+    import importlib
+    for name in _POLICY_REVISION_MODULES:
+        try:
+            value = getattr(importlib.import_module(name), "POLICY_REVISION", None)
+        except Exception:  # an optional module (e.g. ML) may not import on a lean install
+            continue
+        if value is not None:
+            return str(value)
+    return None
+
+
+def code_provenance(repo: Path = REPO_ROOT) -> dict:
+    """Code version that produced a run: git commit, uncommitted changes, policy revision.
+
+    Runs execute under sudo while the checkout belongs to the user, so git is told
+    to trust this one directory (safe.directory) instead of refusing to answer.
+    Outside a git checkout (e.g. a source tarball) the commit fields are None.
+    """
+    def git(*args: str) -> str | None:
+        try:
+            done = subprocess.run(["git", "-c", f"safe.directory={repo}", "-C", str(repo), *args],
+                                  capture_output=True, text=True, timeout=10, check=True)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return done.stdout.rstrip("\n")  # keep porcelain's leading status columns
+
+    commit = git("rev-parse", "HEAD")
+    status = git("status", "--porcelain", "--untracked-files=no") if commit else None
+    changed = [line[3:] for line in status.splitlines()] if status else []
+    return {"git_commit": commit, "git_dirty": bool(changed) if commit else None,
+            "git_changed_files": changed[:50], "policy_revision": policy_revision()}
 
 
 class _QueueSampler:
@@ -344,10 +390,15 @@ def run_experiment(*, n: int, scenario: str, seed: int, rounds: int, beta: float
     if not stub_run and policy not in GRANT_POLICIES and policy not in BASELINE_MODES:
         raise ValueError(f"policy {policy!r} has no Mininet implementation; "
                          f"expected one of {sorted(GRANT_POLICIES | set(BASELINE_MODES))}")
-    if experiment_id in MININET_EXPERIMENTS:
-        # Spec Section 5.2/12: real runs use the FULL value bank and always
-        # record gateway CPU/RSS (sampling is otherwise opt-in).
+    if not stub_run:
+        # Production policies always use the FULL value bank (spec Section 5.2):
+        # the gateway takes its client weights from it and clients their
+        # profiles. Without this the grant clients fell back to synthetic
+        # profiles and uniform weights while the B1-B3 processes silently used
+        # the bank, and meta.json mislabelled both.
         value_bank = value_bank or DEFAULT_VALUE_BANK
+    if experiment_id in MININET_EXPERIMENTS:
+        # Real runs always record gateway CPU/RSS (sampling is otherwise opt-in).
         profile_gateway = True
     if value_bank is not None and not Path(value_bank).is_file():
         raise FileNotFoundError(f"value bank not found: {value_bank} (get it from the FULL seed-0 run)")
@@ -359,7 +410,7 @@ def run_experiment(*, n: int, scenario: str, seed: int, rounds: int, beta: float
     out.mkdir(parents=True, exist_ok=True)
     identity = {"experiment_id": experiment_id, "policy": policy, "scenario": scenario,
                 "seed": int(seed), "N": int(n), "beta": float(beta), "cross_mbps": float(cross_mbps),
-                "n_rounds": int(rounds), "platform": "mininet"}
+                "n_rounds": int(rounds), "platform": "mininet", "provenance": code_provenance()}
     started = time.monotonic_ns()
     roles = cpu_roles()
     net = None
@@ -647,7 +698,14 @@ def resolve_cli(argv: list[str] | None = None) -> dict:
     return settings
 
 
+def _terminate_as_interrupt(signum, frame) -> None:
+    # SIGTERM (e.g. from a job runner) gets the same cleanup path as Ctrl+C.
+    raise KeyboardInterrupt(f"signal {signum}")
+
+
 def main(argv: list[str] | None = None) -> None:
+    import signal
+    signal.signal(signal.SIGTERM, _terminate_as_interrupt)
     s = resolve_cli(argv)
     if hasattr(os, "geteuid") and os.geteuid() != 0:
         # Check before creating the run directory, so a forgotten sudo leaves nothing behind.

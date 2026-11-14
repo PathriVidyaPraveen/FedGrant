@@ -2,7 +2,7 @@ PYTHON ?= python3
 PYTEST ?= $(PYTHON) -m pytest
 RUNS ?= results/summary/runs.csv
 
-.PHONY: help install install-ml test test-pure test-ml test-mininet trace-fetch trace-bin data mininet-smoke mininet mininet-run metrics calibrate plots grid-net grid-fl docker-build docker-test testbed-report
+.PHONY: help install install-ml test test-pure test-ml test-mininet trace-fetch trace-bin data mininet-smoke mininet mininet-run metrics calibrate plots grid-net grid-fl docker-build docker-test docker-m1-prepare docker-m1 testbed-report
 
 help:
 	@printf '%s\n' 'install       Install Python dependencies from docker/requirements.lock' \
@@ -24,7 +24,9 @@ help:
 	  'plots         Generate analysis plots from RUNS' \
 	  'testbed-report Regenerate testbed/trace tables and figures from raw artifacts' \
 	  'docker-build  Build the reproducibility image (docker or podman)' \
-	  'docker-test   Build the image and run the unit suite inside it'
+	  'docker-test   Build the image and run the unit suite inside it' \
+	  'docker-m1-prepare  TRACES=<mahimahi traces dir> BANK=<dir with femnist_full_s0.npz>: inputs -> data/' \
+	  'docker-m1     As root: reproduce M1 runs in a privileged container [M1_RUNS="L2 B2 0 L4 B2 0"]'
 
 install:
 	$(PYTHON) -m pip install -r docker/requirements.lock
@@ -97,3 +99,24 @@ docker-build:
 
 docker-test: docker-build
 	$(CONTAINER) run --rm $(IMAGE)
+
+# Non-author M1 reproduction (docs/DOCKER_M1_REPRODUCTION.md). Run both targets
+# with sudo: docker-m1 needs a privileged container (network namespaces, tc, Open
+# vSwitch), and with podman root has its own image store, built by docker-build
+# under the same sudo. The container keeps its own PID namespace, so cleanup
+# inside it can never signal host processes.
+M1_RUNS ?= L2 B2 0 L4 B2 0
+M1_MOUNTS = -v $(CURDIR)/data:/workspace/FedGrant/data -v $(CURDIR)/results/mininet:/workspace/FedGrant/results/mininet
+
+docker-m1-prepare: docker-build
+	@test -n "$(TRACES)" -a -n "$(BANK)" || (echo 'Set TRACES=<mahimahi traces dir> BANK=<dir with femnist_full_s0.npz>' >&2; exit 2)
+	mkdir -p data results/mininet
+	$(CONTAINER) run --rm --security-opt label=disable $(M1_MOUNTS) \
+	  -v $(abspath $(TRACES)/..):/in/src:ro -v $(abspath $(BANK)):/in/bank:ro \
+	  -e TRACES_SUBDIR=$(notdir $(abspath $(TRACES))) $(IMAGE) docker/m1_repro.sh prepare
+
+docker-m1: docker-build
+	@test "$$(id -u)" = 0 || (echo 'docker-m1 needs root (privileged container): sudo make docker-m1' >&2; exit 2)
+	mkdir -p results/mininet
+	$(CONTAINER) run --rm --privileged --init --stop-timeout 150 $(M1_MOUNTS) \
+	  $(IMAGE) docker/m1_repro.sh run $(M1_RUNS)

@@ -107,4 +107,4 @@ make docker-build
 docker run --rm fedgrant-testbed
 ```
 
-The Docker image pins the project runtime to Python 3.11 and runs the non-root unit suite. Mininet tests still require a compatible host kernel, Open vSwitch, and elevated network-namespace access. There is no final LaTeX report in this checkout yet; the Tejaswi testbed/traces report draft is [docs/TESTBED_TRACES_REPORT.md](docs/TESTBED_TRACES_REPORT.md).
+The Docker image pins the project runtime to Python 3.11 and runs the non-root unit suite. To reproduce M1 Mininet runs in a privileged container and check them against the committed reference fingerprints, follow [docs/DOCKER_M1_REPRODUCTION.md](docs/DOCKER_M1_REPRODUCTION.md) (`sudo make docker-m1-prepare TRACES=... BANK=...`, then `sudo make docker-m1`). Mininet tests still require a compatible host kernel, Open vSwitch, and elevated network-namespace access. There is no final LaTeX report in this checkout yet; the Tejaswi testbed/traces report draft is [docs/TESTBED_TRACES_REPORT.md](docs/TESTBED_TRACES_REPORT.md).
