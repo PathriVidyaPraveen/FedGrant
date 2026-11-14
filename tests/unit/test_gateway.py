@@ -882,3 +882,174 @@ def test_data_message_does_not_treat_explicit_invalid_block_length_as_default() 
     assert gateway.on_data_message(packet, block_length=0) == []
     assert state.m == 0
     assert gateway.stats.rejected_data == 1
+
+
+# -- stale-round DATA accounting -------------------------------------------------
+
+
+def wire_data(round_id: int, *, grant_id: int = 1, send_pos: int = 1, block_idx: int = 0) -> bytes:
+    return encode_message(
+        MessageType.DATA,
+        round_id=round_id,
+        client_id=1,
+        t_send_ns=0,
+        block_length=2,
+        body={
+            "grant_id": grant_id,
+            "send_pos": send_pos,
+            "block_idx": block_idx,
+            "n_coords": 2,
+            "payload": [1.0, 0.0],
+        },
+    )
+
+
+def round_snapshot(gateway, state) -> tuple:
+    return (
+        gateway.round,
+        gateway.phase,
+        gateway.next_grant_id,
+        dict(state.outstanding),
+        state.status.copy().tolist(),
+        state.m,
+        dict(state.delivered_payloads),
+        {cid: set(blocks) for cid, blocks in gateway.delivered_blocks.items()},
+        {cid: dict(grants) for cid, grants in gateway.resolved_grants.items()},
+        len(gateway.estimator.resolutions),
+        gateway.stats.accepted_data,
+        gateway.stats.late_after_deadline,
+    )
+
+
+def start_round_8_with_grant_outstanding():
+    gateway, state = make_gateway()
+    ready(gateway)
+    gateway.on_deadline(1000)
+    gateway.on_round_start(1100, round_id=8, deadline_ns=2000, K=3, L=2)
+    assert gateway.on_ready(1, [4.0, 2.0, 0.0], 1200) == [SendGrant(1, 1, 1)]
+    return gateway, state
+
+
+def test_previous_round_data_is_stale_and_mutates_nothing() -> None:
+    gateway, state = start_round_8_with_grant_outstanding()
+    before = round_snapshot(gateway, state)
+    stats_before = (gateway.stats.rejected_data, gateway.stats.invalid_events)
+
+    # Same grant id and position as the live round-8 grant: only round_id differs.
+    assert gateway.on_data_message(wire_data(7), block_length=2, received_at_ns=1205) == []
+
+    assert gateway.stats.stale_round_data == 1
+    assert (gateway.stats.rejected_data, gateway.stats.invalid_events) == (
+        stats_before[0] + 1,
+        stats_before[1] + 1,
+    )
+    assert gateway.stats.late_after_deadline == 0
+    assert round_snapshot(gateway, state) == before
+
+    # The live grant was not consumed: the real round-8 DATA is still accepted.
+    gateway.on_data_message(wire_data(8), block_length=2, received_at_ns=1205)
+    assert gateway.stats.accepted_data == 1 and state.m == 1
+    assert gateway.stats.stale_round_data == 1
+    actions = gateway.on_deadline(2000)
+    assert EmitAggregate(((1, 1),)) in actions  # only the valid round-8 block
+
+
+def test_future_and_unrelated_round_data_count_once_per_packet() -> None:
+    gateway, state = start_round_8_with_grant_outstanding()
+    before = round_snapshot(gateway, state)
+    aggregate_calls = gateway.aggregate.calls  # round 7's deadline already aggregated once
+
+    for round_id in (9, 1234, 1):  # future, unrelated, much older
+        assert gateway.on_data_message(wire_data(round_id), block_length=2, received_at_ns=1205) == []
+    stale = wire_data(7)
+    for _ in range(3):  # repeated copies are separate packets
+        gateway.on_data_message(stale, block_length=2, received_at_ns=1205)
+
+    assert gateway.stats.stale_round_data == 6
+    assert gateway.stats.rejected_data == 6 and gateway.stats.invalid_events == 6
+    assert gateway.stats.late_after_deadline == 0
+    assert round_snapshot(gateway, state) == before
+    assert gateway.aggregate.calls == aggregate_calls
+
+
+def test_stale_data_from_unknown_client_is_counted_as_bad_client_only() -> None:
+    gateway, _ = start_round_8_with_grant_outstanding()
+    packet = encode_message(
+        MessageType.DATA,
+        round_id=7,
+        client_id=99,
+        t_send_ns=0,
+        block_length=2,
+        body={"grant_id": 1, "send_pos": 1, "block_idx": 0, "n_coords": 2, "payload": [1.0, 0.0]},
+    )
+    assert gateway.on_data_message(packet, block_length=2, received_at_ns=1205) == []
+    assert gateway.stats.bad_client_id == 1 and gateway.stats.stale_round_data == 0
+    assert gateway.stats.rejected_data == 1
+
+
+def test_data_before_any_round_started_is_stale() -> None:
+    # No round has started, so no round_id is current (the existing contract
+    # rejects it in the same branch as a mismatched round).
+    state = ClientState(1, 0.5, K=3)
+    gateway = GatewayCore({1: state}, estimator=FakeEstimator(), aggregate=FakeAggregate())
+    assert gateway.round is None and gateway.phase is GatewayPhase.IDLE
+
+    assert gateway.on_data_message(wire_data(1), block_length=2, received_at_ns=50) == []
+
+    assert gateway.stats.stale_round_data == 1 and gateway.stats.rejected_data == 1
+    assert gateway.stats.late_after_deadline == 0
+    assert gateway.round is None and gateway.phase is GatewayPhase.IDLE
+    assert state.m == 0 and state.outstanding == {} and gateway.estimator.resolutions == []
+
+
+def test_same_round_data_in_drain_is_late_not_stale() -> None:
+    gateway, state = make_gateway()
+    ready(gateway)
+    gateway.on_deadline(1000)
+    assert gateway.phase is GatewayPhase.DEADLINE
+    before = round_snapshot(gateway, state)[:10]
+
+    assert gateway.on_data_message(wire_data(7), block_length=2, received_at_ns=1050) == []
+
+    assert gateway.stats.late_after_deadline == 1
+    assert gateway.stats.stale_round_data == 0
+    assert gateway.stats.rejected_data == 0
+    assert round_snapshot(gateway, state)[:10] == before
+
+
+def test_stale_and_late_counters_are_cumulative_across_round_transitions() -> None:
+    gateway, state = make_gateway()  # round 7
+    ready(gateway)
+    gateway.on_deadline(1000)
+    gateway.on_data_message(wire_data(7), block_length=2, received_at_ns=1050)  # late, drain of 7
+
+    gateway.on_round_start(1100, round_id=8, deadline_ns=2000, K=3, L=2)
+    gateway.on_data_message(wire_data(7), block_length=2, received_at_ns=1150)  # stale in 8
+    gateway.on_deadline(2000)
+    gateway.on_data_message(wire_data(8), block_length=2, received_at_ns=2050)  # late, drain of 8
+    gateway.on_data_message(wire_data(9), block_length=2, received_at_ns=2060)  # future, stale
+
+    gateway.on_round_start(2100, round_id=9, deadline_ns=3000, K=3, L=2)
+    assert (gateway.stats.stale_round_data, gateway.stats.late_after_deadline) == (2, 2)  # not reset
+    gateway.on_data_message(wire_data(7), block_length=2, received_at_ns=2150)
+    gateway.on_data_message(wire_data(8), block_length=2, received_at_ns=2160)
+
+    assert gateway.stats.stale_round_data == 4
+    assert gateway.stats.late_after_deadline == 2
+    assert gateway.stats.rejected_data == 4
+    assert gateway.stats.accepted_data == 0 and state.m == 0
+
+
+def test_grant_timed_out_before_deadline_is_not_resolved_again_at_deadline() -> None:
+    gateway, state = make_gateway()
+    ready(gateway)
+    assert gateway.on_tick(211) == [SendGrant(1, 2, 1)]  # grant 1 timed out; retransmit as grant 2
+    timed_out = [r for r in gateway.estimator.resolutions if r[1].pos == 1 and r[2] is False]
+    assert len(timed_out) == 1 and 1 not in state.outstanding
+
+    gateway.on_deadline(1000)
+
+    grant_1 = gateway.resolved_grants[1][1]
+    assert [r for r in gateway.estimator.resolutions if r[1] is grant_1] == [timed_out[0]]
+    assert timed_out[0][3] == 211  # resolved at its timeout, not at D
+    assert state.outstanding == {}

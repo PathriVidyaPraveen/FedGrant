@@ -410,9 +410,14 @@ class BaselineGateway:
             self.logs.packet(t_ns=received_ns, round_id=0, client_id=-1, direction="received",
                              packet_type="malformed", size=len(data), result="rejected")
             return
-        if message.message_type not in (MessageType.READY, MessageType.DATA):
-            self._count_invalid()
-        result = self._classify(self.current, message.round_id, received_ns, accepted)
+        if message.message_type is MessageType.READY:
+            # accepted_data / rejected_data / late_after_deadline count DATA only
+            # (same meaning as GatewayCore's counters); READY is logged, not counted.
+            result = "accepted" if accepted else "rejected"
+        else:
+            if message.message_type is not MessageType.DATA:
+                self._count_invalid()
+            result = self._classify(self.current, message.round_id, received_ns, accepted)
         body = message.body
         self.logs.packet(t_ns=received_ns, round_id=message.round_id, client_id=message.client_id,
                          direction="received", packet_type=MessageType(message.message_type).name, size=len(data),
@@ -627,6 +632,12 @@ class PushOrTcpClient:
             timer.cancel()
         core = self.core
         if core.round is not None and core.round.round_id == round_id:
+            if "block_energies" not in record:
+                # The record is written here, possibly before the transfer task
+                # returns (B1 holds its TCP stream until D), and finish_round
+                # drops the encoded update: take the energies of the update this
+                # round actually encoded now (D-09). Never inferred otherwise.
+                record["block_energies"] = [float(x) for x in _block_energies(core.round.encoded)]
             core.finish_round(round_id, delivered)  # error feedback e <- u - u_hat (Eq. 6)
             record["status"] = how
         else:

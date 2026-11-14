@@ -205,6 +205,11 @@ class GatewayStats:
     rejected_round_start: int = 0
     bad_client_id: int = 0
     late_after_timeout: int = 0
+    # Wire DATA whose round_id is not the current round (previous, future, or
+    # any round before the first ROUND_START). Also counted in rejected_data and
+    # invalid_events; distinct from late_after_deadline, which is current-round
+    # DATA arriving after D. Cumulative, like every other counter here.
+    stale_round_data: int = 0
 
 
 class GatewayCore:
@@ -465,6 +470,9 @@ class GatewayCore:
             self._reject("DATA", bad_client_id=True)
             return []
         if self.round is None or message.round_id != self.round.round_id:
+            # Rejected before on_data, so no round state, grant, delivery or
+            # aggregation input is touched and the packet is counted once.
+            self.stats.stale_round_data += 1
             self._reject("DATA")
             return []
         body = message.body
