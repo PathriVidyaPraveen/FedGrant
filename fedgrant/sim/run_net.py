@@ -27,7 +27,7 @@ from fedgrant.policy.constants import (
     L as L_DEFAULT,
     S,
 )
-from fedgrant.policy.eligibility import is_eligible
+from fedgrant.policy.eligibility import Reason, is_eligible
 from fedgrant.policy.features import (
     ArrivalLog,
     GatewayView,
@@ -197,21 +197,27 @@ class _CoreEligibility:
         ids: list[int] = []
         values: list[float] = []
         remaining: list[int] = []
+        probe: list[bool] = []
         relative_t = now_ns - sim.round_start_abs_ns
         for cid, state in clients.items():
             if not state.ready:
                 continue
             p_hat = sim.core._predict_probability(cid, now_ns)
-            if not is_eligible(state, relative_t, sim.D_ns, p_hat, sim.cfg)[0]:
+            # Bounded probe (rule (v) amendment): the core owns the per-round allowance.
+            ok, reason = is_eligible(state, relative_t, sim.D_ns, p_hat, sim.cfg,
+                                     probe_available=sim.core.probe_available(cid))
+            if not ok:
                 continue
             ids.append(cid)
             values.append(value_key(state, retransmit))
             remaining.append(sim.K - state.m - len(state.outstanding))
+            probe.append(reason == Reason.PROBE)
         return CandidateView(
             client_id=np.asarray(ids, dtype=np.int32),
             next_value=np.asarray(values, dtype=np.float64),
             undelivered=np.asarray(remaining, dtype=np.int32),
             rr_pointer=sim.rr_pointer,
+            probe=np.asarray(probe, dtype=np.bool_),
         )
 
 

@@ -1,0 +1,5 @@
+policy,scenario,variant,seeds,eta,eta_late,eta_late_sd,eta_ratio_late,clients_late,low_phat_end,zero_grant_rounds,wasted_late,qdrops_late,util_late,q_p99_late,probe_share,p_target_late
+B4,L2,integrated-probe,5,0.447,0.452,0.019,0.691,20.0,0.6,0.0,27.638,60.804,0.799,76.195,0.006,117.19
+B4,L4,integrated-probe,5,0.449,0.457,0.011,0.7,20.0,1.2,0.0,32.983,33.284,0.791,75.449,0.006,113.913
+B6,L2,integrated-probe,5,0.446,0.455,0.019,0.696,19.996,1.4,0.0,28.213,56.028,0.799,76.164,0.007,113.438
+B6,L4,integrated-probe,5,0.445,0.451,0.006,0.689,20.0,1.0,0.0,33.305,36.108,0.791,75.597,0.006,116.037

@@ -14,11 +14,11 @@ m1 = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(m1)
 
 
-def _run(path: Path, *, revision="__absent__", status="ok", rounds=0):
+def _run(path: Path, *, revision="__absent__", status="ok", rounds=0, wired=True):
     path.mkdir(parents=True)
     meta = {"status": status}
     if revision != "__absent__":
-        meta["provenance"] = {"policy_revision": revision}
+        meta["provenance"] = {"policy_revision": revision, "probe_wired": wired}
     (path / "meta.json").write_text(json.dumps(meta))
     if rounds:
         (path / "round_metrics.csv").write_text("round_id\n" + "".join(f"{r}\n" for r in range(1, rounds + 1)))
@@ -34,6 +34,9 @@ def test_run_state(tmp_path):
     assert m1.run_state(_run(tmp_path / "other", revision="r0"), "FG-GRU", "r1") == "superseded"
     assert m1.run_state(old, "B2", "r1") == "complete"    # baselines do not depend on the policy
     assert m1.run_state(_run(tmp_path / "bad", status="failed"), "B2", "r1") == "todo"
+    # Stamped with the probe revision but produced before the providers issued probes.
+    assert m1.run_state(_run(tmp_path / "unwired", revision="r1", wired=False), "B6", "r1") == "superseded"
+    assert m1.run_state(_run(tmp_path / "unwired-b2", revision="r1", wired=False), "B2", "r1") == "complete"
 
 
 def test_missing_record_reads_old_list_and_accumulates(tmp_path):
@@ -62,10 +65,11 @@ def grid(tmp_path):
     return path
 
 
-def _main(monkeypatch, tmp_path, grid, revision, outcomes, *extra):
+def _main(monkeypatch, tmp_path, grid, revision, outcomes, *extra, wired=True):
     """Run main() with run_one replaced: outcomes[name] = list of (ok, rounds) per attempt."""
     import fedgrant.mininet.run_mininet as rm
     monkeypatch.setattr(rm, "policy_revision", lambda: revision)
+    monkeypatch.setattr(rm, "probe_wired", lambda: wired)
     calls = []
 
     def fake_run_one(cmd, out, log):
@@ -85,6 +89,17 @@ def _main(monkeypatch, tmp_path, grid, revision, outcomes, *extra):
 def test_grant_policies_refused_without_revision(monkeypatch, tmp_path, grid):
     with pytest.raises(SystemExit, match="eligibility amendment"):
         _main(monkeypatch, tmp_path, grid, None, {})
+
+
+def test_grant_policies_refused_when_probe_not_wired(monkeypatch, tmp_path, grid):
+    with pytest.raises(SystemExit, match="probe wired"):
+        _main(monkeypatch, tmp_path, grid, "r1", {}, wired=False)
+
+
+def test_probe_wired_matches_this_checkout():
+    from fedgrant.mininet.run_mininet import probe_wired
+    from fedgrant.policy.types import CandidateView
+    assert probe_wired() is ("probe" in CandidateView.__dataclass_fields__)
 
 
 def test_superseded_runs_move_aside_and_failures_are_classified(monkeypatch, tmp_path, grid):

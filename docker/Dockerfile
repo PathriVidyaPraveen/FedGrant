@@ -10,7 +10,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /workspace/FedGrant
 COPY docker/requirements.lock docker/requirements-ml.lock ./
-RUN python -m pip install --no-cache-dir -r requirements.lock -r requirements-ml.lock
+# Long timeout + retries: the torch wheel is large and PyPI reads can stall (seen on a home link).
+RUN python -m pip install --no-cache-dir --default-timeout=120 --retries 10 \
+      -r requirements.lock -r requirements-ml.lock
 # Debian's mininet package installs into the system python3 (3.11) dist-packages,
 # which the image's /usr/local python does not search. Expose only that package.
 RUN ln -s /usr/lib/python3/dist-packages/mininet "$(python -c 'import site; print(site.getsitepackages()[0])')/mininet" \

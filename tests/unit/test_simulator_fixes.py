@@ -123,15 +123,21 @@ def test_scheduler_waits_until_a_client_becomes_eligible() -> None:
         np.array([1.0], dtype=np.float32),
         DelayedPredictor(),
         D_ns=1_000_000_000,
-        K=1,
+        K=2,
     )
     gateway.on_round_start(1, round_start_abs_ns=1)
-    assert gateway.on_ready(0, np.array([1.0], dtype=np.float32), t_ns=0) == []
+    # Bounded probe (rule (v) amendment): p_hat = 0 < THETA still earns one
+    # probe grant per round; after that the client waits for p_hat >= THETA.
+    probe = gateway.on_ready(0, np.array([1.0, 0.5], dtype=np.float32), t_ns=0)
+    assert [g.client_id for g in probe] == [0]
+    assert gateway.core.round_probe_grants == 1
+    assert gateway.on_tick(1_000_000) == []
 
     grants = gateway.on_tick(5_000_000)
 
     assert len(grants) == 1
     assert grants[0].client_id == 0
+    assert gateway.core.round_probe_grants == 1
 
 
 def test_round_robin_pointer_does_not_advance_when_pacing_blocks_grant() -> None:

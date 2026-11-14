@@ -10,8 +10,10 @@ and runs each configuration through ``fedgrant.mininet.run_mininet`` into
   (``meta.json`` provenance.policy_revision == POLICY_REVISION). A completed run
   from another policy revision is *superseded*: it is moved to
   ``<out-root>-superseded/`` (never deleted) and rerun.
-* Grant policies are refused while the code has no POLICY_REVISION (the
-  eligibility amendment is not merged), unless --allow-unrevised is given.
+  A grant run is also superseded unless provenance.probe_wired is true: the
+  revision string can name the probe before the providers actually issue probes.
+* Grant policies are refused while the code has no POLICY_REVISION or does not
+  issue probe grants (``run_mininet.probe_wired``), unless --allow-unrevised is given.
 * A failed run is moved aside to ``<dir>.failed-<n>`` and retried once with the
   same seed. A second failure is recorded in ``missing_runs.json``:
   ``missing`` if rounds had started (an outlier, spec Section 14) or
@@ -82,8 +84,10 @@ def run_state(out: Path, policy: str, revision: str | None) -> str:
     if meta.get("status", "ok") != "ok":
         return "todo"
     if policy in GRANT_POLICIES:
-        recorded = (meta.get("provenance") or {}).get("policy_revision", _UNRECORDED)
-        if recorded != revision:
+        provenance = meta.get("provenance") or {}
+        if provenance.get("policy_revision", _UNRECORDED) != revision:
+            return "superseded"
+        if provenance.get("probe_wired") is not True:   # stamped with the revision, run without probes
             return "superseded"
     return "complete"
 
@@ -166,7 +170,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--allow-unrevised", action="store_true",
                         help="run grant policies although the code has no POLICY_REVISION (diagnostics only)")
     args = parser.parse_args(argv)
-    from fedgrant.mininet.run_mininet import policy_revision
+    from fedgrant.mininet.run_mininet import policy_revision, probe_wired
 
     revision = policy_revision()
     grid_path = (ROOT / args.grid).resolve()
@@ -178,6 +182,13 @@ def main(argv: list[str] | None = None) -> None:
         if blocked:
             raise SystemExit(f"{blocked} need the eligibility amendment (no POLICY_REVISION in this code); "
                              "merge it first, or pass --allow-unrevised for a diagnostic run")
+    if not args.allow_unrevised:
+        blocked = sorted({pol for _, pol, _ in jobs} & GRANT_POLICIES)
+        if blocked and not probe_wired():
+            raise SystemExit(f"{blocked} need the bounded probe wired into the providers "
+                             f"(POLICY_REVISION {revision!r}, but no probe grant is issued: "
+                             "CandidateView.probe pass-through missing); "
+                             "or pass --allow-unrevised for a diagnostic run")
     states = {job: run_state(out_root / f"{job[0]}-{job[1]}-s{job[2]}", job[1], revision) for job in jobs}
     todo = [job for job in jobs if states[job] != "complete"]
     superseded = [job for job in jobs if states[job] == "superseded"]

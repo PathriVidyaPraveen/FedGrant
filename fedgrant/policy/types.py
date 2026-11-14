@@ -20,12 +20,16 @@ class CandidateView:
     next_value: float64 [n], v~_i of Eq. (13): v_i(s_next_i), or +inf for starved clients.
     undelivered: int32 [n], K - m_i - outstanding_i.
     rr_pointer: cyclic round-robin pointer over client ids (selector "rr", B4).
+    probe: optional bool [n]; True marks a candidate admitted only by the bounded
+        probe (rule (v) amendment, Reason.PROBE). None means no probe candidates.
+        GatewayCore validates its alignment with client_id.
     """
 
     client_id: np.ndarray
     next_value: np.ndarray
     undelivered: np.ndarray
     rr_pointer: int
+    probe: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         cid, val, und = self.client_id, self.next_value, self.undelivered

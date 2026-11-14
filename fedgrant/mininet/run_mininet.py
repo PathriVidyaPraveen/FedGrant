@@ -164,6 +164,32 @@ def policy_revision() -> str | None:
     return None
 
 
+def probe_wired() -> bool:
+    """Whether this code actually issues bounded-probe grants (rule (v) amendment).
+
+    POLICY_REVISION can name the probe before the simulator/production providers
+    pass ``CandidateView.probe``; then B4/B6/FG-GRU still run the unamended rule.
+    This is a functional check, not a version check: one client whose prediction
+    is always 0 (< THETA) must receive exactly one probe grant in a round.
+    """
+    try:
+        import numpy as np
+
+        from fedgrant.sim.run_net import GatewaySim
+
+        class _Zero:
+            def reset_round(self, _ctx): pass
+            def observe(self, *_args): pass
+            def predict(self, inp): return np.zeros(inp.n, dtype=np.float32)
+
+        sim = GatewaySim(1, np.array([1.0], np.float32), _Zero(), D_ns=1_000_000_000, K=2)
+        sim.on_round_start(1, round_start_abs_ns=1)
+        sim.on_ready(0, np.array([1.0, 0.5], np.float32), t_ns=0)
+        return int(getattr(sim.core, "round_probe_grants", 0)) == 1
+    except Exception:
+        return False
+
+
 def code_provenance(repo: Path = REPO_ROOT) -> dict:
     """Code version that produced a run: git commit, uncommitted changes, policy revision.
 
@@ -183,7 +209,8 @@ def code_provenance(repo: Path = REPO_ROOT) -> dict:
     status = git("status", "--porcelain", "--untracked-files=no") if commit else None
     changed = [line[3:] for line in status.splitlines()] if status else []
     return {"git_commit": commit, "git_dirty": bool(changed) if commit else None,
-            "git_changed_files": changed[:50], "policy_revision": policy_revision()}
+            "git_changed_files": changed[:50], "policy_revision": policy_revision(),
+            "probe_wired": probe_wired()}
 
 
 class _QueueSampler:

@@ -30,7 +30,7 @@ from fedgrant.policy.types import PolicyConfig
 from fedgrant.core.estimators import RateWindow, grant_timeout
 from fedgrant.core.gateway import GatewayCore, SendGrant
 from fedgrant.core.state import ClientState, values_from_energies
-from fedgrant.policy.eligibility import is_eligible
+from fedgrant.policy.eligibility import Reason, is_eligible
 from fedgrant.policy.features import (
     ArrivalLog,
     GatewayView,
@@ -157,21 +157,26 @@ class _ReplayAssembly:
     # -- EligibilityProvider ------------------------------------------------
     def candidates(self, clients, now_ns, deadline_ns, retransmit):
         self._set_time(now_ns)
-        ids, values, remaining = [], [], []
+        ids, values, remaining, probe = [], [], [], []
         for cid, state in clients.items():
             if not state.ready:
                 continue
             p_hat = self.gateway._predict_probability(cid, now_ns)
-            if not is_eligible(state, now_ns - self.start_ns, self.D_ns, p_hat, self.cfg)[0]:
+            # Bounded probe (rule (v) amendment), as the simulator's provider does.
+            ok, reason = is_eligible(state, now_ns - self.start_ns, self.D_ns, p_hat, self.cfg,
+                                     probe_available=self.gateway.probe_available(cid))
+            if not ok:
                 continue
             ids.append(cid)
             values.append(value_key(state, retransmit))
             remaining.append(state.K - state.m - len(state.outstanding))
+            probe.append(reason == Reason.PROBE)
         return CandidateView(
             np.asarray(ids, dtype=np.int32),
             np.asarray(values, dtype=np.float64),
             np.asarray(remaining, dtype=np.int32),
             0,
+            probe=np.asarray(probe, dtype=np.bool_),
         )
 
     # -- PacingProvider: a pure check; GatewayCore inserts into Phi --------
