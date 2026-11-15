@@ -949,6 +949,8 @@ def run_network_round(
         "utilization": utilization,
         "frames_sent": frames_sent_at_deadline,
         "grants_issued": gateway.grants_issued,
+        # Bounded probe grants issued this round (rule (v) amendment); the core's own counter.
+        "probe_grants": int(getattr(gateway.core, "round_probe_grants", 0)),
         "grants_delivered": gateway.grants_delivered,
         "grants_timed_out": gateway.grants_timed_out,
         "wasted_grants_ratio": wasted_grants_ratio,

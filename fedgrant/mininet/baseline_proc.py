@@ -493,6 +493,26 @@ class _ClientControl(asyncio.DatagramProtocol):
         self.client.socket_errors += 1
 
 
+class _RecordingB1Core(B1ClientCore):
+    """B1ClientCore that remembers the last update it encoded.
+
+    ``B1TcpClient.send_round`` encodes the update and, when the TCP connect fails
+    before D, finalizes the round itself (empty delivery), which drops the encoded
+    update. The energies of that update are still real and are needed for eta
+    (D-09); without them every such round's eta is missing.
+    """
+
+    prepared: tuple[int, Any] | None = None
+
+    def start_round(self, round_id: int, deadline_ns: int, delta: np.ndarray):
+        encoded = super().start_round(round_id, deadline_ns, delta)
+        self.prepared = (round_id, encoded)
+        return encoded
+
+    def prepared_encoded(self, round_id: int):
+        return self.prepared[1] if self.prepared is not None and self.prepared[0] == round_id else None
+
+
 class PushOrTcpClient:
     """B1/B2 client: ROUND_START -> wait rho_i -> send; ROUND_END -> error feedback."""
 
@@ -502,7 +522,7 @@ class PushOrTcpClient:
         self.gateway_addr = (cfg.gateway_host, cfg.udp_port)
         self.control: _ClientControl | None = None
         self.b2: B2UdpClient | None = None
-        self.b1_core = B1ClientCore(client_id, d=cfg.d, L=cfg.L) if cfg.policy == "B1" else None
+        self.b1_core = _RecordingB1Core(client_id, d=cfg.d, L=cfg.L) if cfg.policy == "B1" else None
         self.b1_sender = B1TcpClient(port=cfg.tcp_port) if cfg.policy == "B1" else None
         self.rate_bps = mean_access_rate_bps(client_id)  # b_bar_i (Section 3.1, D-15)
         self.finished = asyncio.Queue()
@@ -595,7 +615,8 @@ class PushOrTcpClient:
             else:
                 transfer = await self.b1_sender.send_round(self.b1_core, gateway_host=self.cfg.gateway_host,
                                                            round_id=round_id, deadline_ns=deadline_ns, delta=delta)
-                encoded = self.b1_core.round.encoded if self.b1_core.round is not None else None
+                encoded = (self.b1_core.round.encoded if self.b1_core.round is not None
+                           else self.b1_core.prepared_encoded(round_id))  # connect failed: finalized by sender
                 self.logs.packets.write(t_mono_ns=transfer.completed_ns, round_id=round_id, direction="sent",
                                         client_id=self.client_id, packet_seq=transfer.blocks_written, grant_id="",
                                         send_pos="", block_idx="", packet_type="B1_TCP_STREAM",
@@ -642,6 +663,10 @@ class PushOrTcpClient:
             record["status"] = how
         else:
             record["status"] = f"{how}_without_prepared_round"
+            prepared = core.prepared_encoded(round_id) if hasattr(core, "prepared_encoded") else None
+            if "block_energies" not in record and prepared is not None:
+                # B1 connect failed: the sender already applied the empty delivery.
+                record["block_energies"] = [float(x) for x in _block_energies(prepared)]
         record["delivered"] = list(delivered)
         self.logs.round(record)
         self.finished.put_nowait(round_id)
