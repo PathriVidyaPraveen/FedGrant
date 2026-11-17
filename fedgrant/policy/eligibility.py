@@ -1,6 +1,6 @@
 """Eligibility rule (Section 3.9): client i is eligible iff rules (i)-(v) all hold.
 
-Bounded probe (CHANGELOG amendment, PROPOSED 2026-11-13): a client that passes
+Bounded probe (CHANGELOG amendment 2026-11-13, ACCEPTED 2026-11-17): a client that passes
 rules (i)-(iv) and fails only rule (v) (p_hat < theta) is still a candidate,
 with Reason.PROBE, while its per-round probe allowance is unused. The caller
 owns the allowance: it resets at ROUND_START and is used up when a grant is
@@ -9,12 +9,16 @@ exploration, pacing (with the client's real p_hat), position, timeout and
 predictor feedback are all unchanged. Under A4 (pred_in_eligibility=False)
 rule (v) is off, so PROBE never occurs.
 
+A NaN p_hat fails rule (v) outright and is never a probe: the probe is for a
+valid but low prediction, not a broken one.
+
 Without the probe, rule (v) is absorbing: an ineligible client gets no grants,
 hence no outcomes, so p_hat never changes and the client is excluded for good.
 """
 
 from __future__ import annotations
 
+import math
 from enum import IntEnum
 
 from fedgrant.core.state import ClientState
@@ -51,7 +55,8 @@ def is_eligible(
     (iii) outstanding_i < cap_i.
     (iv)  t + srtt_i + 2 ms <= D.
     (v)   p_hat_i(t) >= theta = 0.05; skipped when cfg.pred_in_eligibility is False (A4).
-          If only (v) fails and probe_available is True, returns (True, PROBE).
+          If only (v) fails, p_hat is not NaN and probe_available is True,
+          returns (True, PROBE).
 
     probe_available: the client's per-round probe allowance is unused. The
     default False gives the unamended rule; callers must pass it explicitly.
@@ -65,7 +70,7 @@ def is_eligible(
     if t_ns + state.srtt_ns + DEADLINE_MARGIN_NS > D_ns:
         return False, Reason.TOO_LATE
     if cfg.pred_in_eligibility and not p_hat >= THETA:      # NaN fails too
-        if probe_available:
+        if probe_available and not math.isnan(p_hat):
             return True, Reason.PROBE
         return False, Reason.LOW_PREDICTION
     return True, Reason.ELIGIBLE

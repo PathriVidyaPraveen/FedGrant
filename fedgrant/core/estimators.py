@@ -57,7 +57,8 @@ def _div_round(num: int, den: int) -> int:
 
 
 def rtt_update(state: ClientState, sample_ns: int) -> None:
-    """RFC 6298 update with alpha = 1/8, beta = 1/4 (Section 3.7), and append to rtt_last8.
+    """RFC 6298 update with alpha = 1/8, beta = 1/4 (Section 3.7), append to rtt_last8,
+    and fold the sample into rtt_min_ns (Eq. 12 min-RTT amendment).
 
     rttvar <- (1 - beta) rttvar + beta |srtt - R|   (uses the OLD srtt)
     srtt   <- (1 - alpha) srtt + alpha R
@@ -77,6 +78,8 @@ def rtt_update(state: ClientState, sample_ns: int) -> None:
     state.rttvar_ns = _div_round(3 * rttvar + abs(srtt - r), 4)
     state.srtt_ns = _div_round(7 * srtt + r, 8)
     state.rtt_last8.append(r)
+    if state.rtt_min_ns is None or r < state.rtt_min_ns:
+        state.rtt_min_ns = r
 
 
 def grant_timeout(t_g_ns: int, state: ClientState, D_ns: int) -> int:

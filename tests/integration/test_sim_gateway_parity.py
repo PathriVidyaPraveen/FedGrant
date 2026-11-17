@@ -30,7 +30,7 @@ from fedgrant.policy.types import PolicyConfig
 from fedgrant.core.estimators import RateWindow, grant_timeout
 from fedgrant.core.gateway import GatewayCore, SendGrant
 from fedgrant.core.state import ClientState, values_from_energies
-from fedgrant.policy.eligibility import is_eligible
+from fedgrant.policy.eligibility import Reason, is_eligible
 from fedgrant.policy.features import (
     ArrivalLog,
     GatewayView,
@@ -38,7 +38,7 @@ from fedgrant.policy.features import (
     features48,
     resolve_event,
 )
-from fedgrant.policy.pacing import InflightTracker, p_target, pacing_p
+from fedgrant.policy.pacing import InflightTracker, p_target_min_rtt, pacing_p
 from fedgrant.policy.selectors import make_selector, value_key
 from fedgrant.policy.types import CandidateView
 from fedgrant.predictors.ewma import PEWMA
@@ -146,8 +146,9 @@ class _ReplayAssembly:
         return self.gateway.round.start_ns
 
     def _target(self) -> float:
-        ready = [state.srtt_ns for state in self.states.values() if state.ready]
-        return float(p_target(ready or [state.srtt_ns for state in self.states.values()]))
+        # Eq. 12, min-RTT amendment, as the simulator's GatewaySim.get_p_target.
+        ready = [state for state in self.states.values() if state.ready]
+        return float(p_target_min_rtt(ready or list(self.states.values())))
 
     def _set_time(self, absolute_ns: int) -> None:
         self.view.t_ns = absolute_ns - self.start_ns
@@ -157,21 +158,26 @@ class _ReplayAssembly:
     # -- EligibilityProvider ------------------------------------------------
     def candidates(self, clients, now_ns, deadline_ns, retransmit):
         self._set_time(now_ns)
-        ids, values, remaining = [], [], []
+        ids, values, remaining, probe = [], [], [], []
         for cid, state in clients.items():
             if not state.ready:
                 continue
             p_hat = self.gateway._predict_probability(cid, now_ns)
-            if not is_eligible(state, now_ns - self.start_ns, self.D_ns, p_hat, self.cfg)[0]:
+            # Bounded probe (rule (v) amendment), as the simulator's provider does.
+            ok, reason = is_eligible(state, now_ns - self.start_ns, self.D_ns, p_hat, self.cfg,
+                                     probe_available=self.gateway.probe_available(cid))
+            if not ok:
                 continue
             ids.append(cid)
             values.append(value_key(state, retransmit))
             remaining.append(state.K - state.m - len(state.outstanding))
+            probe.append(reason == Reason.PROBE)
         return CandidateView(
             np.asarray(ids, dtype=np.int32),
             np.asarray(values, dtype=np.float64),
             np.asarray(remaining, dtype=np.int32),
             0,
+            probe=np.asarray(probe, dtype=np.bool_),
         )
 
     # -- PacingProvider: a pure check; GatewayCore inserts into Phi --------

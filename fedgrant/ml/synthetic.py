@@ -32,7 +32,7 @@ from fedgrant.ml.schema import SPLITS, SplitRecorder
 from fedgrant.policy.constants import C, K, S
 from fedgrant.policy.eligibility import Reason, is_eligible
 from fedgrant.policy.features import GatewayView, features48, resolve_event
-from fedgrant.policy.pacing import p_target, pacing_p
+from fedgrant.policy.pacing import p_target_min_rtt, pacing_p
 from fedgrant.policy.selectors import ValueSelector, value_key
 from fedgrant.policy.types import CandidateView, PolicyConfig
 from fedgrant.predictors.ewma import PEWMA
@@ -185,7 +185,10 @@ def simulate_run(rec: SplitRecorder, seed: int, split: str, n_clients: int = N_C
         for i, st in enumerate(states):
             st.reset_round(K, round_start_ns=t0_abs)
             rho = int(rng_ready.random() * 0.1 * D)        # readiness delay U(0, 0.1 D)
-            push(rho + net.delta[i] + BN_DELAY_NS, _READY, i)
+            # READY timer-origin amendment (CHANGELOG 2026-11-13): ROUND_START leg,
+            # then rho from its receipt, then the READY leg, as in sim/run_net.py.
+            leg = net.delta[i] + BN_DELAY_NS
+            push(leg + rho + leg, _READY, i)
         for t in range(TICK_NS, D + 1, TICK_NS):
             push(t, _TICK, 0)
 
@@ -196,7 +199,7 @@ def simulate_run(rec: SplitRecorder, seed: int, split: str, n_clients: int = N_C
             view.t_ns = t
             ids = ready_ids()
             if ids:
-                view.P_target = p_target([states[i].srtt_ns for i in ids])
+                view.P_target = p_target_min_rtt([states[i] for i in ids])
 
         def resolve(gid: int, y: int, t: int) -> None:
             g = grants[gid]

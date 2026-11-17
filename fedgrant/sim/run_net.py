@@ -27,7 +27,7 @@ from fedgrant.policy.constants import (
     L as L_DEFAULT,
     S,
 )
-from fedgrant.policy.eligibility import is_eligible
+from fedgrant.policy.eligibility import Reason, is_eligible
 from fedgrant.policy.features import (
     ArrivalLog,
     GatewayView,
@@ -36,7 +36,7 @@ from fedgrant.policy.features import (
     features48,
     resolve_event,
 )
-from fedgrant.policy.pacing import InflightTracker, p_target, pacing_p
+from fedgrant.policy.pacing import InflightTracker, p_target_min_rtt, pacing_p
 from fedgrant.policy.selectors import (
     RoundRobinSelector,
     SRPTSelector,
@@ -197,21 +197,27 @@ class _CoreEligibility:
         ids: list[int] = []
         values: list[float] = []
         remaining: list[int] = []
+        probe: list[bool] = []
         relative_t = now_ns - sim.round_start_abs_ns
         for cid, state in clients.items():
             if not state.ready:
                 continue
             p_hat = sim.core._predict_probability(cid, now_ns)
-            if not is_eligible(state, relative_t, sim.D_ns, p_hat, sim.cfg)[0]:
+            # Bounded probe (rule (v) amendment): the core owns the per-round allowance.
+            ok, reason = is_eligible(state, relative_t, sim.D_ns, p_hat, sim.cfg,
+                                     probe_available=sim.core.probe_available(cid))
+            if not ok:
                 continue
             ids.append(cid)
             values.append(value_key(state, retransmit))
             remaining.append(sim.K - state.m - len(state.outstanding))
+            probe.append(reason == Reason.PROBE)
         return CandidateView(
             client_id=np.asarray(ids, dtype=np.int32),
             next_value=np.asarray(values, dtype=np.float64),
             undelivered=np.asarray(remaining, dtype=np.int32),
             rr_pointer=sim.rr_pointer,
+            probe=np.asarray(probe, dtype=np.bool_),
         )
 
 
@@ -283,7 +289,7 @@ class GatewaySim(_GatewaySimState):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        self.view = GatewayView(t_ns=0, D_ns=self.D_ns, P_target=p_target([s.srtt_ns for s in self.client_states]))
+        self.view = GatewayView(t_ns=0, D_ns=self.D_ns, P_target=p_target_min_rtt(self.client_states))
         self.core = GatewayCore(
             clients={state.client_id: state for state in self.client_states},
             selector=_CoreSelector(self),
@@ -323,8 +329,9 @@ class GatewaySim(_GatewaySimState):
         return self.inflight.phi
 
     def get_p_target(self) -> float:
-        ready = [state.srtt_ns for state in self.client_states if state.ready]
-        return float(p_target(ready or [state.srtt_ns for state in self.client_states]))
+        # Eq. 12, min-RTT amendment: ready clients, or every client before any READY.
+        ready = [state for state in self.client_states if state.ready]
+        return float(p_target_min_rtt(ready or self.client_states))
 
     def get_view(self, t_ns: int) -> GatewayView:
         self._set_view_time(self.round_start_abs_ns + int(t_ns))

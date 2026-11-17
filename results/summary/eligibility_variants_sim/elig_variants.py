@@ -52,7 +52,9 @@ def run_job(job):
         rtt_min[c] = min(rtt_min.get(c, sample_ns), int(sample_ns))
     feat.rtt_update = rtt_update
 
-    def is_eligible(state, t_ns, D_ns, p_hat, cfg):
+    def is_eligible(state, t_ns, D_ns, p_hat, cfg, probe_available=False):
+        # The repository's own probe (probe_available) is ignored: each variant here
+        # implements rule (v) itself, starting from the unamended rule.
         ok, reason = orig_elig(state, t_ns, D_ns, p_hat, cfg)
         if ok or reason != Reason.LOW_PREDICTION:
             return ok, reason
@@ -114,7 +116,9 @@ def run_job(job):
 
 if __name__ == "__main__":
     jobs = [(v, p, sc, s) for v in VARIANTS for p in ("B4", "B6") for sc in ("L2", "L4") for s in SEEDS]
-    with Pool(10) as pool:
+    # maxtasksperchild=1: every job monkeypatches module/class attributes, so a reused
+    # worker would carry an earlier variant's patches (e.g. minrtt get_p_target) into later jobs.
+    with Pool(10, maxtasksperchild=1) as pool:
         out = [r for rows in pool.imap_unordered(run_job, jobs) for r in rows]
     with open(sys.argv[1], "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=list(out[0])); w.writeheader(); w.writerows(out)

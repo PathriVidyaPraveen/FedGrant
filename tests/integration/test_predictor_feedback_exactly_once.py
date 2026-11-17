@@ -301,7 +301,12 @@ def test_production_round_over_udp_observes_each_resolved_grant_once(policy: str
     # deterministic deadline path is covered above).
     d_rel = deadline - start
     assert any(r["y"] == 1 for r in resolutions)
-    assert any(r["y"] == 0 and r["t_ns"] < d_rel for r in resolutions)
+    # A timeout *before* D is not guaranteed here: with min-RTT pacing (Eq. 12 amendment)
+    # localhost RTT_min is < 1 ms, P_target falls to ~5-15 packets, and the lossy client's
+    # first grant can come so late that its timeout (srtt0 + 4 rttvar0 = 300 ms) is past D.
+    # The timeout-before-D path is covered deterministically by
+    # test_no_sequence_observes_a_grant_twice; here every loss must be at or before D.
+    assert all(r["t_ns"] <= d_rel for r in resolutions if r["y"] == 0)
     assert len(at_deadline) == 1
     assert sum(r["y"] == 0 and r["t_ns"] == d_rel for r in resolutions) == at_deadline[0]
     # Gateway accounting is unchanged by the observation path.

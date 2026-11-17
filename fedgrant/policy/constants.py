@@ -28,7 +28,10 @@ TAU_Q_NS: int = 5_000_000         # tau_q = 5 ms, Eq. (12)
 # ml/datagen.py writes this into every manifest and ml/train.py refuses data
 # generated under another revision. Bump it with every such CHANGELOG amendment.
 #   2026-11-13: rule (v) bounded probe (<= 1 grant per round for a client failing only (v)).
-POLICY_REVISION: str = "2026-11-13-probe"
+#               Stamped before run_net issued probes; data under it has no probes.
+#   2026-11-17: probe wired end to end + Eq. 12 min-RTT pacing; also the first revision
+#               whose simulator uses the two-leg READY timer origin everywhere.
+POLICY_REVISION: str = "2026-11-17-probe-minrtt"
 
 # --- Estimator initial values (Table 2) --------------------------------------
 SRTT0_NS: int = 100_000_000       # 100 ms

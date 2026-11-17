@@ -1,0 +1,5 @@
+policy,scenario,eta51_old_rule,eta51_study_probe,eta51_study_sd,eta51_integrated,eta51_integrated_sd,diff,within_0.02,clients_study,clients_integrated,probe_share_study,probe_share_integrated,zero_grant_rounds_integrated,qdrops_study,qdrops_integrated
+B4,L2,0.24,0.553,0.013,0.452,0.019,-0.101,False,20.0,20.0,0.001,0.006,0.0,1.58,60.804
+B4,L4,0.0,0.508,0.008,0.457,0.011,-0.051,False,20.0,20.0,0.006,0.006,0.0,1.892,33.284
+B6,L2,0.099,0.592,0.003,0.455,0.019,-0.137,False,20.0,19.996,0.001,0.007,0.0,0.472,56.028
+B6,L4,0.0,0.528,0.004,0.451,0.006,-0.077,False,19.992,20.0,0.007,0.006,0.0,0.656,36.108
