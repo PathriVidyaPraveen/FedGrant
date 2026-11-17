@@ -44,6 +44,9 @@ class CandidateView:
         if isinstance(rr, (bool, np.bool_)) or not isinstance(rr, (int, np.integer)):
             raise TypeError("rr_pointer must be an int")
         self.rr_pointer = int(rr)
+        pr = self.probe
+        if pr is not None and (not isinstance(pr, np.ndarray) or pr.dtype != np.bool_ or pr.shape != (n,)):
+            raise TypeError(f"probe must be None or a bool ndarray of shape ({n},)")
 
     def __len__(self) -> int:
         return int(self.client_id.shape[0])

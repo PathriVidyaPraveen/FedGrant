@@ -202,6 +202,44 @@ def _simulate_run(
     return sample_count
 
 
+def _require_policy_wired() -> None:
+    """Refuse to stamp POLICY_REVISION on data whose simulator does not run that policy.
+
+    The revision names the bounded probe and min-RTT pacing; both are checked
+    functionally (as run_mininet.probe_wired does for the probe), so data can
+    never again carry a revision its grants did not follow.
+    """
+    from fedgrant.mininet.run_mininet import probe_wired
+
+    if not probe_wired():
+        raise RuntimeError(
+            f"POLICY_REVISION {POLICY_REVISION!r} includes the bounded probe, but the simulator "
+            "issues no probe grants (CandidateView.probe not wired); refusing to generate data"
+        )
+    if not min_rtt_wired():
+        raise RuntimeError(
+            f"POLICY_REVISION {POLICY_REVISION!r} includes min-RTT pacing (Eq. 12), but the "
+            "simulator's P_target does not follow each client's minimum RTT; refusing to generate data"
+        )
+
+
+def min_rtt_wired() -> bool:
+    """Whether GatewaySim's P_target uses the min-RTT RTT~ of Eq. 12 (functional check)."""
+    try:
+        from fedgrant.core.estimators import rtt_update
+        from fedgrant.policy.pacing import p_target_min_rtt
+        from fedgrant.predictors.ewma import PEWMA
+        from fedgrant.sim.run_net import GatewaySim
+
+        sim = GatewaySim(1, np.array([1.0], np.float32), PEWMA(), D_ns=1_000_000_000, K=2)
+        state = sim.client_states[0]
+        rtt_update(state, 20_000_000)
+        rtt_update(state, 200_000_000)      # srtt rises; the minimum stays 20 ms
+        return abs(sim.get_p_target() - p_target_min_rtt([state])) < 1e-9 and state.rtt_min_ns == 20_000_000
+    except Exception:
+        return False
+
+
 def generate_split(
     split: str,
     out: str | Path = "data/mldata",
@@ -225,6 +263,7 @@ def generate_split(
     if run_count < 1 or run_count > approved_runs:
         raise ValueError(f"runs must be in [1, {approved_runs}] for approved {split} data")
 
+    _require_policy_wired()
     trace_path = Path(trace_dir)
     _validate_traces(split, trace_path)
     energy_bank, client_weights, energy_bank_sha256 = _load_energy_bank(energy_bank_path, n_clients)
@@ -272,7 +311,7 @@ def generate_split(
         },
         "policy": {
             "selector": "value", "predictor": "ewma", "explore_eps": 0.1,
-            "revision": POLICY_REVISION,
+            "revision": POLICY_REVISION, "probe_wired": True, "pacing_rtt": "min",
         },
         "beta_values": list(BETA_VALUES),
         "loss_and_burst_values": (

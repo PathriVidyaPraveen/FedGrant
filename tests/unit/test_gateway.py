@@ -1326,9 +1326,19 @@ def test_probe_mask_must_align_with_candidates() -> None:
     gateway, _, eligibility, _ = probe_gateway({1: LOW_P})
 
     def misaligned(clients, now_ns, deadline_ns, retransmit):
-        return ProbeCandidateView(np.asarray([1], np.int32), np.asarray([1.0]), np.asarray([3], np.int32), 0,
-                                  probe=np.asarray([True, False]))
+        view = ProbeCandidateView(np.asarray([1], np.int32), np.asarray([1.0]), np.asarray([3], np.int32), 0)
+        view.probe = np.asarray([True, False])      # bypasses CandidateView's own check
+        return view
 
     eligibility.candidates = misaligned
     with pytest.raises(GatewayError, match="aligned"):
         gateway.on_ready(1, ENERGIES, 200)
+
+
+def test_candidate_view_rejects_malformed_probe_mask() -> None:
+    ids, vals, und = np.asarray([1, 2], np.int32), np.asarray([1.0, 0.5]), np.asarray([3, 3], np.int32)
+    assert CandidateView(ids, vals, und, 0).probe is None                       # positional form unchanged
+    assert CandidateView(ids, vals, und, 0, probe=np.asarray([True, False])).probe.tolist() == [True, False]
+    for bad in (np.asarray([True]), np.asarray([1, 0]), [True, False]):
+        with pytest.raises(TypeError, match="probe"):
+            CandidateView(ids, vals, und, 0, probe=bad)

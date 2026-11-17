@@ -29,7 +29,8 @@ def test_probe_only_when_allowance_available() -> None:
     assert is_eligible(st, 0, D, 0.01, CFG) == (False, Reason.LOW_PREDICTION)          # default: unamended
     assert is_eligible(st, 0, D, 0.01, CFG, probe_available=False) == (False, Reason.LOW_PREDICTION)
     assert is_eligible(st, 0, D, 0.01, CFG, probe_available=True) == (True, Reason.PROBE)
-    assert is_eligible(st, 0, D, math.nan, CFG, probe_available=True) == (True, Reason.PROBE)
+    # A NaN prediction is broken, not low: it fails rule (v) and is never a probe.
+    assert is_eligible(st, 0, D, math.nan, CFG, probe_available=True) == (False, Reason.LOW_PREDICTION)
 
 
 def test_probe_flag_irrelevant_when_rule_v_passes() -> None:
