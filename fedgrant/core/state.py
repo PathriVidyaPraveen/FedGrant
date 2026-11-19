@@ -96,6 +96,9 @@ class ClientState:
     ewma_fast: float = field(init=False, default=EWMA_INIT)
     ewma_slow: float = field(init=False, default=EWMA_INIT)
     rtt_last8: deque = field(init=False, default_factory=lambda: deque(maxlen=RTT_LAST_LEN))
+    # Minimum RTT sample ever seen (Eq. 12 min-RTT amendment); None = no sample yet.
+    # Persistent like srtt: never reset per round.
+    rtt_min_ns: int | None = field(init=False, default=None)
     evbuf: deque = field(init=False, default_factory=lambda: deque(maxlen=T_EVBUF))
     # SPEC-NOTE: Table 2 gives no initial value for h / h_stale. h=None with
     # h_stale=True means "not yet computed"; with no events Eq. (14) gives h = 0.

@@ -636,3 +636,75 @@ def test_summary_reader_accepts_schema_v1_columns(tmp_path: Path) -> None:
     run = read_runs_csv(path)[0]
     assert run.status == "missing"
     assert np.isnan(run.metrics["planned_blocks"])
+
+
+# -- probe_grants in round_metrics.csv (rule (v) bounded probe) ------------------------
+
+
+class _Core:
+    def __init__(self, probes: int) -> None:
+        self.round_probe_grants = probes
+
+
+class _Gateway:
+    def __init__(self, probes: int) -> None:
+        self.core = _Core(probes)
+
+
+def _round_metric_rows(tmp_path: Path, job: dict) -> list[dict]:
+    with (tmp_path / job["experiment_id"] / job["run_id"] / "round_metrics.csv").open(newline="") as stream:
+        return list(csv.DictReader(stream))
+
+
+def test_grant_round_metrics_record_the_rounds_probe_grants(tmp_path: Path) -> None:
+    job = _supported_job()
+
+    def runner(**kwargs):
+        result = _fake_runner(**kwargs)
+        result["gateway"] = _Gateway(kwargs["round_id"] % 3)  # this round's GatewayCore count
+        return result
+
+    assert execute_job(job, tmp_path, simulation_runner=runner)["status"] == "ok"
+    rows = _round_metric_rows(tmp_path, job)
+    assert [row["probe_grants"] for row in rows[:4]] == ["1", "2", "0", "1"]
+    assert len(rows) == job["n_rounds"]
+
+
+def test_simulator_probe_metric_takes_precedence_over_the_core_counter(tmp_path: Path) -> None:
+    job = _supported_job()
+
+    def runner(**kwargs):
+        result = _fake_runner(**kwargs)
+        result["gateway"] = _Gateway(99)
+        result["metrics"]["probe_grants"] = 4
+        return result
+
+    execute_job(job, tmp_path, simulation_runner=runner)
+    assert {row["probe_grants"] for row in _round_metric_rows(tmp_path, job)} == {"4"}
+
+
+def test_probe_grants_blank_for_b2_b3_and_without_a_counter(tmp_path: Path) -> None:
+    jobs = expand_grid(["N-main"], scenarios=["L1"])
+    for policy in ("B2", "B3"):
+        job = next(j for j in jobs if j["policy"] == policy and j["seed"] == 0)
+
+        def baseline(**kwargs):
+            result = _fake_baseline_runner(**kwargs)
+            result["gateway"] = _Gateway(7)  # even with a counter, B2/B3 have no grants
+            return result
+
+        execute_job(job, tmp_path, baseline_runner=baseline)
+        assert {row["probe_grants"] for row in _round_metric_rows(tmp_path, job)} == {""}
+    grant_job = _supported_job()
+    execute_job(grant_job, tmp_path / "plain", simulation_runner=_fake_runner)  # gateway=object(): no counter
+    assert {row["probe_grants"] for row in _round_metric_rows(tmp_path / "plain", grant_job)} == {""}
+
+
+def test_real_simulator_round_exposes_the_probe_counter() -> None:
+    from fedgrant.policy.constants import K
+    from fedgrant.sim.run_net import run_network_round
+
+    result = run_network_round(round_id=1, num_clients=4, beta=0.1, scenario="L1", seed=3,
+                               client_energies=np.tile(np.linspace(1.0, 0.01, K, dtype=np.float32), (4, 1)))
+    # run_net does not issue probes until its eligibility passes probe_available; the value is a real 0.
+    assert run_grid_module._round_probe_grants(result, result["metrics"]) == 0

@@ -36,7 +36,7 @@ from fedgrant.policy.features import (
     features48,
     resolve_event,
 )
-from fedgrant.policy.pacing import InflightTracker, p_target, pacing_p
+from fedgrant.policy.pacing import InflightTracker, p_target_min_rtt, pacing_p
 from fedgrant.policy.selectors import (
     RoundRobinSelector,
     SRPTSelector,
@@ -289,7 +289,7 @@ class GatewaySim(_GatewaySimState):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        self.view = GatewayView(t_ns=0, D_ns=self.D_ns, P_target=p_target([s.srtt_ns for s in self.client_states]))
+        self.view = GatewayView(t_ns=0, D_ns=self.D_ns, P_target=p_target_min_rtt(self.client_states))
         self.core = GatewayCore(
             clients={state.client_id: state for state in self.client_states},
             selector=_CoreSelector(self),
@@ -329,8 +329,9 @@ class GatewaySim(_GatewaySimState):
         return self.inflight.phi
 
     def get_p_target(self) -> float:
-        ready = [state.srtt_ns for state in self.client_states if state.ready]
-        return float(p_target(ready or [state.srtt_ns for state in self.client_states]))
+        # Eq. 12, min-RTT amendment: ready clients, or every client before any READY.
+        ready = [state for state in self.client_states if state.ready]
+        return float(p_target_min_rtt(ready or self.client_states))
 
     def get_view(self, t_ns: int) -> GatewayView:
         self._set_view_time(self.round_start_abs_ns + int(t_ns))

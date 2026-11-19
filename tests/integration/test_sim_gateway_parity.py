@@ -38,7 +38,7 @@ from fedgrant.policy.features import (
     features48,
     resolve_event,
 )
-from fedgrant.policy.pacing import InflightTracker, p_target, pacing_p
+from fedgrant.policy.pacing import InflightTracker, p_target_min_rtt, pacing_p
 from fedgrant.policy.selectors import make_selector, value_key
 from fedgrant.policy.types import CandidateView
 from fedgrant.predictors.ewma import PEWMA
@@ -146,8 +146,9 @@ class _ReplayAssembly:
         return self.gateway.round.start_ns
 
     def _target(self) -> float:
-        ready = [state.srtt_ns for state in self.states.values() if state.ready]
-        return float(p_target(ready or [state.srtt_ns for state in self.states.values()]))
+        # Eq. 12, min-RTT amendment, as the simulator's GatewaySim.get_p_target.
+        ready = [state for state in self.states.values() if state.ready]
+        return float(p_target_min_rtt(ready or list(self.states.values())))
 
     def _set_time(self, absolute_ns: int) -> None:
         self.view.t_ns = absolute_ns - self.start_ns

@@ -206,10 +206,14 @@ def test_full_round_counts_late_packets_outside_deadline_metrics(monkeypatch) ->
         return link
 
     monkeypatch.setattr(run_net, "BottleneckLink", track_bottleneck)
-    result = run_network_round(num_clients=20, seed=42)
+    # Round 2 of a reused gateway: under min-RTT pacing (Eq. 12 amendment) round 1,
+    # which starts from srtt0 = 100 ms, issues its last grants early enough that no
+    # DATA is still in flight at D; later rounds do have late arrivals.
+    first = run_network_round(num_clients=20, seed=42)
+    result = run_network_round(round_id=2, num_clients=20, seed=43, gateway=first["gateway"])
 
     assert result["late_metrics"]["late_after_deadline"] > 0
-    assert result["metrics"]["frames_sent"] < bottlenecks[0].frames_sent
+    assert result["metrics"]["frames_sent"] < bottlenecks[-1].frames_sent
     assert "late_after_deadline" not in result["metrics"]
 
 
