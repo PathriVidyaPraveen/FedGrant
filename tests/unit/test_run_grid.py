@@ -706,5 +706,6 @@ def test_real_simulator_round_exposes_the_probe_counter() -> None:
 
     result = run_network_round(round_id=1, num_clients=4, beta=0.1, scenario="L1", seed=3,
                                client_energies=np.tile(np.linspace(1.0, 0.01, K, dtype=np.float32), (4, 1)))
-    # run_net does not issue probes until its eligibility passes probe_available; the value is a real 0.
-    assert run_grid_module._round_probe_grants(result, result["metrics"]) == 0
+    # The core's real per-round counter, not a blank (a nonzero count is checked
+    # end to end in tests/integration/test_probe_end_to_end.py).
+    assert run_grid_module._round_probe_grants(result, result["metrics"]) == result["gateway"].core.round_probe_grants
