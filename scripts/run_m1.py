@@ -150,7 +150,7 @@ def gateway_rcvbuf_drops(out: Path) -> int | None:
     return None if value is None else int(value)
 
 
-def busy_host_warning(threshold_per_cpu: float = 0.25) -> str | None:
+def busy_host_warning(threshold_per_cpu: float = 0.5) -> str | None:
     """A warning when the 1-minute load average says the host is not idle (grant runs time the predictor)."""
     try:
         load = os.getloadavg()[0]
