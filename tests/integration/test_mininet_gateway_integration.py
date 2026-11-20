@@ -18,8 +18,8 @@ import asyncio
 import csv
 import hashlib
 import json
-import socket
 import threading
+from collections import Counter
 
 import numpy as np
 import pytest
@@ -62,12 +62,6 @@ def _fixture_bank(tmp_path, n: int = N):
                             "source": "test-fixture", "provenance_path": str(provenance),
                             "provenance_sha256": hashlib.sha256(provenance.read_bytes()).hexdigest()})))
     return path
-
-
-def _free_udp_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
 
 
 def _runner_args(tmp_path, bank_path, policy: str, **overrides) -> argparse.Namespace:
@@ -121,29 +115,39 @@ def test_factory_load_path_returns_a_passive_long_lived_core(tmp_path) -> None:
 def test_gateway_proc_serves_rounds_with_the_production_factory(policy, tmp_path, monkeypatch) -> None:
     bank_path = _fixture_bank(tmp_path)
     bank = load_value_bank(bank_path, N)
-    gw_port = _free_udp_port()
-    endpoints = {cid: ("127.0.0.1", _free_udp_port()) for cid in range(N)}
     bound: list = []
+    gateway_ready: list[asyncio.Future] = []
     original_bind = gateway_proc.LoggingUdpGateway.bind.__func__
 
     async def localhost_bind(cls, core, *, local_addr, endpoints: dict, **kwargs):
         bound.append(core)
         assert local_addr == ("10.0.0.254", 9000)  # what gateway_proc asks for in Mininet
-        return await original_bind(cls, core, local_addr=("127.0.0.1", gw_port),
-                                   endpoints=localhost_endpoints, **kwargs)
+        # Kernel-assigned port: no probe-then-rebind race with other processes.
+        gateway = await original_bind(cls, core, local_addr=("127.0.0.1", 0), endpoints={}, **kwargs)
+        gateway_ready[0].set_result(gateway)
+        return gateway
 
-    localhost_endpoints = endpoints
     monkeypatch.setattr(gateway_proc.LoggingUdpGateway, "bind", classmethod(localhost_bind))
-    args = _runner_args(tmp_path, bank_path, policy)
+    # D = 600 ms: gateway and clients share one event loop here, and under CPU
+    # load a 300 ms round could pass with every DATA arriving after D.
+    args = _runner_args(tmp_path, bank_path, policy, duration_ns=600_000_000)
     log_dir = tmp_path / "run"
 
     async def scenario():
+        gateway_ready.append(asyncio.get_running_loop().create_future())
+        server = asyncio.create_task(gateway_proc.serve(args))
+        # Clients bind once the gateway is bound (its first ROUND_START waits
+        # start_delay + Tc = 0.35 s), each on a kernel-assigned port that is then
+        # registered as its endpoint.
+        gateway = await asyncio.wait_for(asyncio.shield(gateway_ready[0]), 10.0)
+        gw_port = gateway.transport.get_extra_info("sockname")[1]
         clients = []
         for cid in range(N):
             core = ClientCore(cid, error_feedback=False)  # network-only values (D-19)
-            clients.append(await UdpClient.bind(core, gateway_addr=("127.0.0.1", gw_port),
-                                                local_addr=endpoints[cid],
-                                                update_provider=BankUpdateProvider(bank, SEED, cid)))
+            client = await UdpClient.bind(core, gateway_addr=("127.0.0.1", gw_port), local_addr=("127.0.0.1", 0),
+                                          update_provider=BankUpdateProvider(bank, SEED, cid))
+            gateway.set_endpoint(cid, ("127.0.0.1", client.transport.get_extra_info("sockname")[1]))
+            clients.append(client)
         async def follow(client):
             # Same loop as client_proc: each client waits for its own rounds,
             # concurrently with the others (the round-end event is level-triggered).
@@ -153,7 +157,6 @@ def test_gateway_proc_serves_rounds_with_the_production_factory(policy, tmp_path
                 client._round_end_event.clear()
             return rounds
 
-        server = asyncio.create_task(gateway_proc.serve(args))
         finished = await asyncio.gather(*(follow(client) for client in clients))
         await server
         for client in clients:
@@ -172,11 +175,29 @@ def test_gateway_proc_serves_rounds_with_the_production_factory(policy, tmp_path
                                    rtol=1e-4, atol=1e-6)
     summary = json.loads((log_dir / "gateway_summary.json").read_text())
     assert [r["round_id"] for r in summary] == [1, 2]
-    assert all(r["accepted_data"] > 0 and r["invalid_events"] == 0 for r in summary)
+    assert all(r["accepted_data"] > 0 for r in summary)
+    # The only invalid packets allowed are previous-round DATA that arrives after
+    # the next ROUND_START (Section 8: rejected and counted as stale). Under CPU
+    # load the shared event loop can delay round-1 DATA past the 0.4 s gap.
+    stats = core.stats
+    assert stats.invalid_events == stats.rejected_data == stats.stale_round_data
+    assert summary[0]["invalid_events"] == 0
     with (log_dir / "round_metrics.csv").open(newline="") as stream:
         metrics = list(csv.DictReader(stream))
     assert [int(m["round_id"]) for m in metrics] == [1, 2]
     assert all(0.0 < float(m["eta"]) <= 1.0 for m in metrics)
+    # Probe logging: the issued rows flagged probe=1 in grants.csv are exactly the
+    # round's probe_grants in round_metrics.csv, at most one per client per round,
+    # and the flag is blank on every other grant event.
+    with (log_dir / "grants.csv").open(newline="") as stream:
+        grant_rows = list(csv.DictReader(stream))
+    issued = [g for g in grant_rows if g["event"] == "issued"]
+    assert issued and all(g["probe"] in {"0", "1"} for g in issued)
+    assert all(g["probe"] == "" for g in grant_rows if g["event"] != "issued")
+    probes = Counter((int(g["round_id"]), int(g["client_id"])) for g in issued if g["probe"] == "1")
+    assert all(count == 1 for count in probes.values())
+    for m in metrics:
+        assert int(m["probe_grants"]) == sum(1 for (r, _) in probes if r == int(m["round_id"]))
     state = RoundStateFile(log_dir / ".round_state.json").read()
     assert (state["round_id"], state["active"]) == (2, False)
 

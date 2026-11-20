@@ -31,6 +31,26 @@ N = 6
 UNIFORM = np.full(N, 1.0 / N, dtype=np.float32)
 
 
+@pytest.fixture(autouse=True)
+def _frozen_predictor_clock(monkeypatch):
+    """Freeze FallbackPredictor's clock for every predictor built in this module.
+
+    Its 2 ms limit reads the wall clock (time.perf_counter_ns), so under CPU
+    load a P-EWMA call can "take" > 2 ms, switch that side to the fallback, and
+    make two otherwise identical decision streams diverge. A constant clock
+    keeps the limit from firing; the fallback itself is tested elsewhere with
+    an injected clock.
+    """
+    from fedgrant.predictors import fallback
+
+    original = fallback.FallbackPredictor.__init__
+
+    def init(self, primary, ewma=None, time_limit_ns=fallback.TIME_LIMIT_NS, clock=None):
+        original(self, primary, ewma, time_limit_ns, clock if clock is not None else (lambda: 0))
+
+    monkeypatch.setattr(fallback.FallbackPredictor, "__init__", init)
+
+
 def _ctx(policy: str, **kwargs) -> GatewayContext:
     return GatewayContext(num_clients=kwargs.pop("num_clients", N), policy=policy,
                           client_weights=kwargs.pop("client_weights", UNIFORM), **kwargs)
@@ -195,6 +215,7 @@ def test_production_core_reproduces_simulator_decisions_on_an_arbitrary_clock(po
         for sim, live in zip(decisions, produced, strict=True):
             assert_same_decision(sim, live, origin, selector)
         assert all(not state.outstanding for state in core.clients.values())
+    assert core.predictor.n_fallbacks == 0  # every decision used the configured predictor
 
 
 class _CountingPredictor:
