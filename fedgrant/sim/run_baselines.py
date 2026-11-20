@@ -273,11 +273,14 @@ def run_baseline_round(
     b3_plans: dict[int, Any] = {}
     for cid in range(num_clients):
         rho_rel = int(rng_ready.integers(0, int(READY_JITTER_FRACTION * duration_ns) + 1))
-        rho = round_start_abs_ns + rho_rel
-        rho_by_client[cid] = rho
+        # rho starts when the client receives ROUND_START, so clients cannot
+        # send their first DATA/READY until the downlink control leg has elapsed.
+        control_leg_ns = access_links[cid].prop_delay_ns + BN_PROP_NS
+        ready_send_ns = round_start_abs_ns + control_leg_ns + rho_rel
+        rho_by_client[cid] = ready_send_ns
         if mode == "B2":
             encoded = client_encodings[cid]
-            next_send_ns = rho
+            next_send_ns = ready_send_ns
             for send_pos, block_idx_value in enumerate(encoded.order, start=1):
                 send_ns = next_send_ns
                 if send_ns >= deadline_abs_ns:
@@ -316,11 +319,11 @@ def run_baseline_round(
                 MessageType.READY,
                 round_id=round_id,
                 client_id=cid,
-                t_send_ns=rho,
+                t_send_ns=ready_send_ns,
                 body={"K": K, "energy": tuple(float(x) for x in encoded.energies_sorted)},
                 block_length=L,
             )
-            ready_arrival = rho + access_links[cid].prop_delay_ns + BN_PROP_NS
+            ready_arrival = ready_send_ns + control_leg_ns
             engine.schedule(
                 delay_ns=ready_arrival - engine.now_ns,
                 event_type=EventType.READY_ARRIVE,
