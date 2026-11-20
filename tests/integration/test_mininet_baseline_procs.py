@@ -135,9 +135,9 @@ def test_baseline_processes_complete_rounds_over_real_sockets(policy, tmp_path) 
         delivered_total = sum(len(v) for v in record["delivered"].values())
         assert int(row["delivered_blocks"]) == delivered_total
         if policy == "B3":
-            # A READY arriving after t_plan = 0.1 D gets k = 0 (Section 10), and
-            # rho_i can reach 0.1 D, so a round may legitimately deliver nothing.
-            assert delivered_total <= int(row["planned_blocks"])
+            # B3 plans at the last READY (all arrive on localhost well before the
+            # 0.1 D + 105 ms cap, CHANGELOG 2026-11-21), so every round has a plan.
+            assert 0 < delivered_total <= int(row["planned_blocks"])
         else:
             assert delivered_total > 0
         assert float(row["goodput_bps"]) == pytest.approx(delivered_total * 2 * L * 8 / (D / 1e9))

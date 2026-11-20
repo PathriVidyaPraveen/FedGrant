@@ -26,7 +26,7 @@ from fedgrant.baselines.b3_pacing import (
 from fedgrant.common.constants import MessageType
 from fedgrant.common.wire import decode_message, encode_message
 from fedgrant.core.estimators import rtt_update
-from fedgrant.policy.plan import plan_budget, plan_caps, plan_time_ns
+from fedgrant.policy.plan import B3_READY_ALLOWANCE_NS, plan_budget, plan_cap_offset_ns, plan_caps, plan_time_ns
 
 
 def _ready(
@@ -198,8 +198,10 @@ def test_udp_gateway_resets_plan_send_counters_for_each_round() -> None:
 
 
 def test_t_plan_ready_cutoff_median_rtt_budget_caps_and_greedy_allocation() -> None:
-    core = _core()
-    assert core.plan_ns == core.start_ns + plan_time_ns(core.duration_ns)
+    # Planned at the cap (client 3 never registers), 0.1 D + 105 ms = 144.8 ms.
+    core = _core(bottleneck_bps=200_000)
+    assert core.plan_cap_ns == core.start_ns + plan_time_ns(core.duration_ns) + 105_000_000
+    assert core.plan_ns == core.plan_cap_ns  # the latest plan time until the plan is made
     core.states[1].srtt_ns = 100_000_000
     core.states[2].srtt_ns = 200_000_000
     core.states[3].srtt_ns = 300_000_000
@@ -212,7 +214,7 @@ def test_t_plan_ready_cutoff_median_rtt_budget_caps_and_greedy_allocation() -> N
     plans = core.compute_plans(core.plan_ns)
     median_rtt = 150_000_000
     budget = plan_budget(
-        100_000,
+        200_000,
         core.duration_ns,
         core.plan_ns - core.start_ns,
         median_rtt,
@@ -229,13 +231,104 @@ def test_t_plan_ready_cutoff_median_rtt_budget_caps_and_greedy_allocation() -> N
     }
     assert core.median_rtt_ns == median_rtt
     assert core.budget == budget == 1
-    assert core.caps == caps
+    assert core.caps == caps == {1: 5, 2: 1}
     assert plans[1].blocks == 1
     assert plans[2].blocks == 0
     assert plans[3].blocks == 0
     assert sum(plan.blocks for plan in plans.values()) <= budget
     assert all(plans[cid].blocks <= caps[cid] for cid in caps)
     assert all(plan.rate_bps == 4_000_000 for plan in plans.values())
+
+
+MS = 1_000_000
+
+
+def test_plan_cap_is_a_tenth_of_d_plus_the_ready_allowance() -> None:
+    # CHANGELOG 2026-11-21: 2 (delta_max + 5 ms) + 15 ms margin = 105 ms.
+    assert B3_READY_ALLOWANCE_NS == 105 * MS
+    assert plan_cap_offset_ns(398 * MS) == 144_800_000      # beta = 0.10, N = 20
+    assert plan_cap_offset_ns(199 * MS) == 124_900_000      # beta = 0.05
+    assert plan_cap_offset_ns(797 * MS) == 184_700_000      # beta = 0.20
+    # A cap at or past D is clamped just before D (no budget is left there).
+    assert plan_cap_offset_ns(100 * MS) == 100 * MS - 1
+    with pytest.raises(ValueError):
+        plan_cap_offset_ns(0)
+
+
+def test_early_close_plans_at_the_last_ready_with_the_actual_plan_time() -> None:
+    core = _core(bottleneck_bps=1_000_000)
+    for cid in (1, 2, 3):
+        core.states[cid].srtt_ns = 100 * MS
+    t = {1: core.start_ns + 40 * MS, 2: core.start_ns + 70 * MS, 3: core.start_ns + 95 * MS}
+    core.accept_ready(_ready(1), t[1])
+    core.accept_ready(_ready(2), t[2])
+    assert not core.ready_complete
+    with pytest.raises(B3PlanError, match="before every READY or the plan cap"):
+        core.compute_plans(t[2])                     # one READY still expected, cap not reached
+    core.accept_ready(_ready(3), t[3])
+    assert core.ready_complete
+    with pytest.raises(B3PlanError, match="before the READYs it uses"):
+        core.compute_plans(t[3] - 1)
+    plans = core.compute_plans(t[3])                 # early close at the last READY
+    offset = t[3] - core.start_ns
+    assert (core.plan_ns, core.plan_offset_ns) == (t[3], offset) and offset < core.plan_cap_offset_ns
+    # Budget and caps use the actual plan time, not the cap.
+    assert core.budget == plan_budget(1_000_000, core.duration_ns, offset, 100 * MS)
+    assert core.budget > plan_budget(1_000_000, core.duration_ns, core.plan_cap_offset_ns, 100 * MS)
+    assert core.caps == {cid: plan_caps(0.1, 4_000_000.0, core.duration_ns, offset, 100 * MS) for cid in (1, 2, 3)}
+    assert sum(p.blocks for p in plans.values()) <= core.budget
+    with pytest.raises(B3PlanError, match="outside"):
+        core.accept_ready(_ready(1, round_id=1), t[3] + 1)  # nothing is accepted after the plan
+    for cid in (1, 2, 3):
+        core.mark_plan_sent(cid, t[3])
+    result = core.finish(core.deadline_ns)
+    assert result.plan_ns == t[3] and result.plan_cap_ns == core.plan_cap_ns
+    assert result.planned_early and result.ready_clients == 3
+
+
+def test_ready_at_the_cap_is_included_and_later_readies_are_ignored() -> None:
+    core = _core()
+    core.accept_ready(_ready(1), core.plan_cap_ns)          # at the cap: included
+    with pytest.raises(B3PlanError, match="outside"):
+        core.accept_ready(_ready(2), core.plan_cap_ns + 1)  # after the cap: ignored
+    plans = core.compute_plans(core.plan_cap_ns)
+    assert core.plan_ns == core.plan_cap_ns and set(core.caps) == {1}
+    assert plans[2].blocks == plans[3].blocks == 0
+    for cid in (1, 2, 3):
+        core.mark_plan_sent(cid, core.plan_cap_ns)
+    result = core.finish(core.deadline_ns)
+    assert not result.planned_early and result.ready_clients == 1
+
+
+def test_udp_gateway_plans_on_the_last_ready_without_waiting_for_the_cap() -> None:
+    async def scenario() -> None:
+        clock = _FakeClock(1_000_000_000)
+        endpoints = {1: ("127.0.0.1", 9201), 2: ("127.0.0.1", 9202)}
+        gateway = B3UdpGateway(client_weights={1: 0.5, 2: 0.5}, endpoints=endpoints, d=6, L=2,
+                               duration_ns=398 * MS, bottleneck_bps=1_000_000, clock_ns=clock)
+        transport = _FakeTransport()
+        gateway.transport = transport
+        try:
+            core = gateway.start_round(1)
+            clock.now_ns = core.start_ns + 30 * MS
+            gateway.receive_datagram(_ready(1), endpoints[1], clock.now_ns)
+            assert not core.plan_computed
+            clock.now_ns = core.start_ns + 60 * MS
+            gateway.receive_datagram(_ready(2), endpoints[2], clock.now_ns)
+            # The last READY triggers the plan at once, well before the 144.8 ms cap.
+            assert core.plan_computed and core.plan_ns == core.start_ns + 60 * MS
+            plan_packets = [decode_message(p, block_length=2) for p, _ in transport.packets
+                            if decode_message(p, block_length=2).message_type is MessageType.PLAN]
+            assert sorted(m.client_id for m in plan_packets) == [1, 2]
+            assert gateway.rejected_datagrams == 0 and gateway.plan_local_handoffs == 2
+            # The cap-time task then finds the plan made and sends nothing more.
+            clock.now_ns = core.plan_cap_ns
+            await gateway._plan_at_deadline()
+            assert gateway.plan_local_handoffs == 2
+        finally:
+            await gateway.close()
+
+    asyncio.run(scenario())
 
 
 def test_no_ready_clients_get_zero_plan_and_missing_ready_is_counted() -> None:
@@ -781,7 +874,11 @@ def test_no_data_uses_plan_plus_half_rtt_fallback_for_windows_and_loss_rate() ->
         client_weights={1: 1.0},
     )
     core.states[1].bhat_bps = 100_000.0
-    core.compute_plans(core.plan_ns)
+    # Early close at 100 ms (the only READY), so the window arithmetic below is
+    # the same as with the old fixed t_plan = 0.1 D.
+    core.accept_ready(_ready(1, tuple(float(100 - i) for i in range(100))), 100_000_000)
+    core.compute_plans(100_000_000)
+    assert core.plan_ns == 100_000_000
     core.plans[1] = B3ClientPlan(1, 100, 100_000, core.plan_ns)
     core._plan_sent.add(1)
     core.plan_srtt_ns[1] = 100_000_000
@@ -829,9 +926,10 @@ def test_rate_window_backlog_uses_shared_pacing_progress(
 def test_client_and_gateway_use_same_pacing_schedule_and_send_positions() -> None:
     async def scenario() -> None:
         gateway_core = _core(client_ids=(1,), bottleneck_bps=1_000_000)
-        gateway_core.accept_ready(_ready(1), gateway_core.plan_ns)
+        ready_ns = gateway_core.start_ns + plan_time_ns(gateway_core.duration_ns)
+        gateway_core.accept_ready(_ready(1), ready_ns)
         gateway_core.states[1].bhat_bps = 1_500_000.0
-        gateway_plan = gateway_core.compute_plans(gateway_core.plan_ns)[1]
+        gateway_plan = gateway_core.compute_plans(ready_ns)[1]  # early close: the only READY is in
         assert gateway_plan.blocks == 3
         start_ns = gateway_core.plan_ns + 1
         gateway_core.mark_plan_sent(1, start_ns)

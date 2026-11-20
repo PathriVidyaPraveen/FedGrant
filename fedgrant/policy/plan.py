@@ -17,12 +17,37 @@ EBAR_WEIGHT: float = 0.1
 EBAR_INIT: float = 1.0
 
 
-def plan_time_ns(D_ns: int) -> int:
-    """t_plan = 0.1 D. D is a whole number of ms, so this is exact in ns.
+# B3 READY cutoff (CHANGELOG 2026-11-21, approved by all four). A READY reaches
+# the gateway at most 2 (delta_max + 5 ms) + rho_i after the round starts
+# (ROUND_START leg, rho_i <= 0.1 D, READY leg; delta_max = 40 ms), i.e. by
+# 0.1 D + 90 ms; 15 ms covers measured host lateness (max 8.64 ms on the testbed).
+B3_READY_BOUND_NS: int = 2 * (40_000_000 + 5_000_000)
+B3_READY_MARGIN_NS: int = 15_000_000
+B3_READY_ALLOWANCE_NS: int = B3_READY_BOUND_NS + B3_READY_MARGIN_NS  # 105 ms
 
+
+def plan_time_ns(D_ns: int) -> int:
+    """0.1 D: the original Section 10 t_plan, now the base of the B3 plan cap.
+
+    D is a whole number of ms, so this is exact in ns.
     SPEC-NOTE: floors if D_ns is not divisible by 10.
     """
     return int(D_ns) // 10
+
+
+def plan_cap_offset_ns(D_ns: int) -> int:
+    """Latest B3 plan time after the round start: 0.1 D + 105 ms (CHANGELOG 2026-11-21).
+
+    B3 plans when the last expected READY arrives, and at this cap at the latest;
+    READYs received at the cap are included, later ones are ignored for the round.
+    Budget and caps then use the actual plan time. If the cap would reach D
+    (D < 116.7 ms, outside every configured experiment) it is D - 1 ns, which
+    leaves no budget: B3 is infeasible there (reported as not applicable).
+    """
+    D_ns = int(D_ns)
+    if D_ns < 1:
+        raise ValueError("D_ns must be positive")
+    return min(plan_time_ns(D_ns) + B3_READY_ALLOWANCE_NS, D_ns - 1)
 
 
 def plan_budget(C: int, D_ns: int, t_plan_ns: int, rtt_median_ns: float) -> int:
@@ -116,9 +141,11 @@ class DeliveryRatioEWMA:
 
 
 __all__ = [
+    "B3_READY_ALLOWANCE_NS",
     "DeliveryRatioEWMA",
     "plan_allocate",
     "plan_budget",
+    "plan_cap_offset_ns",
     "plan_caps",
     "plan_time_ns",
 ]

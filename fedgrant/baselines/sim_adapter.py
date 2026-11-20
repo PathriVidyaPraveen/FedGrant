@@ -395,6 +395,9 @@ def run_baseline_network_round(
                         "client_id": client,
                         "detail": "",
                     })
+                    if b3_core.ready_complete:
+                        # Early close: the last expected READY is in (CHANGELOG 2026-11-21).
+                        send_plans(None)
                 except B3PlanError as exc:
                     if "outside the round start-to-plan window" not in str(exc):
                         raise
@@ -413,7 +416,10 @@ def run_baseline_network_round(
             )
 
         def send_plans(_event) -> None:
+            # At the last READY (early close) or at the cap, whichever comes first.
             nonlocal plans
+            if b3_core.plan_computed:
+                return
             plans = b3_core.compute_plans(engine.now_ns)
             for cid, pending_plan in plans.items():
                 plan = b3_core.mark_plan_sent(cid, engine.now_ns)
@@ -479,7 +485,7 @@ def run_baseline_network_round(
                 )
 
         engine.schedule(
-            delay_ns=b3_core.plan_ns - engine.now_ns,
+            delay_ns=b3_core.plan_cap_ns - engine.now_ns,
             event_type=EventType.TICK_1MS,
             callback=send_plans,
         )
@@ -487,6 +493,8 @@ def run_baseline_network_round(
     engine.run_until(deadline_abs_ns)
     frames_sent_at_deadline = bottleneck.frames_sent
     access_queue_drops_at_deadline = sum(link.drops_queue for link in access_links)
+    # GE channel losses of DATA on the access links (READY/PLAN are not sent through them).
+    ge_data_drops_at_deadline = sum(link.drops_ge for link in access_links)
     bottleneck_data_drops_at_deadline = bottleneck.drops_queue_client
     data_queue_drops_at_deadline = access_queue_drops_at_deadline + bottleneck_data_drops_at_deadline
     cross_queue_drops_at_deadline = bottleneck.drops_queue_cross
@@ -585,6 +593,8 @@ def run_baseline_network_round(
         "queueing_delay_p99_ms": float(np.percentile(queueing_delays_ms, 99)) if queueing_delays_ms else 0.0,
         "drops_queue_data": data_queue_drops_at_deadline,
         "drops_queue_access": access_queue_drops_at_deadline,
+        # GE (channel) drops of DATA, separate from the two queues (attribution of missing blocks).
+        "drops_ge_data": ge_data_drops_at_deadline,
         # Spec queue drops: bottleneck drop-tail drops of FedGrant frames.
         "drops_queue_bn_client": bottleneck_data_drops_at_deadline,
         "drops_queue_cross": cross_queue_drops_at_deadline,

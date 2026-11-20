@@ -577,7 +577,10 @@ def run_experiment(*, n: int, scenario: str, seed: int, rounds: int, beta: float
             process_sampler.stop()
             process_sampler = None
         enrich_round_metrics(out, cross_mbps=cross_mbps)
-        baseline_eta_rounds = (fill_baseline_eta(out, n) if policy in {"B1", "B2"} else None)
+        # B1-B3 gateways log eta blank; it is joined from client block energies (D-09).
+        # B3 included since its plan cutoff fix (CHANGELOG 2026-11-21): its gateway knows
+        # only the READYs it planned with, so the same post-run join is used.
+        baseline_eta_rounds = (fill_baseline_eta(out, n) if policy in {"B1", "B2", "B3"} else None)
         if stub_run:
             summary_path = out / "gateway_summary.json"
             summary = json.loads(summary_path.read_text(encoding="utf-8"))

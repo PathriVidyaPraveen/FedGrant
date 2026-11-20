@@ -74,7 +74,12 @@ def test_real_udp_b3_round_start_ready_plan_and_energy_order_data() -> None:
             )
             assert result.rtt_samples_ns.keys() == result.plans.keys()
             assert all(sample >= 0 for sample in result.rtt_samples_ns.values())
-            assert core.plan_ns == core.start_ns + 50_000_000
+            # Both READYs arrived (rho = 0), so the plan was made at the last one,
+            # well before the 0.1 D + 105 ms = 155 ms cap (CHANGELOG 2026-11-21).
+            # (the plan is stamped when the gateway processes that READY).
+            assert max(core.ready_times_ns.values()) <= core.plan_ns < core.plan_cap_ns
+            assert core.plan_cap_ns == core.start_ns + 155_000_000
+            assert result.planned_early and result.ready_clients == 2
             assert core.accumulator.rejected_duplicates == 0
         finally:
             for client in clients:
