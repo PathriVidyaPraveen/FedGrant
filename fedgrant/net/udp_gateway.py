@@ -214,6 +214,18 @@ class UdpGateway(asyncio.DatagramProtocol):
                 self.stats.dropped_actions += 1
                 log.exception("dropping invalid gateway action")
 
+    async def flush_aggregates(self, timeout_s: float = 10.0) -> bool:
+        """Wait (bounded) for aggregate transfers still in flight; True if none is left.
+
+        Call before :meth:`close`, which cancels them: the last round's aggregate
+        is otherwise lost when the process exits right after the late drain (M2).
+        """
+        pending = tuple(self._aggregate_tasks)
+        if not pending:
+            return True
+        done, not_done = await asyncio.wait(pending, timeout=timeout_s)
+        return not not_done
+
     async def close(self) -> None:
         """Cancel scheduler/aggregate tasks and close the UDP transport."""
         self._closing = True
