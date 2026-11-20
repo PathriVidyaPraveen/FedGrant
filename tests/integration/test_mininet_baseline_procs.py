@@ -33,6 +33,10 @@ from fedgrant.sim.value_bank import load_value_bank
 N = 3
 SEED = 5
 SCHEDULE = RoundSchedule(duration_ns=250_000_000, compute_window_ns=60_000_000, late_drain_ns=80_000_000)
+# Multi-round runs over real sockets: gateway and clients share one event loop,
+# so under CPU load a 250 ms round can pass with no block delivered. The longer
+# D and Tc keep that from happening without changing what is checked.
+SOCKET_SCHEDULE = RoundSchedule(duration_ns=500_000_000, compute_window_ns=100_000_000, late_drain_ns=80_000_000)
 
 
 def _free_port(kind: int) -> int:
@@ -57,9 +61,9 @@ def _fixture_bank(tmp_path):
     return load_value_bank(path, N)
 
 
-def _config(policy: str, rounds: int = 3) -> BaselineConfig:
+def _config(policy: str, rounds: int = 3, schedule: RoundSchedule = SCHEDULE) -> BaselineConfig:
     return BaselineConfig(
-        policy=policy, num_clients=N, rounds=rounds, master_seed=SEED, schedule=SCHEDULE,
+        policy=policy, num_clients=N, rounds=rounds, master_seed=SEED, schedule=schedule,
         client_endpoints={cid: ("127.0.0.1", _free_port(socket.SOCK_DGRAM)) for cid in range(N)},
         gateway_host="127.0.0.1", gateway_bind_host="127.0.0.1",
         udp_port=_free_port(socket.SOCK_DGRAM), tcp_port=_free_port(socket.SOCK_STREAM),
@@ -76,9 +80,22 @@ def _jsonl(path):
 
 
 async def _run(cfg: BaselineConfig, bank, run_dir, *, extra=None):
-    gateway = asyncio.create_task(run_gateway(cfg, bank.client_weights, run_dir,
-                                              RoundStateFile(run_dir / "round_state.json")))
-    await asyncio.sleep(0.02)  # gateway sockets bound before clients start
+    opened = asyncio.Event()
+    original_open = baseline_proc.BaselineGateway.open
+
+    async def open_and_signal(self) -> None:
+        await original_open(self)
+        opened.set()
+
+    # Start the clients once the gateway's sockets are bound (not after a fixed
+    # sleep); its first ROUND_START still waits Tc.
+    baseline_proc.BaselineGateway.open = open_and_signal
+    try:
+        gateway = asyncio.create_task(run_gateway(cfg, bank.client_weights, run_dir,
+                                                  RoundStateFile(run_dir / "round_state.json")))
+        await asyncio.wait_for(opened.wait(), 10.0)
+    finally:
+        baseline_proc.BaselineGateway.open = original_open
     clients = [asyncio.create_task(run_client(cfg, cid, BankUpdateProvider(bank, SEED, cid),
                                               run_dir / f"client_{cid}.json", round_timeout_s=5.0))
                for cid in range(N)]
@@ -92,7 +109,7 @@ async def _run(cfg: BaselineConfig, bank, run_dir, *, extra=None):
 @pytest.mark.parametrize("policy", ["B1", "B2", "B3"])
 def test_baseline_processes_complete_rounds_over_real_sockets(policy, tmp_path) -> None:
     bank = _fixture_bank(tmp_path)
-    cfg = _config(policy)
+    cfg = _config(policy, schedule=SOCKET_SCHEDULE)
     run_dir = tmp_path / policy
     timings, summaries = asyncio.run(_run(cfg, bank, run_dir))
 
@@ -110,7 +127,7 @@ def test_baseline_processes_complete_rounds_over_real_sockets(policy, tmp_path) 
     metrics = _csv(run_dir / "round_metrics.csv")
     packets = _csv(run_dir / "packets.csv")
     assert [int(r["round_id"]) for r in metrics] == [1, 2, 3]
-    D = SCHEDULE.duration_ns
+    D = cfg.schedule.duration_ns
     for record, row in zip(gateway_rounds, metrics, strict=True):
         r = record["round_id"]
         # Readiness delays are the simulator's seeded draws (D-06).

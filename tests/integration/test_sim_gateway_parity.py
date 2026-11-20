@@ -42,7 +42,7 @@ from fedgrant.policy.pacing import InflightTracker, p_target_min_rtt, pacing_p
 from fedgrant.policy.selectors import make_selector, value_key
 from fedgrant.policy.types import CandidateView
 from fedgrant.predictors.ewma import PEWMA
-from fedgrant.policy.constants import K, L, S
+from fedgrant.policy.constants import K, L, S, THETA
 from fedgrant.sim.run_net import compute_deadline_ns, run_network_round
 
 _INPUT_FIELDS = {
@@ -67,6 +67,25 @@ _GRANT_FIELDS = ("grant_id", "send_pos", "timeout_ns")
 _SIM_COMPAT_FIELDS = {"selection_method", "selected_client_id", "p_pacing", "p_target"}
 _DECISION_FIELDS = _DECISION_FIELDS | _SIM_COMPAT_FIELDS | set(_GRANT_FIELDS)
 
+
+@pytest.fixture(autouse=True)
+def _frozen_predictor_clock(monkeypatch):
+    """Freeze FallbackPredictor's clock for every predictor built in this module.
+
+    Its 2 ms limit reads the wall clock (time.perf_counter_ns), so under CPU
+    load a P-EWMA call can "take" > 2 ms, switch that side to the fallback, and
+    make two otherwise identical decision streams diverge. A constant clock
+    keeps the limit from firing; the fallback itself is tested elsewhere with
+    an injected clock.
+    """
+    from fedgrant.predictors import fallback
+
+    original = fallback.FallbackPredictor.__init__
+
+    def init(self, primary, ewma=None, time_limit_ns=fallback.TIME_LIMIT_NS, clock=None):
+        original(self, primary, ewma, time_limit_ns, clock if clock is not None else (lambda: 0))
+
+    monkeypatch.setattr(fallback.FallbackPredictor, "__init__", init)
 
 def _round_seed(seed: int, round_id: int) -> int:
     # Match fedgrant.fl.server._network_round_seed(master_seed, round_id).
@@ -351,8 +370,9 @@ def test_simulator_replay_is_deterministic_and_reports_only_gateway_observables(
             assert event["outcome"] in {"grant_issued", "pacing_blocked"}
             issued = event["outcome"] == "grant_issued"
             assert all((event[k] is not None) == issued for k in _GRANT_FIELDS), event
-            # Simulator probe wiring (run_net eligibility mask) has not landed yet.
-            assert event["probe"] == 0, event
+            # Bounded probe: the flag is 0/1 and is only ever set below theta.
+            assert event["probe"] in (0, 1), event
+            assert not event["probe"] or event["p_hat"] < THETA, event
         else:
             expected = _INPUT_FIELDS[kind]
         assert set(event) == expected, (kind, sorted(set(event) ^ expected))
