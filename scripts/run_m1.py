@@ -33,6 +33,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import signal
 import subprocess
 import sys
@@ -130,6 +131,38 @@ def save_missing(path: Path, record: dict[str, list[str]]) -> None:
                     encoding="utf-8")
 
 
+def predictor_fallbacks(out: Path) -> int | None:
+    """meta.json predictor_fallbacks_total (None for B1-B3 or when not recorded)."""
+    try:
+        value = json.loads((out / "meta.json").read_text(encoding="utf-8")).get("predictor_fallbacks_total")
+    except (OSError, ValueError):
+        return None
+    return None if value is None else int(value)
+
+
+def gateway_rcvbuf_drops(out: Path) -> int | None:
+    """meta.json gateway_udp.RcvbufErrors: datagrams lost because the gateway read too slowly."""
+    try:
+        udp = json.loads((out / "meta.json").read_text(encoding="utf-8")).get("gateway_udp") or {}
+    except (OSError, ValueError):
+        return None
+    value = udp.get("RcvbufErrors")
+    return None if value is None else int(value)
+
+
+def busy_host_warning(threshold_per_cpu: float = 0.5) -> str | None:
+    """A warning when the 1-minute load average says the host is not idle (grant runs time the predictor)."""
+    try:
+        load = os.getloadavg()[0]
+    except OSError:
+        return None
+    cpus = os.cpu_count() or 1
+    if load > threshold_per_cpu * cpus:
+        return (f"WARNING: host load {load:.1f} on {cpus} CPUs; grant policies time the predictor "
+                "(2 ms budget), so stop other jobs before B4/B6/FG-GRU runs")
+    return None
+
+
 def run_one(cmd: list[str], out: Path, log) -> bool:
     started = time.monotonic()
     proc = subprocess.Popen(cmd, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -151,9 +184,20 @@ def run_one(cmd: list[str], out: Path, log) -> bool:
                   "`sudo pkill -f fedgrant.mininet` before the next run", flush=True)
         raise
     ok = proc.returncode == 0 and (out / "meta.json").is_file()
+    fallbacks = predictor_fallbacks(out) if ok else None
+    if fallbacks:
+        print(f"  WARNING: {fallbacks} predictor fallbacks to P-EWMA (Section 9 wall-clock budget); "
+              "the host was probably not idle. Keep it idle during grant runs.", flush=True)
+    rcvbuf = gateway_rcvbuf_drops(out) if ok else None
+    if rcvbuf:
+        print(f"  WARNING: gateway socket dropped {rcvbuf} datagrams (receive buffer full): the gateway "
+              "process could not keep up, so RTT/loss include a gateway-side queue the tc samples miss.",
+              flush=True)
     log.write(json.dumps({"output": str(out), "returncode": proc.returncode, "ok": ok,
                           "seconds": round(time.monotonic() - started, 1),
                           "rounds_completed": completed_rounds(out),
+                          "predictor_fallbacks_total": fallbacks,
+                          "gateway_rcvbuf_drops": rcvbuf,
                           "stderr_tail": (stderr or "")[-2000:]}) + "\n")
     log.flush()
     return ok
@@ -216,6 +260,8 @@ def main(argv: list[str] | None = None) -> None:
                         n += 1
                     out.rename(out.with_name(f"{out.name}.failed-{n}"))
                 print(f"[{index}/{len(todo)}] {out.name} (attempt {attempt}) ...", flush=True)
+                if pol in GRANT_POLICIES and (warning := busy_host_warning()):
+                    print("  " + warning, flush=True)
                 if run_one(command(grid_path, sc, pol, seed, out), out, log):
                     for key in record:
                         record[key] = [name for name in record[key] if name != out.name]

@@ -138,3 +138,48 @@ def test_b1_and_b2_records_use_the_same_energy_schema(tmp_path) -> None:
     assert np.all(by_block[np.asarray(encoded.order)] == np.asarray(encoded.energies_sorted))
     assert b1["block_energies"] == [float(x) for x in by_block]
     assert isinstance(b1["block_energies"], list) and all(isinstance(x, float) for x in b1["block_energies"])
+
+
+class _FailedConnect:
+    """Stands in for B1TcpClient.send_round when the TCP connect times out before D:
+    the real sender encodes the update, then finalizes the round with no delivery."""
+
+    async def send_round(self, core, *, gateway_host, round_id, deadline_ns, delta):
+        core.start_round(round_id, deadline_ns, delta)
+        core.finish_round(round_id, ())
+        return B1ClientTransfer(client_id=core.client_id, round_id=round_id, blocks_written=0,
+                                application_bytes_written=0, connected=False, connection_error="",
+                                close_reason="connection_failed", completed_ns=1, residual_finalized=True)
+
+
+@pytest.mark.parametrize("round_end_first", [True, False])
+def test_b1_failed_connect_still_logs_the_encoded_energies(tmp_path, round_end_first: bool) -> None:
+    async def scenario():
+        logs = baseline_proc._ClientLogs(tmp_path / "client_0.json", 0)
+        client = baseline_proc.PushOrTcpClient(_cfg(), 0, _update, logs)
+        baseline_proc._configure_error_feedback(client.core, client.cfg)
+        client.b1_sender = _FailedConnect()
+        if round_end_first:  # ROUND_END handled after encoding+finalize but before the task records energies
+
+            async def late(*args):
+                client.b1_core.start_round(1, 2**62, _update(1))
+                client.b1_core.finish_round(1, ())
+                client._on_round_end(_round_end(1, ()))
+            client._send_after_readiness = late
+        client._on_round_start(_round_start(1, deadline_ns=2**62), received_ns=0)
+        for _ in range(4):
+            await asyncio.sleep(0)
+        if not round_end_first:
+            client._on_round_end(_round_end(1, ()))
+        await asyncio.gather(*client._tasks, return_exceptions=True)
+        for timer in client._timers.values():
+            timer.cancel()
+        logs.close()
+
+    asyncio.run(scenario())
+    (record,) = [json.loads(line) for line in (tmp_path / "client_0_rounds.jsonl").read_text().splitlines()]
+    assert record["delivered"] == []
+    assert record["block_energies"] == _expected_energies(1)
+    (tmp_path / "gateway_rounds.jsonl").write_text(json.dumps({"round_id": 1, "delivered": {"0": []}}) + "\n")
+    (tmp_path / "client_0.json").write_text(json.dumps({"client_weight": 1.0}))
+    assert eta_from_run_dir(tmp_path, 1) == {1: 0.0}  # a real zero, not missing

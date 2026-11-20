@@ -132,3 +132,30 @@ def test_network_only_aggregate_sink_records_each_round(tmp_path):
     rows = [json.loads(line) for line in (tmp_path / "aggregates.jsonl").read_text().splitlines()]
     assert rows == [{"round_id": 3, "dimension": 117_694, "clients": 2, "delivered_coords": 2100},
                     {"round_id": 4, "dimension": 117_694, "clients": 0, "delivered_coords": 0}]
+
+
+def test_predictor_fallbacks_and_busy_host(tmp_path, monkeypatch):
+    run = _run(tmp_path / "r")
+    assert m1.predictor_fallbacks(run) is None
+    (run / "meta.json").write_text(json.dumps({"status": "ok", "predictor_fallbacks_total": 3}))
+    assert m1.predictor_fallbacks(run) == 3
+    monkeypatch.setattr(m1.os, "getloadavg", lambda: (10.0, 0, 0))
+    monkeypatch.setattr(m1.os, "cpu_count", lambda: 12)
+    assert "host load 10.0" in m1.busy_host_warning()
+    monkeypatch.setattr(m1.os, "getloadavg", lambda: (0.5, 0, 0))
+    assert m1.busy_host_warning() is None
+
+
+def test_gateway_udp_counters_and_rcvbuf_warning(tmp_path):
+    from fedgrant.mininet.run_mininet import gateway_udp_delta, udp_counters
+    snmp = ("Ip: Forwarding DefaultTTL\nIp: 1 64\n"
+            "Udp: InDatagrams NoPorts InErrors OutDatagrams RcvbufErrors SndbufErrors InCsumErrors IgnoredMulti MemErrors\n"
+            "Udp: {} 0 {} 10 {} 0 0 0 0\nUdpLite: InDatagrams\nUdpLite: 0\n")
+    before, after = udp_counters(snmp.format(100, 0, 0)), udp_counters(snmp.format(900, 40, 40))
+    assert before["InDatagrams"] == 100 and "Forwarding" not in before
+    assert gateway_udp_delta(before, after)["RcvbufErrors"] == 40
+    assert gateway_udp_delta({}, after) is None
+    run = _run(tmp_path / "r")
+    assert m1.gateway_rcvbuf_drops(run) is None
+    (run / "meta.json").write_text(json.dumps({"status": "ok", "gateway_udp": {"RcvbufErrors": 40}}))
+    assert m1.gateway_rcvbuf_drops(run) == 40
