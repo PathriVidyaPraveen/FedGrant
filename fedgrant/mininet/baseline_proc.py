@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import csv
+import dataclasses
 import json
 import time
 from collections.abc import Mapping
@@ -96,6 +97,9 @@ class BaselineConfig:
     # profile itself, so the client carries no error-feedback residual (D-19).
     # ROUND_END is still sent and processed; only the residual is discarded.
     network_only: bool = True
+    # M2 (end-to-end FL): the gateway sends each round's aggregate to the FL
+    # server at this (host, port); None for network-only runs.
+    aggregate_endpoint: tuple[str, int] | None = None
 
     def __post_init__(self) -> None:
         if self.policy not in BASELINES:
@@ -247,6 +251,8 @@ class BaselineGateway:
         self._b3: _LoggingB3Gateway | None = None
         self._b2: B2RoundAccumulator | None = None
         self._b1: B1TcpGateway | None = None
+        self._aggregate_tasks: set[asyncio.Task] = set()
+        self.aggregate_transfer_errors = 0
 
     async def open(self) -> None:
         loop = asyncio.get_running_loop()
@@ -262,6 +268,12 @@ class BaselineGateway:
             _, self._control = await loop.create_datagram_endpoint(lambda: _ControlEndpoint(self), local_addr=local)
 
     async def close(self) -> None:
+        # M2: let the last round's aggregate reach the FL server before exit.
+        if self._aggregate_tasks:
+            await asyncio.wait(tuple(self._aggregate_tasks), timeout=20.0)
+            for task in tuple(self._aggregate_tasks):
+                task.cancel()
+            await asyncio.gather(*self._aggregate_tasks, return_exceptions=True)
         if self._b1 is not None:
             await self._b1.close()
         if self._b3 is not None:
@@ -329,6 +341,28 @@ class BaselineGateway:
                 self._send_control(_encode_round_end(cfg, round_id, cid, book.delivered[cid]), cid,
                                    round_id, "ROUND_END")
         self.logs.event(time.monotonic_ns(), round_id, "round_end_sent")
+        if cfg.aggregate_endpoint is not None:
+            self._send_aggregate(round_id, round_result)
+
+    def _send_aggregate(self, round_id: int, round_result) -> None:
+        """M2: G_r = sum_i w_i u_hat_i (zero-filled, as fl/server.py) to the FL server."""
+        from fedgrant.net.fl_tcp import TcpAggregateSender
+
+        cfg = self.cfg
+        aggregate = round_result.aggregate(weighted_sum)
+        n_coords = {cid: {int(j): block_coords(cfg.d, cfg.L, int(j)) for j in result.delivered_indices}
+                    for cid, result in round_result.client_results.items()}
+        sender = TcpAggregateSender(*cfg.aggregate_endpoint)
+        task = asyncio.create_task(sender.send_aggregate(round_id, aggregate, n_coords))
+        self._aggregate_tasks.add(task)
+        task.add_done_callback(self._aggregate_done)
+
+    def _aggregate_done(self, task: asyncio.Task) -> None:
+        self._aggregate_tasks.discard(task)
+        if not task.cancelled() and task.exception() is not None:
+            self.aggregate_transfer_errors += 1
+            self.logs.event(time.monotonic_ns(), self.current.round_id if self.current else 0,
+                            "aggregate_transfer_failed", detail=repr(task.exception())[:200])
 
     def finalize_round(self, round_id: int) -> None:
         book = self.books[round_id]
@@ -672,6 +706,19 @@ class PushOrTcpClient:
         self.finished.put_nowait(round_id)
 
 
+def weighted_sum(updates, weights) -> np.ndarray:
+    """sum_i w_i u_hat_i in float32 (``fl/server.py::aggregate_updates`` without its d check)."""
+    out = np.zeros_like(updates[0], dtype=np.float64)
+    for w, update in zip(np.asarray(weights, dtype=np.float64), updates, strict=True):
+        out += w * np.asarray(update, dtype=np.float64)
+    return out.astype(np.float32)
+
+
+def block_coords(d: int, L: int, block_idx: int) -> int:
+    """Real coordinates in block j: L, except the zero-padded last block."""
+    return min(L, d - block_idx * L)
+
+
 def _configure_error_feedback(core, cfg: BaselineConfig) -> None:
     if cfg.network_only:
         core.error_feedback = ErrorFeedback(cfg.d, cfg.L, enabled=False)
@@ -711,8 +758,11 @@ async def run_client(cfg: BaselineConfig, client_id: int, provider: BankUpdatePr
     weight = getattr(provider, "weight", None)
     completed: list[int] = []
     summary: dict[str, Any] = {"client_id": client_id, "policy": cfg.policy}
-    updates = _PrefetchedUpdates(provider, cfg.rounds)
-    updates.prefetch(1)
+    if getattr(provider, "trains_in_background", False):
+        updates = provider  # M2: trains when the FL server's model arrives (fl_service)
+    else:
+        updates = _PrefetchedUpdates(provider, cfg.rounds)
+        updates.prefetch(1)
     try:
         if cfg.policy == "B3":
             summary.update(await _run_b3_client(cfg, client_id, updates, logs, round_timeout_s, completed, weight))
@@ -726,7 +776,8 @@ async def run_client(cfg: BaselineConfig, client_id: int, provider: BankUpdatePr
                     except asyncio.TimeoutError:
                         break
                     completed.append(finished)
-                    updates.prefetch(finished + 1)  # during late drain + Tc
+                    if hasattr(updates, "prefetch"):
+                        updates.prefetch(finished + 1)  # during late drain + Tc
             finally:
                 await client.close()
             summary.update(sent=client.sent_packets, rejected=client.rejected,
@@ -764,15 +815,17 @@ async def _run_b3_client(cfg, client_id, provider, logs, round_timeout_s, comple
                                        packet_seq="", grant_id="", send_pos=pos, block_idx=block_idx,
                                        packet_type="DATA", bytes=32 + 2 * cfg.L, payload_bytes=2 * cfg.L,
                                        result="sent")
-            # With network_only, u = provider(round_id) exactly (no residual), so
-            # these are the energies the client reported in READY.
-            base = getattr(provider, "provider", provider)  # deterministic: same u as sent
-            energies = _block_energies(encode(base(round_id), cfg.L))
-            logs.round({"round_id": round_id, "ready_sent_ns": record.ready_sent_ns,
-                        "plan_start_ns": record.plan_start_ns, "delivered": list(record.delivered_indices),
-                        "packets_sent": record.packets_sent, "status": record.finished_by,
-                        "transfer_status": record.transfer_status, "transfer_error": record.transfer_error,
-                        "block_energies": [float(x) for x in energies]})
+            entry = {"round_id": round_id, "ready_sent_ns": record.ready_sent_ns,
+                     "plan_start_ns": record.plan_start_ns, "delivered": list(record.delivered_indices),
+                     "packets_sent": record.packets_sent, "status": record.finished_by,
+                     "transfer_status": record.transfer_status, "transfer_error": record.transfer_error}
+            if cfg.network_only:
+                # With network_only, u = provider(round_id) exactly (no residual), so
+                # these are the energies the client reported in READY. (M2 trains a
+                # fresh update and carries a residual, so it cannot be recomputed.)
+                base = getattr(provider, "provider", provider)  # deterministic: same u as sent
+                entry["block_energies"] = [float(x) for x in _block_energies(encode(base(round_id), cfg.L))]
+            logs.round(entry)
             completed.append(round_id)
             if hasattr(provider, "prefetch"):
                 provider.prefetch(round_id + 1)  # during late drain + Tc
@@ -831,6 +884,8 @@ def main(argv: list[str] | None = None) -> None:
         p.add_argument("--client-port", type=int, default=UDP_CLIENT_PORT)
         p.add_argument("--tcp-port", type=int, default=TCP_GATEWAY_PORT)
         if role == "gateway":
+            p.add_argument("--aggregate-endpoint", default=None,
+                           help="M2: FL server HOST:PORT that receives each round's aggregate")
             p.add_argument("--log-dir", required=True)
             p.add_argument("--round-state", required=True)
             p.add_argument("--profile-gateway", action="store_true",
@@ -839,6 +894,12 @@ def main(argv: list[str] | None = None) -> None:
             p.add_argument("--client-id", type=int, required=True)
             p.add_argument("--log-file", required=True)
             p.add_argument("--round-timeout-s", type=float, default=10.0)
+            p.add_argument("--fl-model-port", type=int, default=None,
+                           help="M2: receive the FL server's model on this TCP port and train locally")
+            p.add_argument("--fl-data-root", default="data/femnist/reproduced/leaf/data")
+            p.add_argument("--fl-shard-root", default="data/femnist/reproduced/clients")
+            p.add_argument("--fl-trainer", default=None, help="module:function trainer factory (tests)")
+            p.add_argument("--fl-wait-s", type=float, default=30.0)
     args = parser.parse_args(argv)
     if args.mode is not None:
         args.policy = MODE_TO_POLICY[args.mode]
@@ -848,11 +909,36 @@ def main(argv: list[str] | None = None) -> None:
     cfg = _config_from_args(args, num_clients)
     bank = _load_real_bank(args.bank, num_clients)
     if args.role == "gateway":
+        if args.aggregate_endpoint:
+            from fedgrant.mininet.gateway_proc import parse_endpoint
+
+            cfg = dataclasses.replace(cfg, aggregate_endpoint=parse_endpoint(args.aggregate_endpoint))
         asyncio.run(run_gateway(cfg, bank.client_weights, Path(args.log_dir), RoundStateFile(args.round_state)))
+    elif args.fl_model_port is not None:
+        asyncio.run(run_fl_client(cfg, args))
     else:
         provider = BankUpdateProvider(bank, args.seed, args.client_id, source_path=args.bank)
         asyncio.run(run_client(cfg, args.client_id, provider, Path(args.log_file),
                                round_timeout_s=args.round_timeout_s))
+
+
+async def run_fl_client(cfg: BaselineConfig, args: argparse.Namespace) -> dict[str, Any]:
+    """M2 baseline client: local training on the received model, error feedback on (D-19)."""
+    from fedgrant.mininet.client_proc import make_fl_updates
+    from fedgrant.mininet.fl_service import start_model_receiver
+
+    cfg = dataclasses.replace(cfg, network_only=False)
+    updates = make_fl_updates(args)
+    receiver = await start_model_receiver(updates, port=args.fl_model_port)
+    try:
+        summary = await run_client(cfg, args.client_id, updates, Path(args.log_file),
+                                   round_timeout_s=args.round_timeout_s)
+    finally:
+        await receiver.close()
+        updates.close()
+    summary.update(fl_models_received=updates.models_received, fl_missing_models=updates.missing_models)
+    Path(args.log_file).write_text(json.dumps(summary, indent=2) + "\n")
+    return summary
 
 
 if __name__ == "__main__":

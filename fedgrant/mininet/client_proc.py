@@ -54,14 +54,48 @@ def make_update_provider(args: argparse.Namespace):
     return synthetic_provider
 
 
+def load_factory(spec: str):
+    """'package.module:function' -> the function."""
+    import importlib
+
+    module, sep, name = str(spec).partition(":")
+    if not sep or not module or not name:
+        raise ValueError(f"factory must be 'module:function', got {spec!r}")
+    return getattr(importlib.import_module(module), name)
+
+
+def make_fl_updates(args: argparse.Namespace):
+    """M2: train Delta_r on the FL server's MODEL r in the background (fl_service.TrainedUpdates)."""
+    from fedgrant.mininet.fl_service import TrainedUpdates, make_femnist_trainer
+    from fedgrant.policy.constants import D_MODEL
+
+    if args.fl_trainer:
+        trainer = load_factory(args.fl_trainer)(client_id=args.client_id, seed=args.seed)
+    else:
+        trainer = make_femnist_trainer(args.client_id, seed=args.seed, data_root=args.fl_data_root,
+                                       shard_root=args.fl_shard_root)
+    return TrainedUpdates(trainer, d=D_MODEL, wait_s=args.fl_wait_s)
+
+
 async def run(args: argparse.Namespace) -> None:
-    update_provider = PrefetchedUpdates(make_update_provider(args), args.rounds)
-    update_provider.prefetch(1)
-    # Network-only Mininet runs (M1, smoke): each round's update is the bank
-    # profile itself, so error feedback stays off (decision D-19, as in the B1-B3
-    # clients). With it on, undelivered residuals would change the READY energies
-    # away from the profile the M-sim twin receives. Real FL (M2) is not this path.
-    core = ClientCore(args.client_id, error_feedback=False)
+    fl_mode = getattr(args, "fl_model_port", None) is not None
+    model_receiver = None
+    if fl_mode:
+        # M2 (end-to-end FL): the update is trained on the received global model,
+        # and error feedback carries undelivered blocks to the next round (D-19).
+        from fedgrant.mininet.fl_service import start_model_receiver
+
+        update_provider = make_fl_updates(args)
+        model_receiver = await start_model_receiver(update_provider, port=args.fl_model_port)
+        core = ClientCore(args.client_id, error_feedback=True)
+    else:
+        update_provider = PrefetchedUpdates(make_update_provider(args), args.rounds)
+        update_provider.prefetch(1)
+        # Network-only Mininet runs (M1, smoke): each round's update is the bank
+        # profile itself, so error feedback stays off (decision D-19, as in the B1-B3
+        # clients). With it on, undelivered residuals would change the READY energies
+        # away from the profile the M-sim twin receives.
+        core = ClientCore(args.client_id, error_feedback=False)
 
     packet_path = Path(args.log_file).with_name(f"client_{args.client_id}_packets.csv")
     packet_stream = packet_path.open("w", newline="", encoding="utf-8")
@@ -100,21 +134,31 @@ async def run(args: argparse.Namespace) -> None:
                 completed.append(round_id)
                 last_seen = round_id
                 # Idle until the next ROUND_START (late drain + Tc): prepare its update now.
-                update_provider.prefetch(round_id + 1)
+                # (M2 trains as soon as the next model arrives instead.)
+                if hasattr(update_provider, "prefetch"):
+                    update_provider.prefetch(round_id + 1)
             # Event is level-triggered and remains set after ROUND_END. Consume
             # it here so the next wait cannot return the previous round twice.
             client._round_end_event.clear()
         stats = client.stats
-        Path(args.log_file).write_text(json.dumps({
+        summary = {
             "client_id": args.client_id, "completed_rounds": completed, "sent": stats.sent,
             "received": stats.received, "malformed": stats.malformed,
             "timeouts": stats.round_end_timeouts,
-        }, indent=2) + "\n")
+        }
+        if fl_mode:
+            summary.update(fl_models_received=update_provider.models_received,
+                           fl_missing_models=update_provider.missing_models)
+        Path(args.log_file).write_text(json.dumps(summary, indent=2) + "\n")
     finally:
         try:
             await client.close()
         finally:
             packet_stream.close()
+            if model_receiver is not None:
+                await model_receiver.close()
+            if fl_mode:
+                update_provider.close()
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -128,6 +172,15 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--clients", type=int, default=None, help="N; required with --value-bank")
     parser.add_argument("--value-bank", default=None,
                         help="FULL value bank (.npz); omit only for synthetic smoke profiles")
+    fl = parser.add_argument_group("M2 (end-to-end FL)")
+    fl.add_argument("--fl-model-port", type=int, default=None,
+                    help="receive the FL server's model on this TCP port and train locally (M2)")
+    fl.add_argument("--fl-data-root", default="data/femnist/reproduced/leaf/data")
+    fl.add_argument("--fl-shard-root", default="data/femnist/reproduced/clients")
+    fl.add_argument("--fl-trainer", default=None,
+                    help="module:function trainer factory (tests); default: the FEMNIST CNN trainer")
+    fl.add_argument("--fl-wait-s", type=float, default=30.0,
+                    help="max wait at ROUND_START for local training still running")
     args = parser.parse_args(argv)
     asyncio.run(run(args))
 

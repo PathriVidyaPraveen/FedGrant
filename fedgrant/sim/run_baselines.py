@@ -257,6 +257,16 @@ def run_baseline_round(
             delivery_ewma=state.b3_delivery_ewma,
         )
 
+    def _on_b3_ready(packet: bytes, t: int) -> None:
+        # READYs after the plan cap (or after the plan) are ignored for the round;
+        # the last expected READY triggers the plan (CHANGELOG 2026-11-21).
+        assert b3_core is not None
+        if t > b3_core.plan_cap_ns or b3_core.plan_computed:
+            return
+        b3_core.accept_ready(packet, t)
+        if b3_core.ready_complete:
+            _send_plans()
+
     rho_by_client: dict[int, int] = {}
     packets_sent_by_client = [0] * num_clients
     data_bytes_sent_by_client = [0] * num_clients
@@ -314,16 +324,17 @@ def run_baseline_round(
             engine.schedule(
                 delay_ns=ready_arrival - engine.now_ns,
                 event_type=EventType.READY_ARRIVE,
-                callback=lambda _evt, packet=ready_packet, t=ready_arrival, core=b3_core: core.accept_ready(packet, t)
-                if t <= core.plan_ns
-                else None,
+                callback=lambda _evt, packet=ready_packet, t=ready_arrival: _on_b3_ready(packet, t),
             )
 
     if mode == "B3":
         assert b3_core is not None
-        plan_ns = b3_core.plan_ns
+        plan_ns = b3_core.plan_cap_ns  # latest plan time (CHANGELOG 2026-11-21)
 
         def _send_plans(_evt: Any = None) -> None:
+            # At the last READY (early close) or at the cap, whichever comes first.
+            if b3_core.plan_computed:
+                return
             plans = b3_core.compute_plans(engine.now_ns)
             for cid, _plan in plans.items():
                 plan = b3_core.mark_plan_sent(cid, engine.now_ns)

@@ -43,8 +43,8 @@ from fedgrant.policy.plan import (
     DeliveryRatioEWMA,
     plan_allocate,
     plan_budget,
+    plan_cap_offset_ns,
     plan_caps,
-    plan_time_ns,
 )
 
 log = logging.getLogger(__name__)
@@ -71,13 +71,20 @@ class B3RoundResult:
     round_id: int
     start_ns: int
     deadline_ns: int
-    plan_ns: int
+    plan_ns: int  # actual plan time: the last READY's arrival, or plan_cap_ns at the latest
     budget: int
     median_rtt_ns: float | None
     caps: Mapping[int, int]
     plans: Mapping[int, B3ClientPlan]
     rtt_samples_ns: Mapping[int, int]
     round_result: B2RoundResult
+    plan_cap_ns: int | None = None
+    ready_clients: int = 0
+
+    @property
+    def planned_early(self) -> bool:
+        """True when every READY arrived and the plan was made before the cap."""
+        return self.plan_cap_ns is not None and self.plan_ns < self.plan_cap_ns
 
     @property
     def completed_at_deadline(self) -> bool:
@@ -88,7 +95,16 @@ class B3RoundResult:
 
 
 class B3GatewayCore:
-    """Deterministic B3 plan and DATA state, independent of socket scheduling."""
+    """Deterministic B3 plan and DATA state, independent of socket scheduling.
+
+    Plan time (CHANGELOG 2026-11-21): the plan is made when the last expected
+    READY arrives, and at ``plan_cap_ns`` = start + 0.1 D + 105 ms at the latest.
+    READYs received at the cap are included; later ones are rejected for the
+    round. ``plan_ns``/``plan_offset_ns`` hold the cap until the plan is made and
+    the actual plan time afterwards; the budget M and the caps c_i use the actual
+    plan time. Callers plan at ``plan_cap_ns`` unless ``ready_complete`` lets
+    them plan earlier.
+    """
 
     def __init__(
         self,
@@ -121,8 +137,11 @@ class B3GatewayCore:
         self.start_ns = start_ns
         self.deadline_ns = deadline_ns
         self.duration_ns = deadline_ns - start_ns
-        self.plan_offset_ns = plan_time_ns(self.duration_ns)
-        self.plan_ns = start_ns + self.plan_offset_ns
+        self.plan_cap_offset_ns = plan_cap_offset_ns(self.duration_ns)
+        self.plan_cap_ns = start_ns + self.plan_cap_offset_ns
+        # Latest plan time until compute_plans() runs, then the actual plan time.
+        self.plan_offset_ns = self.plan_cap_offset_ns
+        self.plan_ns = self.plan_cap_ns
         self.d = d
         self.L = L
         self.K = (d + L - 1) // L
@@ -188,7 +207,7 @@ class B3GatewayCore:
         if message.round_id != self.round_id or message.client_id not in self.states:
             self.rejected_events += 1
             raise B3PlanError("READY has a stale round or unknown client")
-        if received_ns < self.start_ns or received_ns > self.plan_ns:
+        if received_ns < self.start_ns or received_ns > self.plan_cap_ns or self._plan_computed:
             self.rejected_events += 1
             raise B3PlanError("READY arrived outside the round start-to-plan window")
         cid = message.client_id
@@ -207,13 +226,27 @@ class B3GatewayCore:
             raise B3PlanError(f"invalid READY values: {exc}") from exc
         self.ready_times_ns[cid] = received_ns
 
+    @property
+    def ready_complete(self) -> bool:
+        """Every configured client's READY has arrived: the plan may be made now."""
+        return len(self.ready_times_ns) == len(self.client_ids)
+
+    @property
+    def plan_computed(self) -> bool:
+        return self._plan_computed
+
     def compute_plans(self, now_ns: int) -> dict[int, B3ClientPlan]:
         if self._plan_computed:
             raise B3PlanError("PLAN has already been computed for this round")
-        if now_ns < self.plan_ns:
-            raise B3PlanError("cannot compute PLAN before t_plan")
+        if now_ns < self.plan_cap_ns and not self.ready_complete:
+            raise B3PlanError("cannot compute PLAN before every READY or the plan cap")
+        if self.ready_times_ns and now_ns < max(self.ready_times_ns.values()):
+            raise B3PlanError("cannot compute PLAN before the READYs it uses")
         if now_ns >= self.deadline_ns:
             raise B3PlanError("cannot compute PLAN at or after the deadline")
+        # Budget and caps use the actual plan time (CHANGELOG 2026-11-21).
+        self.plan_ns = now_ns
+        self.plan_offset_ns = now_ns - self.start_ns
 
         for cid in self.client_ids:
             self._advance_rate_window(cid, self.plan_ns, backlogged=False)
@@ -363,6 +396,8 @@ class B3GatewayCore:
             plans=self.plans.copy(),
             rtt_samples_ns=self.rtt_samples_ns.copy(),
             round_result=round_result,
+            plan_cap_ns=self.plan_cap_ns,
+            ready_clients=len(self.ready_times_ns),
         )
 
     def _advance_rate_window(
@@ -564,6 +599,16 @@ class B3UdpGateway(asyncio.DatagramProtocol):
         except (B3PlanError, B2ProtocolError, WireProtocolError, ValueError, TypeError):
             self.rejected_datagrams += 1
             log.debug("rejecting invalid B3 datagram", exc_info=True)
+            return
+        if core.ready_complete and not core.plan_computed:
+            # Early close: the last expected READY is in, so plan now instead of
+            # waiting for the cap (CHANGELOG 2026-11-21).
+            try:
+                self._send_plans()
+            except Exception as exc:  # noqa: BLE001 - surfaced by wait(), like the plan task
+                self._plan_error = exc
+                log.error("B3 early PLAN failed", exc_info=True)
+                self._closed_event.set()
 
     def error_received(self, exc: Exception) -> None:
         log.error("B3 UDP gateway socket error: %r", exc)
@@ -619,8 +664,21 @@ class B3UdpGateway(asyncio.DatagramProtocol):
         core = self.core
         if core is None:
             return
-        await _sleep_until(core.plan_ns, self.clock_ns)
+        await _sleep_until(core.plan_cap_ns, self.clock_ns)
+        if core is self.core and not core.plan_computed:
+            self._send_plans()
+
+    def _send_plans(self) -> None:
+        """Compute the round's plans now and send one PLAN per client."""
+        core = self.core
+        if core is None or core.plan_computed:
+            return
         now_ns = self.clock_ns()
+        if now_ns >= core.deadline_ns:
+            # Only reachable when the cap is D - 1 ns (D < 116.7 ms): the budget is
+            # zero, so plan with no time left and send nothing that would arrive after D.
+            core.compute_plans(core.deadline_ns - 1)
+            return
         plans = core.compute_plans(now_ns)
         for cid, plan in plans.items():
             sent_ns = self.clock_ns()

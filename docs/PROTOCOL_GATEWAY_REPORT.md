@@ -196,7 +196,9 @@ retransmission. Both end with ROUND_END.
   which writes one line per round to `aggregates.jsonl` (round id, dimension,
   clients, delivered coordinates) and does not apply the aggregate to a model
   (`test_run_m1.py::test_network_only_aggregate_sink_records_each_round`).
-  M2 still needs a real sender to the FL server (§9).
+  For M2, `gateway_proc --aggregate-endpoint HOST:PORT` sends each aggregate
+  to the FL server with `TcpAggregateSender` instead (§3.1), and the gateway
+  flushes the last round's transfer before exiting (`UdpGateway.flush_aggregates`).
 - **Probe logging** (CHANGELOG 2026-11-14 eligibility amendment). The raw
   grant log gains a `probe` column, 1 on the *issued* row of a probe grant and
   0 otherwise (`logging_tap._probe_flag` → `GatewayCore.is_probe_grant`).
@@ -207,6 +209,57 @@ retransmission. Both end with ROUND_END.
   one exists). Both columns are appended last in `common/logschema.py`, and both
   are blank for B1–B3 or for a core without probe support
   (`test_probe_logging.py`, `test_run_grid.py::test_*probe*`).
+
+### 3.1 End-to-end FL over the network (M2)
+
+`fedgrant/mininet/fl_service.py` implements the M2 loop for the grant
+gateway (FG-GRU) and B3 alike:
+
+1. **Model broadcast.** The FL server (`FLServer`; `python -m
+   fedgrant.mininet.fl_service` on `srv`, aggregates on TCP 9200) sends
+   MODEL r to every client's model port (TCP 9201, `fl_tcp`). Each client
+   is retried until a timeout. θ₀ is `create_model(seed)`, as in the
+   simulated FL path.
+2. **Local training.** Each client (`client_proc --fl-model-port`, or
+   `baseline_proc client --fl-model-port` for B3) trains Δ_r on its own
+   FEMNIST shard as soon as MODEL r arrives, in a background thread
+   (`TrainedUpdates`). Training uses 20 SGD steps at lr 0.05 with the
+   client's persistent, seeded batch loader, as in `fl/server.py`.
+   ROUND_START r only looks the update up. Error feedback is on (D-19).
+3. **Round.** The round runs as in M1.
+4. **Aggregate.** At D the gateway sends G_r = Σᵢ wᵢ ûᵢ and the
+   per-client coordinate counts to the server. For B3, `BaselineGateway`
+   computes G_r from the round's decoded updates.
+5. **Apply.** The server applies θ ← θ + G_r (step 5 of
+   `fl/server.py::run_fl_simulated`) and sends MODEL r+1. The ACK is not held
+   up: evaluation every `eval_every` rounds and the next broadcast run in the
+   background. History goes to `fl_history.jsonl`: round, status, model
+   version, delivered blocks and coordinates, ‖G_r‖, models sent, and test
+   loss and accuracy.
+
+**Failures.**
+- A client without MODEL r sits the round out (`ModelUnavailable`, so no
+  READY).
+- A lost aggregate leaves the model unchanged. Those rounds are recorded as
+  `aggregate_missing` when a later round's aggregate arrives, so one lost
+  transfer does not stall the run.
+- Stale, malformed or non-finite aggregates are rejected and the model is
+  left unchanged.
+- The server stops after an idle timeout if the gateway stops.
+
+**Evidence: localhost only, with a synthetic trainer.**
+`tests/integration/test_m2_fl_loop.py` runs 3 rounds each through the
+production B6 gateway and through the B3 baseline processes. It checks
+three things:
+- θ_R = θ₀ + Σ_r G_r, with exactly the aggregates the gateway sent;
+- every client trained round r on exactly θ_{r−1};
+- the delivered blocks match the gateway's logs.
+
+`tests/unit/test_fl_service.py` covers the update rule, missing and stale
+aggregates, evaluation scheduling, and the trainer. **M2 has not been run:**
+it needs the runner wiring, FEMNIST on the testbed, and Mininet. The
+run_mininet guard that refuses to label output as M2 stays in place until
+then.
 
 ---
 
@@ -448,10 +501,39 @@ functionally issues probes and follows min-RTT.
   `B3ClientRoundRecord` with `transfer_status` ∈ {no_plan, completed,
   cancelled, failed}; partial transfers keep exact sent counts.
 
-### 6.1 B3 READY cutoff margin (testbed evidence)
+### 6.1 B3 plan time and READY cutoff (CHANGELOG 2026-11-21)
 
-B3 currently plans at t_plan = 0.1·D (`policy/plan.py::plan_time_ns`).
-Since ρᵢ ~ U(0, 0.1·D) and a READY reaches the gateway only after
+**Rule (implemented).** B3 plans when the last expected READY arrives, and at
+t_cap = 0.1·D + 105 ms at the latest (144.8 ms at β = 0.10, N = 20).
+READYs received at the cap are included; later ones are rejected for the
+round. The budget M and the caps cᵢ use the **actual** plan time, so an early
+plan leaves more budget. Implementation: `policy/plan.py::plan_cap_offset_ns`;
+`B3GatewayCore` (`plan_cap_ns`, `ready_complete`; `compute_plans(now)` sets
+`plan_ns`/`plan_offset_ns`). The UDP gateway (`B3UdpGateway`) and both
+simulators (`baselines/sim_adapter.py`, `sim/run_baselines.py`) plan on the
+last READY or at the cap. `B3RoundResult` records `plan_cap_ns`,
+`ready_clients` and `planned_early`. The Mininet runner now fills B3's η by
+the same post-run join as B1 and B2 (`run_mininet.py`, `round_summary.py`).
+Tests: `test_b3_plan.py` (cap values, early close, budget from the actual
+time, READY at and after the cap, UDP early close), `test_b3_plan_loopback.py`,
+and `test_mininet_baseline_procs.py`, where every B3 round now has a plan.
+
+**Effect in M-sim** (sim_adapter, N = 20, L2, 20 rounds, random sorted energies):
+
+| β | READYs registered | plan time | planned | delivered | GE drops | bottleneck drops |
+|---|---|---|---|---|---|---|
+| 0.05 | 20 / 20 | 102.5–109.8 ms | 0 (M = 0) | 0 | 0 | 0 |
+| 0.10 | 20 / 20 | 115.1–129.5 ms | 148 | 136 | 1.4 | 10.1 |
+| 0.20 | 20 / 20 | 144.0–169.2 ms | 454 | 225 | 16.6 | 212.6 |
+
+Every round closed early, at the last READY. Under the old 0.1·D cutoff
+(39.8 ms at β = 0.10) almost no READY had arrived. At β = 0.20 the missing
+blocks are mostly **bottleneck queue drops**, not GE loss. B3 paces each
+client at its own b̂ᵢ, and the clients together exceed C. This is the
+attribution Jayadev asked for: `sim_adapter` now reports `drops_ge_data`
+next to the access and bottleneck queue counters.
+
+**Why the old rule failed.** Since ρᵢ ~ U(0, 0.1·D) and a READY reaches the gateway only after
 ROUND_START delivery (δᵢ + 5 ms), ρᵢ and the READY's own path (δᵢ + 5 ms),
 a client with a large ρᵢ or δᵢ misses the plan and gets k = 0. That is a
 property of the cutoff, not of the client. The proposed cutoff covers the
@@ -487,9 +569,9 @@ the initial median RTT is −10.9 ms. The simulator diagnostic of the fixed
 evidence. Every READY registered. L4 at β = 0.10 delivered 86.0 % of planned
 blocks, and 83 % of the shortfall was DATA arriving after D. L2 at β = 0.20
 lost 25.7 % of planned blocks in the network, which is a separate problem. The
-cutoff is
-**not changed in code** yet. The agreed reporting conventions and the
-remaining vote are in §9, item 9.
+cutoff is now
+implemented as above. B3 M1 runs and M-sim twins made before 2026-11-21 are
+superseded and must be rerun.
 
 ---
 
@@ -621,6 +703,8 @@ Status: **U** unit-tested, **I** integration-tested on localhost,
 | READY timed from ROUND_START receipt | `UdpClient._handle_round_start` | `test_udp_client.py::test_ready_deadline_is_receipt_plus_rho_when_encoding_finishes_first`, `test_real_loop_ready_gap_excludes_encoding_time` | U |
 | Simulator ↔ GatewayCore decision parity | `production.py`, `sim/run_net.py` | `test_sim_gateway_parity.py`, `test_mininet_production.py` | U, I |
 | B3 RTT definition | `B3GatewayCore.accept_data`, `mark_plan_sent` | `test_b3_rtt_producer.py`, `test_b3_rtt_fl_path.py`, `test_b3_plan.py::test_first_data_position_after_one_accounts_for_pacing_offset` | U, I |
+| B3 plan at the last READY, capped at 0.1·D + 105 ms; budget from the actual plan time | `policy/plan.py::plan_cap_offset_ns`, `B3GatewayCore.compute_plans`, `B3UdpGateway`, `sim_adapter`, `run_baselines` | `test_b3_plan.py::test_plan_cap_is_a_tenth_of_d_plus_the_ready_allowance`, `test_early_close_plans_at_the_last_ready_with_the_actual_plan_time`, `test_ready_at_the_cap_is_included_and_later_readies_are_ignored`, `test_udp_gateway_plans_on_the_last_ready_without_waiting_for_the_cap`; `test_b3_plan_loopback.py`; `test_mininet_baseline_procs.py` | U, I |
+| M2 FL loop: model broadcast, local training, aggregate to the FL server, θ ← θ + G | `mininet/fl_service.py`, `gateway_proc --aggregate-endpoint`, `client_proc`/`baseline_proc --fl-model-port`, `UdpGateway.flush_aggregates` | `test_fl_service.py`; `test_m2_fl_loop.py` (grant gateway and B3 processes, synthetic trainer) | U, I (not run on Mininet) |
 | B2/B3 goodput (padded 1400 B) | `baseline_proc.finalize_round`, `sim_adapter` | `test_b2_b3_accounting.py::test_goodput_boundary_matches_grant_simulator_for_padded_final_block`, `test_mininet_baseline_procs.py` (packets ↔ summary ↔ goodput) | U, I |
 | B1/B2/B3 processes over real sockets | `baseline_proc.py` | `test_mininet_baseline_procs.py::test_baseline_processes_complete_rounds_over_real_sockets` | I |
 | Gateway profiling harness | `profiling/gateway.py` | `test_gateway_profile_harness.py`; localhost run in §7.1 | U, I |
@@ -641,10 +725,12 @@ Status: **U** unit-tested, **I** integration-tested on localhost,
    measured; it needs a team decision (accept, or change the loop's timer).
 2. **N = 5 at β = 0.10.** D = 100 ms is below srtt₀ + 2 ms, so no grant is ever
    eligible. This only affects runs outside the M1 configuration (N = 20).
-3. **Aggregate receiver: resolved for M1, open for M2.** `serve` now
-   installs `NetworkOnlyAggregateSink` (§3), so network-only runs no longer
-   count `aggregate_transfer_errors`. M2 (FL over Mininet) still needs a real
-   aggregate sender to the FL server.
+3. **Aggregate receiver: resolved for M1; M2 implemented, not yet run.**
+   `serve` installs `NetworkOnlyAggregateSink` for network-only runs. For M2,
+   the gateway sends to the FL server (§3.1). What M2 still needs: the
+   runner launching the FL server on `srv` and the FL flags (Tejaswi), the
+   FEMNIST shards on the hosts (Jayadev), and a timing check that 20
+   clients' local training fits in Tc on the testbed host.
 4. **`stale_round_data` is not exported** to `gateway_summary.json` by
    `gateway_proc.finish_round` (Tejaswi; contract §2 key list). It is visible
    in `GatewayStats` and, on the baseline path, as `rejected` packets with
@@ -675,9 +761,9 @@ Status: **U** unit-tested, **I** integration-tested on localhost,
      parity with M-sim within the M1 fingerprint tolerances: η and delivered
      blocks within ±0.03, late-DATA fraction within ±10 % relative.
 
-   Still open: early close at the last READY capped at 0.1·D + 105 ms
-   (Tejaswi, Praveen and Prajin vote yes), or the fixed 0.1·D + 105 ms. This
-   waits for Jayadev's vote. B3 M1 runs wait for the change.
+   **Decided and implemented (§6.1):** early close at the last READY, capped
+   at 0.1·D + 105 ms; all four voted for it. B3 M1 runs and M-sim twins must
+   now be rerun.
 10. **Load-sensitive tests (diagnosed, fixed in the tests).** Several
     integration tests failed only when the machine was busy. They were
     stress-tested by running many pytest processes in parallel on a 16-core

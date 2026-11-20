@@ -140,14 +140,35 @@ async def serve(args: argparse.Namespace) -> None:
     gateway = await LoggingUdpGateway.bind(core, local_addr=("10.0.0.254", args.port),
                                            endpoints=endpoints, log_dir=args.log_dir,
                                            profile_scheduler=args.profile_gateway,
-                                           aggregate_sender=NetworkOnlyAggregateSink(args.log_dir))
+                                           aggregate_sender=aggregate_sender_from_args(args))
     try:
         await run_rounds(
             GrantRoundProtocol(core, gateway, num_clients=args.clients, K=args.blocks, L=args.block_length,
                                seed=args.seed),
             timing_from_args(args), round_state=RoundStateFile(args.round_state), log_dir=args.log_dir)
+        # M2: the last round's aggregate must reach the FL server before exit.
+        await gateway.flush_aggregates(getattr(args, "aggregate_timeout_s", 10.0) * 2)
     finally:
         await gateway.close()
+
+
+def parse_endpoint(text: str) -> tuple[str, int]:
+    """HOST:PORT -> (host, port)."""
+    host, sep, port = str(text).rpartition(":")
+    if not sep or not host or not port.isdigit() or not 0 < int(port) <= 0xFFFF:
+        raise ValueError(f"endpoint must be HOST:PORT, got {text!r}")
+    return host, int(port)
+
+
+def aggregate_sender_from_args(args: argparse.Namespace):
+    """M2 (FL over Mininet): send each aggregate to the FL server; otherwise network-only."""
+    endpoint = getattr(args, "aggregate_endpoint", None)
+    if not endpoint:
+        return NetworkOnlyAggregateSink(args.log_dir)
+    from fedgrant.net.fl_tcp import TcpAggregateSender
+
+    host, port = parse_endpoint(endpoint)
+    return TcpAggregateSender(host, port, timeout=getattr(args, "aggregate_timeout_s", 10.0))
 
 
 def timing_from_args(args: argparse.Namespace) -> RoundTiming:
@@ -178,6 +199,10 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--value-bank", default=None,
                         help="FULL value bank (.npz); client weights come from it. Default: uniform 1/N")
     parser.add_argument("--models-dir", default=DEFAULT_MODELS_DIR)
+    parser.add_argument("--aggregate-endpoint", default=None,
+                        help="M2: FL server HOST:PORT that receives each round's aggregate "
+                             "(default: network-only sink, aggregates.jsonl)")
+    parser.add_argument("--aggregate-timeout-s", type=float, default=10.0)
     args = parser.parse_args(argv)
     if (args.clients < 1 or args.rounds < 1 or args.duration_ns < 1
             or args.compute_window_s < 0 or args.late_drain_s < 0 or args.inter_round_s < 0):

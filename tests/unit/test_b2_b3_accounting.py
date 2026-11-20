@@ -245,6 +245,7 @@ def test_congested_round_counters_partition_without_double_counting(policy: str)
     # Each sent DATA ends in at most one outcome: delivered by D, dropped in a
     # queue (counted at D), lost on the access link (GE) or late after D.
     assert delivered + m["drops_queue_data"] + m["late_after_deadline"] <= m["data_packets_sent"]
+    assert delivered + m["drops_queue_data"] + m["drops_ge_data"] + m["late_after_deadline"] <= m["data_packets_sent"]
     assert m["drops_queue_data"] == m["drops_queue_access"] + m["drops_queue_bn_client"]
     # Every delivered DATA left the bottleneck by D; cross frames share it.
     assert m["frames_sent"] >= delivered and 0.0 <= m["utilization"] <= 1.0 + 1e-9
@@ -252,4 +253,6 @@ def test_congested_round_counters_partition_without_double_counting(policy: str)
     if policy == "B2":
         assert m["drops_queue_bn_client"] > 0 and m["drops_queue_cross"] > 0 and m["late_after_deadline"] > 0
     else:
-        assert delivered <= m["planned_blocks"] and m["drops_queue_bn_client"] == 0
+        # B3 sizes its budget for the full C and does not see the 3 Mbit/s cross
+        # traffic, so its planned blocks can overflow the bottleneck queue too.
+        assert 0 < delivered <= m["planned_blocks"]
