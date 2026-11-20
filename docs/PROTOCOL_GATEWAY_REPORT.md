@@ -251,24 +251,31 @@ Otherwise the core takes the next send position, the timeout τ_g, allocates
 `grant_id`, inserts the outstanding grant and its probability into Φ, and
 emits `SendGrant`.
 
-**Bounded probe (rule (v) amendment, `POLICY_REVISION = "2026-11-13-probe"`).**
+**Bounded probe (rule (v) amendment, CHANGELOG 2026-11-13; `POLICY_REVISION = "2026-11-17-probe-minrtt"`).**
 A client that passes rules (i)–(iv) and fails only rule (v) (p̂ᵢ < θ) may get
 at most one *probe* grant per round, so its predictor can recover from a
 lockout. A probe still goes through the selector and pacing and is accounted
 like any other grant. `is_eligible(..., probe_available=True)` returns
-`Reason.PROBE` for such a client (`policy/eligibility.py`). The core reads an
-optional `probe` mask on the candidate view (`getattr(candidates, "probe", None)`;
-the field is not yet on `CandidateView`) and classifies a grant as a probe
-only when the mask is set **and** p̂ᵢ < θ. The allowance is consumed at issue,
+`Reason.PROBE` for such a client (`policy/eligibility.py`). A NaN p̂ᵢ is never
+a probe; it fails rule (v). The simulator's eligibility provider
+(`sim/run_net.py::_CoreEligibility`) passes
+`probe_available=core.probe_available(i)` and sets the optional
+`CandidateView.probe` mask from `Reason.PROBE`. `CandidateView` validates the
+mask as a 1-D bool array aligned with the candidates. The core classifies a
+grant as a probe only when the mask is set **and** p̂ᵢ < θ. The allowance is consumed at issue,
 after the outstanding grant and its Φ entry exist, so a probe blocked by
 pacing keeps its allowance. Offering a probe after the allowance is used
 raises `GatewayError` without mutating state. The allowance resets only at a
 valid ROUND_START and survives the deadline and drain. Ablation A4 (no
 rule (v)) never probes. Decision records carry a `probe` field. Tests:
 `test_gateway.py::test_t1…t10`, `test_probe_mask_must_align_with_candidates`,
-`test_policy_amendments.py`. Today no candidate provider sets the mask, so
-every grant is normal (`test_t7_missing_probe_mask_means_every_grant_is_normal`).
-The selector-side mask and the simulator wiring are pending (§9).
+`test_policy_amendments.py`, `test_candidate_view_rejects_malformed_probe_mask`.
+A provider that supplies no mask gets only normal grants
+(`test_t7_missing_probe_mask_means_every_grant_is_normal`). The production
+gateway inherits the simulator's provider through `LiveClockGatewaySim`.
+`run_mininet.probe_wired()` checks functionally that a client with p̂ = 0
+receives exactly one probe; the result is recorded in each run's
+`meta.json`, and `scripts/run_m1.py` refuses grant runs without it.
 
 ### 4.3 DATA validation and delivery
 
@@ -327,7 +334,7 @@ Order of checks for a wire DATA (`GatewayCore.on_data_message` → `on_data`):
 | Eligibility | rules (i)–(v): READY, pending position, outstandingᵢ < capᵢ, **t + srttᵢ + 2 ms ≤ D**, p̂ᵢ ≥ θ = 0.05 (`policy/eligibility.py`) | — |
 | Timeout | τ_g = min(D, t_g + srttᵢ + max(4·rttvarᵢ, 10 ms)) (Eq. 10, `core/estimators.py::grant_timeout`) | — |
 | Cap | capᵢ = max(4, ⌈1.25 · b̂ᵢ · srttᵢ / (8S)⌉ + 2) (Eq. 11) | — |
-| Pacing | issue iff Φ + p̂ᵢ ≤ P_target, P_target = C · (median srtt of ready clients + 5 ms) / (8S) (Eq. 12, `policy/pacing.py`) | — |
+| Pacing | issue iff Φ + p̂ᵢ ≤ P_target, P_target = C · (RTT~ + 5 ms) / (8S). Under the min-RTT amendment (CHANGELOG 2026-11-17), RTT~ is the median, over ready clients with at least one sample, of each client's minimum RTT sample (`ClientState.rtt_min_ns`, set in `estimators.rtt_update`, kept across rounds); it is 100 ms if no ready client has a sample (Eq. 12, `policy/pacing.py::p_target_min_rtt`). B3 keeps median srtt. | ≈ 57–60 packets in late rounds (§5.1) |
 | Client fallback | ROUND_END missing by D + 200 ms (`ROUND_END_GRACE_NS`) | 200 ms |
 
 Timestamp origins: the header `t_send_ns` is the sender's clock and is used
@@ -336,7 +343,14 @@ ROUND_START's `deadline_ns` is in the gateway's monotonic clock; clients
 compare it with their own `time.monotonic_ns()`, which is the same clock only
 when gateway and clients share a kernel (one Mininet host, or localhost).
 
-### 5.1 Rule (v) lockout and the eligibility variants (simulator evidence)
+**ρᵢ in the Mininet grant path (verified in code).** `GrantRoundProtocol.begin_round`
+passes `readiness_delays_us(seed, r, N, D)` as `rho_us`, and `UdpClient`
+waits ρᵢ from ROUND_START receipt. The B1/B2/B3 processes use the same draws.
+Mininet READY packets bypass GE loss but keep the access delay
+(`tcsetup.py`, `ready_lossless`). None of this has been run on the testbed
+from this environment.
+
+### 5.1 Rule (v) lockout, the probe and min-RTT pacing (simulator evidence)
 
 Rule (v) is absorbing without a probe. A client whose p̂ᵢ falls below θ gets
 no grants, so its predictor gets no new observations and p̂ᵢ cannot recover.
@@ -348,43 +362,59 @@ lockout at M1 settings.
 applied in memory to B4 (rr/EWMA) and B6 (value/EWMA) as M1 configures them.
 The configuration is N = 20, β = 0.10, 100 rounds, seeds 0–4, and loss
 scenarios L2 and L4. The scripts are `elig_variants.py` and
-`elig_summary.py`; "late" means rounds 51–100. Means over seeds:
+`elig_summary.py`; "late" means rounds 51–100. Every job runs in a fresh
+process. A first run reused worker processes, so min-RTT patches leaked into
+later jobs; it is kept under `superseded_worker_patch_leak/` and is not
+cited. Means over seeds:
 
-| Policy, scenario | current | minrtt | starve | minrtt+starve | **probe** | minrtt+probe | noRuleV (A4) |
+| Late rounds | current | minrtt | starve | minrtt+starve | probe | **minrtt+probe** | noRuleV (A4) |
 |---|---|---|---|---|---|---|---|
-| B4 L2: η (late) | 0.240 | 0.189 | 0.505 | 0.459 | **0.553** | 0.553 | 0.549 |
-| B4 L4: η (late) | 0.000 | 0.007 | 0.353 | 0.399 | **0.508** | 0.507 | 0.511 |
-| B6 L2: η (late) | 0.099 | 0.525 | 0.485 | 0.530 | **0.592** | 0.593 | 0.585 |
-| B6 L4: η (late) | 0.000 | 0.000 | 0.398 | 0.372 | **0.528** | 0.527 | 0.531 |
-| B6 L4: clients granted per round (late, of 20) | 0.0 | 0.0 | 15.0 | 13.5 | **20.0** | 20.0 | 20.0 |
-| B6 L4: rounds with no grant (of 100) | 85.8 | 79.8 | 0 | 0 | **0** | 0 | 0 |
-| B6 L2: queue drops per round (late) | 1.50 | 0.58 | 10.54 | 7.76 | **0.47** | 0.37 | 12.58 |
-| Probe share of all grants (B6 L4) | — | — | — | — | **0.7 %** | 0.7 % | — |
+| B4 L2: η | 0.203 | 0.192 | 0.449 | 0.429 | 0.448 | **0.554** | 0.442 |
+| B4 L4: η | 0.008 | 0.007 | 0.388 | 0.419 | 0.458 | **0.503** | 0.458 |
+| B6 L2: η | 0.187 | 0.403 | 0.439 | 0.561 | 0.454 | **0.593** | 0.454 |
+| B6 L4: η | 0.003 | 0.004 | 0.382 | 0.372 | 0.451 | **0.525** | 0.459 |
+| B4 L2: queue drops per round | 15.8 | 1.1 | 51.8 | 13.0 | 59.3 | **1.9** | 65.7 |
+| B4 L4: queue drops per round | 0.0 | 0.0 | 19.1 | 0.5 | 34.8 | **3.7** | 36.2 |
+| B6 L2: queue drops per round | 14.1 | 0.0 | 55.0 | 3.9 | 56.3 | **0.4** | 63.6 |
+| B6 L4: queue drops per round | 0.0 | 0.0 | 18.7 | 0.7 | 36.1 | **1.5** | 37.2 |
+| B6 L4: clients granted per round (of 20) | 0.1 | 0.1 | 15.4 | 13.5 | 20.0 | **20.0** | 20.0 |
+| Rounds with no grant, L4 (of 100; B4 / B6) | 62.8 / 83.0 | 62.4 / 80.8 | 0 / 0 | 0 / 0 | 0 / 0 | **0 / 0** | 0 / 0 |
 
 Reading:
 
-- Under the current rule (v), B4 and B6 lock out almost every client in L4.
-  η in late rounds is 0, and 80–86 of 100 rounds issue no grant at all.
-- The bounded probe recovers η to within about 0.01 of having no rule (v)
-  (A4) in every cell. It does so while keeping rule (v)'s protection against
-  queue drops: in B6 L2 the probe has 0.47 drops per round, against 12.58
-  with no rule (v). Probes are under 1 % of grants.
-- The starvation override (`starve`) helps but still leaves about 3–7
-  clients per round without a grant, and in B6 L2 it raises queue drops from
-  1.50 to 10.54 per round.
-- `minrtt` (Eq. 12 with each client's minimum RTT) alone does not fix the
-  lockout in L4.
+- **The lockout is real.** Under the current rule (v), B4 and B6 grant almost
+  no client in L4: η ≈ 0 in late rounds, and 63–83 of 100 rounds issue no
+  grant at all.
+- **The probe alone fixes the lockout but not the queue.** All 20 clients
+  are granted again, and η rises to 0.45–0.46, the same as with rule (v)
+  removed (A4). But it leaves 35–59 queue drops per round, close to A4's
+  36–66. The cause is Eq. 12 with median srtt: srtt includes the queueing
+  delay pacing is meant to bound, so P_target grows with the queue, to about
+  114–116 packets.
+- **Probe + min-RTT is the best variant in every cell.** η is 0.50–0.59,
+  which is 0.77–0.91 of the per-round upper bound, against about 0.69–0.70
+  for probe alone. Queue drops fall to 0.4–3.7 per round, and the queue's
+  p99 delay falls from about 76 ms to 36–42 ms. P_target settles near 57–60
+  packets. Probes are under 1 % of grants.
+- **min-RTT alone does not fix the lockout** in L4, and the starvation
+  override (`starve`) leaves 1–5 clients per round ungranted while adding
+  queue drops.
 
-This is in-memory simulator evidence for the policy choice. It is not the
-GatewayCore implementation running in M-sim: until the candidate mask and
-`run_net` wiring land, M-sim and M1 runs issue no probes (§9).
+**Adopted** (CHANGELOG 2026-11-13 and 2026-11-17;
+`POLICY_REVISION = "2026-11-17-probe-minrtt"`): the bounded probe (§4.2) and
+min-RTT pacing (§5, Pacing row). Both are wired into the simulator
+(`sim/run_net.py`), and production inherits them through
+`LiveClockGatewaySim`.
 
-**ρᵢ in the Mininet grant path (verified in code).** `GrantRoundProtocol.begin_round`
-passes `readiness_delays_us(seed, r, N, D)` as `rho_us`, and `UdpClient`
-waits ρᵢ from ROUND_START receipt. The B1/B2/B3 processes use the same draws.
-Mininet READY packets bypass GE loss but keep the access delay
-(`tcsetup.py`, `ready_lossless`). None of this has been run on the testbed
-from this environment.
+The integrated implementation reproduces the clean probe-only study:
+`results/summary/probe_validation_sim/probe_summary.csv` gives late η of
+0.451–0.457, 20/20 clients, at most one probe per client per round, and
+`round_probe_grants` equal to the logged probes. Its `probe_validation.csv`
+compares against the superseded study, which is how the leak was found.
+
+ML data and the P-GRU/P-MLP models are regenerated and retrained under the
+new revision. `ml/datagen.py` refuses to generate data unless the simulator
+functionally issues probes and follows min-RTT.
 
 ---
 
@@ -458,7 +488,8 @@ evidence. Every READY registered. L4 at β = 0.10 delivered 86.0 % of planned
 blocks, and 83 % of the shortfall was DATA arriving after D. L2 at β = 0.20
 lost 25.7 % of planned blocks in the network, which is a separate problem. The
 cutoff is
-**not changed in code**; it waits on a team decision.
+**not changed in code** yet. The agreed reporting conventions and the
+remaining vote are in §9, item 9.
 
 ---
 
@@ -593,8 +624,9 @@ Status: **U** unit-tested, **I** integration-tested on localhost,
 | B2/B3 goodput (padded 1400 B) | `baseline_proc.finalize_round`, `sim_adapter` | `test_b2_b3_accounting.py::test_goodput_boundary_matches_grant_simulator_for_padded_final_block`, `test_mininet_baseline_procs.py` (packets ↔ summary ↔ goodput) | U, I |
 | B1/B2/B3 processes over real sockets | `baseline_proc.py` | `test_mininet_baseline_procs.py::test_baseline_processes_complete_rounds_over_real_sockets` | I |
 | Gateway profiling harness | `profiling/gateway.py` | `test_gateway_profile_harness.py`; localhost run in §7.1 | U, I |
-| Bounded probe: ≤ 1 per client per round, rules (i)–(iv) required, consumed at issue | `GatewayCore._pump`, `probe_available`, `is_probe_grant`; `eligibility.is_eligible(probe_available=…)` | `test_gateway.py::test_t1_one_probe_per_round_second_is_blocked` … `test_t10_cumulative_and_per_round_probe_counts`, `test_probe_mask_must_align_with_candidates`; `test_policy_amendments.py` | U (core only; no provider sets the mask yet) |
-| Probe logging (`probe`, `probe_grants`) | `logging_tap._probe_flag`, `gateway_proc.finish_round`, `scripts/run_grid.py::_round_probe_grants`, `common/logschema.py` | `test_probe_logging.py`, `test_run_grid.py::test_grant_round_metrics_record_the_rounds_probe_grants` and three more | U |
+| Bounded probe: ≤ 1 per client per round, rules (i)–(iv) required, consumed at issue | `GatewayCore._pump`, `probe_available`, `is_probe_grant`; `eligibility.is_eligible(probe_available=…)` | `test_gateway.py::test_t1_one_probe_per_round_second_is_blocked` … `test_t10_cumulative_and_per_round_probe_counts`, `test_probe_mask_must_align_with_candidates`; `test_policy_amendments.py` | U, I (`test_probe_end_to_end.py`: M-sim and production issue one probe per round to a locked-out client, decision-for-decision equal; `test_sim_gateway_parity.py`; `probe_validation_sim/`) |
+| Min-RTT pacing (Eq. 12 amendment) | `policy/pacing.py::p_target_min_rtt`, `ClientState.rtt_min_ns`, `estimators.rtt_update`, `GatewaySim.get_p_target` | `test_min_rtt_pacing.py`, `test_sim_gateway_parity.py` | U, I |
+| Probe logging (`probe`, `probe_grants`) | `logging_tap._probe_flag`, `gateway_proc.finish_round`, `scripts/run_grid.py::_round_probe_grants`, `common/logschema.py` | `test_probe_logging.py`, `test_run_grid.py::test_grant_round_metrics_record_the_rounds_probe_grants` and three more; `test_mininet_gateway_integration.py` (grants.csv `probe` rows = round_metrics `probe_grants` over real sockets) | U, I |
 | Network-only aggregate receiver | `gateway_proc.NetworkOnlyAggregateSink` | `test_run_m1.py::test_network_only_aggregate_sink_records_each_round` | U |
 | Predictor feedback exactly once per grant | `GatewaySim.resolve` via `_CoreEstimator` | `test_predictor_feedback_exactly_once.py` (unit sequences + localhost UDP round) | U, I |
 
@@ -625,38 +657,65 @@ Status: **U** unit-tested, **I** integration-tested on localhost,
 7. **Not yet verified on Mininet:** every protocol/gateway behaviour in this
    report, the READY-loss filter and nonzero ρᵢ in the grant path, the
    Mininet profiling path, and M2 (FL over Mininet).
-8. **Probe not yet reachable end to end.** GatewayCore, the eligibility rule
-   and the logging support the probe, but no candidate provider sets the
-   `probe` mask (a `CandidateView` change, Praveen), and `sim/run_net.py`
-   does not track a per-round allowance (Jayadev). Until both land, every
-   run records `probe_grants = 0`. Meanwhile `POLICY_REVISION` already reads
-   `2026-11-13-probe`, so grant-policy runs and ML data generated now carry a
-   revision that their behaviour does not match. They should be
-   regenerated, or the revision held back, once probes can be issued.
-9. **B3 cutoff decision pending** (§6.1). The open questions:
-   - the margin (15 ms proposed);
-   - a fixed cutoff, or closing early once all N READYs have arrived;
-   - how β = 0.05 is reported, given its budget is 0;
-   - the acceptance criterion for L4, where late DATA dominates.
-10. **Real-socket test flake (diagnosed, fixed in the test).** The localhost
-    UDP acceptance test in `test_predictor_feedback_exactly_once.py` used to
-    require at least one grant to be resolved *at* D. It failed about once in
-    300 sequential runs, and in 9 of 1,680 B6 runs under parallel CPU
-    load. In every captured failure nothing was outstanding at D. Clients 0
-    and 1 still had pending blocks with p̂ ≈ 1, but on localhost each grant
-    issued before the rule (iv) cutoff (t + srttᵢ + 2 ms ≤ D) returned before
-    D. The lossy client had no grant open in the final window (its p̂ was
-    0.04–0.15, near θ). This is correct gateway behaviour. The test now
-    counts the grants outstanding when the deadline fires, with a
-    pass-through spy on `on_deadline`, and requires exactly that many
-    deadline resolutions. That is a stronger check, and it passes for zero
-    as well. After the change, 1,440 stressed runs passed. Under the same load the
-    P-GRU inference occasionally exceeded its time budget (2–10 ms), and the
-    gateway switched to P-EWMA for the rest of the round
-    (`predictor fallback … reason=timeout`). This is the Section 9 fallback
-    working as designed, but it means **M1 grant runs on a loaded host can be
-    flagged** (`predictor_fallbacks > 0`). `test_mininet_baseline_procs.py`
-    passed 25/25 consecutive runs (275 tests) and was not changed. It has
-    two latent timing risks, `_free_port` (bind, close, rebind) and a fixed
-    20 ms wait for the gateway to bind, which are worth hardening if a failure
-    is ever seen.
+8. **Probe and min-RTT: resolved.** Both are wired into the simulator and
+   production providers (§4.2, §5.1) under
+   `POLICY_REVISION = "2026-11-17-probe-minrtt"`. Data stamped with the
+   earlier `2026-11-13-probe` revision has no probes and is superseded.
+   `ml/datagen.py` and `scripts/run_m1.py` now refuse to produce grant-policy
+   data unless probes (and, for datagen, min-RTT) are functionally present.
+   The FG-GRU numbers wait for the retrained models; the current
+   `models/gru_prod.npz` and `models/mlp_prod.npz` are pre-amendment.
+9. **B3 cutoff.** Agreed so far:
+   - **Margin:** 15 ms, supported by §6.1.
+   - **β = 0.05:** reported as *not applicable* for B3, with a footnote
+     explaining that its budget is M = 0 by construction. It is not averaged
+     in as η = 0.
+   - **L4 acceptance:** no absolute delivery target, since that would mean
+     tuning the baseline. Instead, READY registration of at least 99 %, plus
+     parity with M-sim within the M1 fingerprint tolerances: η and delivered
+     blocks within ±0.03, late-DATA fraction within ±10 % relative.
+
+   Still open: early close at the last READY capped at 0.1·D + 105 ms
+   (Tejaswi, Praveen and Prajin vote yes), or the fixed 0.1·D + 105 ms. This
+   waits for Jayadev's vote. B3 M1 runs wait for the change.
+10. **Load-sensitive tests (diagnosed, fixed in the tests).** Several
+    integration tests failed only when the machine was busy. They were
+    stress-tested by running many pytest processes in parallel on a 16-core
+    host. The causes, all in the tests rather than the protocol:
+    - **Predictor wall-clock limit in parity tests.** `FallbackPredictor`
+      times each prediction against a 2 ms wall-clock limit. Under load a
+      P-EWMA call can exceed it, which switches that side to the fallback, and
+      two otherwise identical decision streams then diverge. The simulator ↔
+      production parity tests (`test_mininet_production.py`,
+      `test_sim_gateway_parity.py`) now freeze the clock with a module
+      fixture, and assert zero fallbacks. At 1.5× CPU oversubscription the
+      old versions failed in 77 of 96 runs; the new ones failed in 0 of 96.
+    - **Wrong deadline assumption.** `test_predictor_feedback_exactly_once.py`
+      assumed some grant is always outstanding at D. On localhost nothing may
+      be, so the test now requires exactly the grants outstanding when the
+      deadline fires to resolve at D.
+    - **Port race and fixed sleep.** The `gateway_proc` serve test picked
+      "free" ports and released them before binding, which failed with
+      `EADDRINUSE`. It now uses kernel-assigned ports and registers client
+      endpoints after binding. The baseline-process tests now start clients
+      when the gateway signals its sockets are bound, instead of after a
+      fixed 20 ms sleep.
+    - **Round length.** These multi-round tests run gateway and clients in
+      one event loop, so the margins were widened: D = 600 ms in the serve
+      test, and D = 500 ms with Tc = 100 ms in the baseline tests. Under load,
+      previous-round DATA can still arrive after the next ROUND_START. The
+      gateway correctly rejects it as `stale_round_data` (Section 8), so the
+      serve test now requires every invalid event to be stale-round DATA,
+      rather than zero invalid events.
+
+    After the fixes, all touched tests ran 96 times at 1.5× oversubscription
+    with one failure. In that run, one client in the UDP exactly-once round
+    missed ROUND_END within its 200 ms grace, which is a real-time protocol
+    constant. Real-time tests still need a host that is not overloaded.
+
+    Under load the P-GRU inference also sometimes exceeds its 2 ms budget
+    (§9 fallback, `predictor fallback … reason=timeout`). That is correct
+    behaviour, but **M1 grant rounds on a loaded host are flagged**
+    (`predictor_fallbacks > 0`). The idle testbed benchmark has a median of
+    0.85 ms and p99 of 1.17 ms for 20 clients
+    (`results/summary/pred_latency_fedora_m1.csv`).
