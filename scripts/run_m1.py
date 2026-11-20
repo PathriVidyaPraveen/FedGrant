@@ -140,6 +140,16 @@ def predictor_fallbacks(out: Path) -> int | None:
     return None if value is None else int(value)
 
 
+def gateway_rcvbuf_drops(out: Path) -> int | None:
+    """meta.json gateway_udp.RcvbufErrors: datagrams lost because the gateway read too slowly."""
+    try:
+        udp = json.loads((out / "meta.json").read_text(encoding="utf-8")).get("gateway_udp") or {}
+    except (OSError, ValueError):
+        return None
+    value = udp.get("RcvbufErrors")
+    return None if value is None else int(value)
+
+
 def busy_host_warning(threshold_per_cpu: float = 0.25) -> str | None:
     """A warning when the 1-minute load average says the host is not idle (grant runs time the predictor)."""
     try:
@@ -178,10 +188,16 @@ def run_one(cmd: list[str], out: Path, log) -> bool:
     if fallbacks:
         print(f"  WARNING: {fallbacks} predictor fallbacks to P-EWMA (Section 9 wall-clock budget); "
               "the host was probably not idle. Keep it idle during grant runs.", flush=True)
+    rcvbuf = gateway_rcvbuf_drops(out) if ok else None
+    if rcvbuf:
+        print(f"  WARNING: gateway socket dropped {rcvbuf} datagrams (receive buffer full): the gateway "
+              "process could not keep up, so RTT/loss include a gateway-side queue the tc samples miss.",
+              flush=True)
     log.write(json.dumps({"output": str(out), "returncode": proc.returncode, "ok": ok,
                           "seconds": round(time.monotonic() - started, 1),
                           "rounds_completed": completed_rounds(out),
                           "predictor_fallbacks_total": fallbacks,
+                          "gateway_rcvbuf_drops": rcvbuf,
                           "stderr_tail": (stderr or "")[-2000:]}) + "\n")
     log.flush()
     return ok

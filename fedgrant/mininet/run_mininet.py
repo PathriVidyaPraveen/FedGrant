@@ -388,6 +388,26 @@ def _fallback_total(summary_path: Path) -> int | None:
     return sum(counts) if counts else None
 
 
+def udp_counters(snmp_text: str) -> dict[str, int]:
+    """The Udp: counters of a /proc/net/snmp dump (header line, then value line)."""
+    rows = [line.split() for line in snmp_text.splitlines() if line.startswith("Udp:")]
+    if len(rows) < 2 or len(rows[0]) != len(rows[1]):
+        return {}
+    return {name: int(value) for name, value in zip(rows[0][1:], rows[1][1:]) if value.lstrip("-").isdigit()}
+
+
+def gateway_udp_delta(before: dict[str, int], after: dict[str, int]) -> dict[str, int] | None:
+    """Gateway-namespace UDP counter increase over the run.
+
+    RcvbufErrors counts datagrams the kernel dropped because the gateway's socket
+    receive buffer was full: the gateway process did not read fast enough. Those
+    drops and the queueing before them are invisible to the tc queue samples.
+    """
+    if not before or not after:
+        return None
+    return {name: after[name] - before[name] for name in after if name in before}
+
+
 def _sha256(path: Path) -> str | None:
     return hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
 
@@ -487,6 +507,7 @@ def run_experiment(*, n: int, scenario: str, seed: int, rounds: int, beta: float
         log_handles.append(gateway_log)
         if roles["pinning_enabled"] and roles["gateway"] is not None:
             gw_cmd = ["taskset", "-c", str(roles["gateway"]), *gw_cmd]
+        udp_before = udp_counters(net.get("gw").cmd("cat /proc/net/snmp"))
         processes.append(net.get("gw").popen(gw_cmd, stdout=gateway_log, stderr=subprocess.STDOUT, env=env))
         for i in range(n):
             client_log = (out / f"client_{i}.log").open("w", encoding="utf-8")
@@ -578,6 +599,7 @@ def run_experiment(*, n: int, scenario: str, seed: int, rounds: int, beta: float
             tc_readback.append({"host": host_name, "interface": iface, "configured_commands": commands,
                                 "effective": host.cmd(f"tc -d qdisc show dev {iface}").strip()})
         loss_target, burst_target = SCENARIO_LOSS[scenario.upper()]
+        gateway_udp = gateway_udp_delta(udp_before, udp_counters(net.get("gw").cmd("cat /proc/net/snmp")))
         meta = {
             **identity, "status": "ok", "rounds": int(rounds),
             "config_id": (make_config_id(scenario, beta, n, cross_mbps)
@@ -596,6 +618,7 @@ def run_experiment(*, n: int, scenario: str, seed: int, rounds: int, beta: float
             "ready_lossless": bool(ready_lossless),
             "baseline_eta_rounds_filled": baseline_eta_rounds,
             "predictor_fallbacks_total": _fallback_total(out / "gateway_summary.json"),
+            "gateway_udp": gateway_udp,
             "models_dir": str(models_dir),
             "model_sha256": {name: _sha256(Path(models_dir) / name)
                              for name in POLICY_MODEL_FILES.get(policy, ())},
